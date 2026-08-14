@@ -1,62 +1,106 @@
 # V0ID
 
-Research prototype for exact encrypted, runtime-programmable computation over a bounded Turing-machine-like interpreter, with client-side precomputed polymorphism, a series-first morph derivation layer and experimental hidden-integrity plumbing.
+Research prototype for exact encrypted, runtime-programmable computation with client-side polymorphism, series-first morph derivation, remote BinFHE evaluation and a sandboxed mathematical extension layer.
 
-Current V0.4.1 scaffold:
+**Current research scaffold: V0.4.2.**
 
-- **Encryption-lite:** OpenFHE BinFHE (`STD128`) exact Boolean gates; no approximate arithmetic.
-- **Encrypted program:** transition semantics are encrypted as one-hot next-state selectors plus encrypted write/move selectors.
-- **UTM-lite:** one fixed interpreter executes encrypted transition tables over encrypted one-hot state, encrypted one-hot head and encrypted tape. The demo is bounded to 8 cells.
-- **Fixed work schedule:** execution uses a public fixed round budget rather than secret-dependent termination.
-- **Remap-lite:** the local prototype uses OpenSSL 3 `KMAC-256` for epoch-specific logical-to-physical tape permutations; remaps move ciphertexts only.
-- **Precomputed polymorphism:** client-side state-label permutation plus fixed-size dummy-state padding. Different morph seeds produce semantically equivalent machine images with the same public shape.
-- **Series-first derivation:** a client-side `PolymorphicSeriesGenerator` derives a private series from input + private 256-bit seed + epoch, then derives the `MorphSeed` used by `ProgramMorpher`.
-- **User-injected series seam:** trusted local code can provide a custom generator through `FunctionalSeriesGenerator`; peers never send executable crypto plugins.
-- **Private morph manifest:** the client keeps the semantic state map, dummy-state map, integrity nonce, selected integrity return slot and output masks. This manifest is not part of an evaluator job.
-- **Toy encrypted self-fingerprint:** a test-only 32-bit Boolean mixer consumes the encrypted morphed transition table, encrypted initial tape and encrypted nonce. A plaintext reference computes the same value client-side.
-- **Masked integrity bank:** the evaluator produces a fixed public number of encrypted candidate digests. Candidate masks are encrypted; only the client manifest says which slot it checks and how to unmask it.
-- **P2P scaffold:** ZeroMQ/cppzmq binary-safe envelopes carry peer id, job id, epoch, message type and opaque payload bytes.
-- **V0.4 full-machine remote path:** `v0id-remote-machine` serializes a whole morphed encrypted program/state/head/tape plus encrypted integrity material, sends it with `EXECUTE_JOB`, executes the fixed public round budget remotely, and returns encrypted final state/head/tape plus all masked integrity candidates. The secret key and `MorphManifest` remain client-side.
-- **V0.4.1 public profile IDs:** remote machine wire format `V0IDRMJ2`/`V0IDRMR2` carries bounded identifiers for FHE primitive, parameter set, machine protocol, integrity profile and client-side series generator id/version.
+V0ID is experimental research code, not audited production cryptography. The repository intentionally distinguishes proven plumbing milestones from security conjectures and future work.
 
-Correctness and exact encrypted state semantics are invariants; speed and memory are expendable. Experimental research code, not audited production cryptography.
+## Current architecture
 
-## Series first -> morph later
+```text
+                         V0ID
+                           |
+        +------------------+------------------+
+        |                                     |
+ encrypted machine path                  MathVM path
+        |                                     |
+ bounded universal                      sandboxed Wasm
+ Boolean interpreter                    mathematical IR
+        |                                     |
+ OpenFHE BinFHE                         primitive registry
+        |                              /       |        \
+ remote evaluator                 classical   PQ   experimental
+        |                                     |
+        +------------------+------------------+
+                           |
+                 series / polymorphism
+```
 
-V0.4.1 adds this client-side path:
+The two execution paths currently serve different purposes:
+
+- the encrypted Turing-machine-like interpreter is the universal exact encrypted reference path;
+- MathVM is the new bounded, faster, portable way to compose mathematical primitives without allowing peers to transmit native plugins.
+
+## Proven V0.4 remote-machine milestone
+
+The V0.4 whole-machine path has been run successfully across two local processes.
+
+The client:
+
+```text
+semantic program
+    -> private morph
+    -> encrypted transition table
+    -> encrypted state/head/tape
+    -> encrypted integrity material
+    -> network
+```
+
+The evaluator executed four fixed BinFHE rounds without receiving the LWE secret key or `MorphManifest`, then returned encrypted final machine state.
+
+The client recovered:
+
+```text
+00001101 -> 00001110
+13 -> 14
+```
+
+and verified its private integrity candidate.
+
+The successful run transferred roughly:
+
+```text
+request: ~551 MB
+result : ~666 KB
+```
+
+because BinFHE context/bootstrap material is still resent with every full-machine job. Persistent evaluator session/key caching is therefore a near-term engineering priority.
+
+## V0.4.1: series first -> morph later
+
+The client-side morph path now supports a `PolymorphicSeriesGenerator`:
 
 ```text
 semantic input
-    |
-    v
-private SeriesSeed + epoch
-    |
-    v
+    + private SeriesSeed
+    + epoch
+          |
+          v
 PolymorphicSeriesGenerator
-    |
-    +--> private series
-    +--> private provenance token
-    +--> derived MorphSeed
-             |
-             v
-        ProgramMorpher
-             |
-             v
-      morphed program image
-             |
-             v
-           BinFHE
+          |
+          +--> private series
+          +--> private provenance
+          +--> derived MorphSeed
+                    |
+                    v
+               ProgramMorpher
+                    |
+                    v
+             morphed machine image
 ```
 
-The built-in profile is `v0id-series-kmac-v1`. It uses KMAC-256 under separate domains and the current demo derives a 64-byte private series. The series, series seed, derived morph seed and series private manifest do not leave the client.
+The built-in profile is `v0id-series-kmac-v1`. Trusted local code can also inject its own generator through the generator interface/callback seam.
 
-This is a concrete experiment for the "series first, algorithm/representation later" idea. It is **not** a proof that an arbitrary or "magic" series is intrinsically post-quantum hard, information-theoretically hidden, or a new cryptographic primitive. See `docs/SERIES_GENERATOR.md`.
+The private series, series seed, derived morph seed and `MorphManifest` do not leave the client.
 
-A trusted application can inject its own local pattern by implementing `PolymorphicSeriesGenerator` or using `FunctionalSeriesGenerator`. V0ID intentionally does not download or execute crypto plugins supplied by peers.
+This is an implementation of the **series-first research direction**, not a proof that an arbitrary generated series is intrinsically post-quantum hard.
 
-## Public crypto/profile identifiers
+See `docs/SERIES_GENERATOR.md`.
 
-Each V0.4.1 remote job now self-identifies approximately as:
+## V0.4.1 remote profile identifiers
+
+The bounded remote-machine wire format is now `V0IDRMJ2` / `V0IDRMR2` and carries public profile identifiers such as:
 
 ```text
 primitive             openfhe-binfhe
@@ -66,214 +110,269 @@ integrity profile     toy-fingerprint32-v1
 series generator      v0id-series-kmac-v1 / v1
 ```
 
-The evaluator fails closed on unsupported execution/integrity profiles. The series generator itself runs entirely client-side; its public identifier is currently provenance for later interoperability/correlation work. The server echoes the full profile in `JOB_RESULT` and the client requires an exact match.
+The evaluator fails closed on unsupported execution/integrity profiles and returns the profile with the result. The client requires an exact match.
 
-This is not yet a capability handshake. Authenticated suite negotiation and downgrade protection belong later, once at least two genuinely interchangeable profiles exist.
+This is self-description, not yet a full authenticated capability-negotiation protocol.
 
-## Precomputed polymorphism + self-check
+## V0.4.2: WAMR MathVM sandbox
 
-V0ID polymorphism does **not** require runtime self-modifying code. The client generates a semantically equivalent fixed-size machine image from a private morph seed.
+V0.4.2 adds a portable mathematical execution layer based on WebAssembly Micro Runtime (WAMR), pinned to `WAMR-2.4.0`.
 
-The current morpher performs:
-
-```text
-base program
-    -> secret state-label permutation
-    -> fixed-size dummy-state padding
-    -> private MorphManifest
-```
-
-The manifest contains client-only metadata approximately equivalent to:
+Instead of allowing this:
 
 ```text
-base semantic state -> morphed state map
-dummy state IDs
-integrity nonce
-selected integrity output slot
-per-slot integrity masks
+peer -> arbitrary crypto_plugin.so -> evaluator
 ```
 
-The encrypted self-fingerprint binds the toy check to the actual morphed encrypted transition semantics plus initial input/nonce. `ToyFingerprint32` is deliberately **not a cryptographic hash**. It proves the FHE/self-check plumbing only; it is not yet proof that every evaluator step was executed honestly and the dedicated fingerprint subcircuit remains structurally recognizable.
-
-## V0.4/V0.4.1 remote machine
+V0ID moves toward:
 
 ```text
-CLIENT
-  derive private series
-  derive morph seed
-  Morph(P)
-  encrypt transition table
-  encrypt state/head/tape
-  encrypt nonce + candidate masks
-       |
-       | EXECUTE_JOB
-       v
-================ network ================
-       |
-       v
-REMOTE EVALUATOR
-  validate public execution profile
-  load key-independent BinFHE context
-  load refresh/switching evaluation keys
-  compute encrypted toy fingerprint
-  run exactly N public interpreter rounds
-       |
-       | JOB_RESULT
-       v
-================ network ================
-       |
-       v
-CLIENT
-  require returned profile == requested profile
-  decrypt final tape
-  select private integrity candidate
-  unmask + verify expected digest
+peer/user
+    -> portable Wasm mathematical composition
+    -> explicit primitive manifest
+    -> WAMR sandbox
+    -> locally installed trusted primitive providers
 ```
 
-The evaluator does **not** receive:
+The V0ID WAMR profile currently enables:
 
 ```text
-LWE secret key
-private series
-SeriesSeed
-series private manifest
-MorphSeed
-MorphManifest
-base-to-morphed semantic mapping
-selected integrity candidate index
-plaintext integrity masks
+classic interpreter       ON
+instruction metering      ON
+WASI                      OFF
+libc host shims           OFF
+AOT                       OFF
+JIT                       OFF
+threads/shared memory     OFF
+multi-module              OFF
+mini-loader               OFF
 ```
 
-The result returns encrypted final state, encrypted final head, encrypted final tape and every masked integrity candidate. State/head are returned so checkpoint/resume can be added later.
-
-### Proven V0.4 milestone
-
-The V0.4 whole-machine path has been run successfully across two local processes. A morphed encrypted increment machine executed four remote BinFHE rounds and the client recovered:
+The current host ABI exposes only one generic scalar import:
 
 ```text
-00001101 -> 00001110
+v0id_math.primitive_u64(
+    tag,
+    version,
+    a,
+    b,
+    c,
+    d
+) -> u64
 ```
 
-while verifying its private integrity candidate. In that run the request was roughly 551 MB because the BinFHE evaluation context/bootstrap material was resent with the job, while the encrypted result was roughly 666 KB. Persistent evaluator sessions/key caching are therefore an obvious near-term engineering optimization.
+Every call is checked against the program's declared `PrimitiveRequirement` manifest.
 
-V0.4.1 adds the series/profile layer on top of that proven path and still needs compiler/runtime validation on the current OpenFHE installation.
-
-### Placement boundary
-
-The remote-machine demo currently sends tape ciphertexts in logical tape order. The local `v0id` executable still demonstrates KMAC-derived ciphertext-only epoch remapping, but that physical remap has deliberately not been folded into the remote evaluator yet.
-
-The intended placement chain is:
+Current built-in providers:
 
 ```text
-logical tape cell
-    -> client/compiler logical relocation
-    -> epoch physical remap
-    -> (peer_id, local_slot)
+0x00010001  v0id.math.add-mod-u64/v1
+0x00010002  v0id.math.mul-mod-u64/v1
+0x7fff0001  v0id.experimental.toy-lwe-affine-u64/v1
 ```
 
-That belongs with distributed-tape `STORE_SLOT` / `FETCH_SLOT`. The current remap is not claimed to provide ORAM/access-pattern privacy.
+The experimental provider computes only:
 
-## Correlation / PQ-facing research issue
+```text
+b = a*s + e mod q
+```
 
-Encryption can remain intact while repeated jobs leak behavioral fingerprints through timing, dependency shape, message sizes, peer access order, remap cadence and future storage-access patterns.
+and exists solely to prove the PQ-provider/plugin architecture. It is **not LWE encryption and carries no post-quantum security claim**.
 
-The central statistical question is therefore whether an evaluator can classify equivalent encrypted computations without decrypting them. The series generator gives V0ID another controllable axis for that experiment: generate many private series/morphs for the same semantic task, record only evaluator-visible traces and test whether a distinguisher can correlate them.
+See `docs/MATHVM.md`.
 
-The current BinFHE demo uses `STD128` because this repository is still a functional prototype; parameter selection for a post-quantum security claim is not finalized or audited.
+## MathVM sandbox limits
 
-See `docs/POLYMORPHISM.md` and `docs/SERIES_GENERATOR.md`.
+The initial defaults are deliberately bounded:
 
-## Dependencies
+```text
+Wasm module             <= 1 MiB
+linear memory           <= 16 pages / 1 MiB
+stack                   <= 64 KiB
+host-managed heap       <= 64 KiB
+WAMR runtime pool       <= 16 MiB
+Wasm instructions       <= 1,000,000
+provider calls          <= 4,096
+provider cost           <= 1,000,000 units
+```
 
-- C++20 compiler
-- CMake >= 3.20
-- Git available during first configure
-- OpenFHE installed with `OpenFHEConfig.cmake`
-- OpenSSL >= 3 with `KMAC-256`
+Native provider work has a separate call/cost budget because time spent inside a native accelerator is not represented by Wasm instruction count.
 
-The network build fetches `zeromq/libzmq` v4.3.5 and `zeromq/cppzmq` v4.11.0. CMake 4+ is supported through `CMAKE_POLICY_VERSION_MINIMUM=3.5` for the legacy libzmq subproject.
+## V0.4.2 sandbox self-tests
 
-## Build
+`v0id-mathvm-tests` constructs its Wasm modules directly in memory, so it does not need a wasm32 compiler.
+
+The suite exercises:
+
+- normal Wasm execution,
+- a declared provider call,
+- manifest id/tag mismatch rejection,
+- undeclared provider rejection,
+- provider call-budget exhaustion,
+- infinite-loop instruction metering,
+- oversized module rejection,
+- excessive linear-memory rejection,
+- non-Wasm/AOT-like input rejection,
+- WASI import rejection,
+- recovery after trapped/rejected jobs.
+
+Build and run:
+
+```sh
+git pull
+cmake -S . -B build
+cmake --build build -j --target v0id-mathvm-tests
+./build/v0id-mathvm-tests
+```
+
+This test target is the immediate validation gate before MathVM bytecode is placed on the network.
+
+## Optional MathVM guest demo
+
+Build the host:
+
+```sh
+cmake --build build -j --target v0id-mathvm
+```
+
+Compile the bundled no-WASI guest with a clang that supports `wasm32`:
+
+```sh
+clang --target=wasm32 -O2 -nostdlib \
+  -Wl,--no-entry \
+  -Wl,--allow-undefined \
+  -Wl,--export=v0id_main \
+  -Wl,--initial-memory=65536 \
+  -Wl,--max-memory=1048576 \
+  examples/mathvm/series_math.c \
+  -o build/series_math.wasm
+```
+
+Run:
+
+```sh
+./build/v0id-mathvm build/series_math.wasm
+```
+
+Expected result:
+
+```text
+13 + 29 mod 97      = 42
+5*7 + 3 mod 12289   = 38
+42 * 38 mod 65537   = 1596
+
+result: 1596
+provider calls: 3
+```
+
+## Remote encrypted-machine demo
+
+Build:
 
 ```sh
 cmake -S . -B build
-cmake --build build -j
+cmake --build build -j --target v0id-remote-machine
 ```
 
-### Local polymorphic encrypted-machine demo
-
-```sh
-./build/v0id
-```
-
-Expected logical outputs:
-
-```text
-00001101 -> increment -> 00001110
-00001101 -> decrement -> 00001100
-```
-
-### Plain peer transport smoke test
-
-```sh
-./build/v0id-peer server A tcp://*:7001 2
-./build/v0id-peer client B tcp://127.0.0.1:7001 hello-from-B
-```
-
-### Single-ciphertext FHE-over-network smoke test
-
-```sh
-./build/v0id-fhe-peer server EVAL tcp://*:7002 1
-./build/v0id-fhe-peer client CLIENT tcp://127.0.0.1:7002 1
-```
-
-### V0.4.1 series-derived remote-machine demo
-
-Terminal 1:
+Evaluator:
 
 ```sh
 ./build/v0id-remote-machine server EVAL tcp://*:7003 1
 ```
 
-Terminal 2:
+Client:
 
 ```sh
 ./build/v0id-remote-machine client CLIENT tcp://127.0.0.1:7003
 ```
 
-The client derives a private series before morphing, transmits only the public generator id/version, and should eventually verify `00001110` plus a morph-specific private self-check. The server prints public round progress; the demo timeout is one hour.
+The V0.4.1 series/profile revision still needs an end-to-end regression run after the proven V0.4 baseline.
+
+## Integrity status
+
+`ToyFingerprint32` remains test-only plumbing.
+
+It currently binds the encrypted morphed job image plus initial input/nonce and demonstrates private integrity-candidate placement, but:
+
+- it is not a cryptographic hash,
+- its dedicated evaluator circuit is recognizable,
+- it does not prove every requested remote execution step was honestly performed,
+- it is not yet bound to evolving/final machine state.
+
+Future integrity work must move toward a real cryptographic construction and stronger verification machinery.
+
+## Placement / correlation boundary
+
+Remote tape ciphertexts are still transferred in logical tape order. Physical KMAC remapping and future distributed storage are separate work.
+
+The intended later chain is:
+
+```text
+logical tape cell
+    -> compiler relocation
+    -> epoch remap
+    -> peer selection
+    -> peer-local slot
+```
+
+The existing remap is not claimed to provide ORAM/access-pattern privacy.
+
+Evaluator-visible correlation surfaces still include timing, dependency shape, message sizes, peer access order, remap cadence and future storage-access patterns. Large morph/series trace sets and a classifier/distinguisher harness remain planned research work.
+
+## Dependencies
+
+- C++20 compiler
+- C compiler for embedded WAMR sources
+- CMake >= 3.20
+- Git during first configure
+- OpenFHE with `OpenFHEConfig.cmake`
+- OpenSSL >= 3 with `KMAC-256`
+- threads support
+
+Fetched dependencies currently include:
+
+- `zeromq/libzmq` v4.3.5
+- `zeromq/cppzmq` v4.11.0
+- `wasm-micro-runtime/wasm-micro-runtime` WAMR-2.4.0
 
 ## Source layout
 
 ```text
-src/core/program.hpp                    Rule / Program representation
+src/core/program.hpp                    machine Rule / Program representation
 src/polymorph/program_morpher.*         semantic morph compiler + private manifest
-src/polymorph/series_generator.*        series-first generator interface + KMAC/default + callback seam
-src/integrity/toy_fingerprint.*         test-only plaintext/FHE self-fingerprint
-src/main.cpp                            local plaintext + FHE morph/integrity tests
-src/fhe/fhe_codec.hpp                   OpenFHE single-object serialization helpers
-src/fhe/remote_machine_codec.hpp        bounded RMJ2/RMR2 full-machine/profile wire format
-src/fhe/remote_machine.*                fixed-path evaluator over received ciphertext machine
-src/net/peer_transport.*                V0ID binary envelope / ZeroMQ transport
-src/net/peer_demo.cpp                   plain network smoke test
-src/net/fhe_peer_demo.cpp               remote single-ciphertext BinFHE smoke test
-src/net/remote_machine_demo.cpp         series-derived client/server whole-machine test
-docs/POLYMORPHISM.md                    polymorphism / correlation threat model
-docs/SERIES_GENERATOR.md                series-first conjecture implementation boundary
+src/polymorph/series_generator.*        series-first generator layer
+src/integrity/toy_fingerprint.*         test-only plaintext/FHE fingerprint
+src/fhe/fhe_codec.hpp                   OpenFHE serialization helpers
+src/fhe/remote_machine_codec.hpp        RMJ2/RMR2 machine/profile wire format
+src/fhe/remote_machine.*                fixed-path encrypted evaluator
+src/net/peer_transport.*                binary ZeroMQ envelope transport
+src/net/remote_machine_demo.cpp         remote encrypted whole-machine demo
+src/mathvm/mathvm.*                     primitive registry / MathVM ABI
+src/mathvm/wamr_sandbox.*               WAMR sandbox wrapper and resource limits
+src/mathvm/mathvm_demo.cpp               external Wasm guest demo runner
+src/mathvm/mathvm_tests.cpp              self-contained sandbox rejection tests
+examples/mathvm/series_math.c            no-WASI mathematical guest
+docs/POLYMORPHISM.md                    morph/correlation threat model
+docs/SERIES_GENERATOR.md                series-first research boundary
+docs/REMOTE_MACHINE.md                  remote encrypted-machine protocol
+docs/MATHVM.md                          WAMR sandbox/provider architecture
 ```
 
-## Next research milestones
+## Next milestones
 
-- compile/run V0.4.1 end-to-end and confirm the private series-driven morph still returns `00001110`,
-- persistent evaluator sessions/key caching so huge BinFHE evaluation material is sent once rather than per job,
-- generate large morph/series trace sets and build a correlation/distinguisher harness,
-- add a second genuinely different series generator before designing capability negotiation,
-- randomized logical scratch/output relocation before physical KMAC remapping,
-- distributed encrypted tape with `(peer_id, local_slot)` and `STORE_SLOT` / `FETCH_SLOT`,
-- move fingerprint work toward morphed/interleaved integrity computation,
-- encrypted halted/no-op semantics and checkpoint/resume,
-- bind integrity to evolving/final computation state,
-- later authenticated crypto-profile negotiation with downgrade protection,
-- eventually replace the toy mixer with a real cryptographic construction and stronger verification machinery.
+Immediate order:
 
-If CMake/compiler complains, report the exact error and installation layout. The code intentionally favors explicit research scaffolding over pretending this is production cryptography.
+```text
+1. compile/run v0id-mathvm-tests
+2. fix every sandbox rejection failure until fail-closed behavior is confirmed
+3. regression-run V0.4.1 series -> morph -> BinFHE -> remote -> 14
+4. add persistent evaluator session/evaluation-key caching
+5. define and transmit RemoteMathProgram
+6. add authenticated MathVM/provider capability negotiation + downgrade protection
+7. integrate a real standardized PQ provider
+8. only then experiment with generated-relation / series-first key-exchange research
+```
+
+Parallel later work includes distributed encrypted tape, trace classification, stronger polymorphism, encrypted halt/no-op semantics, checkpoint/resume and real hidden-integrity machinery.
+
+V0ID currently favors explicit research boundaries over pretending unproven components are secure.

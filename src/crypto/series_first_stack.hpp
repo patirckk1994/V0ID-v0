@@ -28,8 +28,10 @@ enum class StackPurpose : std::uint8_t {
 
 // Canonical context shared by the stack schedule. The KEX transcript binding is
 // optional: all-zero means the job is not attached to the application-level KEM
-// schedule. outer_channel_binding is also optional and is where a future TLS
-// exporter/channel-binding value may be committed. V0ID does not derive or
+// schedule. shared_modules_binding is an optional SHA3-512 commitment to the
+// content-addressed shared Wasm module set expected by this session/job.
+// outer_channel_binding is also optional and is where a future TLS exporter or
+// other authenticated-channel binding may be committed. V0ID does not derive or
 // replace TLS traffic keys here.
 struct SeriesFirstStackContext {
     std::string protocol_id{"v0id-series-first-stack-v1"};
@@ -41,6 +43,7 @@ struct SeriesFirstStackContext {
     std::array<std::uint8_t, 64> semantic_binding{};
     std::array<std::uint8_t, 64> generator_binding{};
     TranscriptHash512 kex_transcript_binding{};
+    std::array<std::uint8_t, 64> shared_modules_binding{};
     std::vector<std::uint8_t> outer_channel_binding;
 };
 

@@ -11,14 +11,24 @@
 
 namespace v0id::mathvm {
 
-inline constexpr std::uint32_t MATHVM_ABI_VERSION = 1;
+// ABI v2 is additive: primitive_u64 remains valid and primitive_bytes adds
+// bounded byte-buffer providers for hashes, KEM ciphertexts, polynomial blobs,
+// and other non-scalar cryptographic values.
+inline constexpr std::uint32_t MATHVM_ABI_VERSION = 2;
 
-// Stable numeric tags used by the generic Wasm host import. They are protocol
+// Stable numeric tags used by the generic Wasm host imports. They are protocol
 // identifiers, not security values. The textual id remains the canonical name
 // used in manifests/logging and later capability negotiation.
 inline constexpr std::uint64_t PRIMITIVE_ADD_MOD_U64 = 0x0001'0001ull;
 inline constexpr std::uint64_t PRIMITIVE_MUL_MOD_U64 = 0x0001'0002ull;
+inline constexpr std::uint64_t PRIMITIVE_SHA3_256_BYTES = 0x0002'0001ull;
+inline constexpr std::uint64_t PRIMITIVE_ML_KEM_768_ENCAP_BYTES = 0x0003'0301ull;
 inline constexpr std::uint64_t PRIMITIVE_TOY_LWE_AFFINE_U64 = 0x7fff'0001ull;
+
+enum class PrimitiveAbi : std::uint8_t {
+    u64 = 1,
+    bytes = 2,
+};
 
 struct PrimitiveDescriptor {
     std::uint64_t tag{};
@@ -26,6 +36,9 @@ struct PrimitiveDescriptor {
     std::uint32_t version{};
     std::uint64_t cost{};
     bool experimental{};
+    PrimitiveAbi abi{PrimitiveAbi::u64};
+    std::size_t max_input_bytes{};
+    std::size_t max_output_bytes{};
 };
 
 struct PrimitiveRequirement {
@@ -38,20 +51,31 @@ class PrimitiveProvider {
 public:
     virtual ~PrimitiveProvider() = default;
     virtual PrimitiveDescriptor descriptor() const = 0;
+};
 
-    // V0.4.2 starts with a deliberately tiny exact scalar ABI. Larger vectors,
-    // matrices and polynomial buffers can be added later behind separate bounded
-    // imports without changing the trust model.
+class U64PrimitiveProvider : public PrimitiveProvider {
+public:
     virtual std::uint64_t evaluate_u64(std::uint64_t a,
                                        std::uint64_t b,
                                        std::uint64_t c,
                                        std::uint64_t d) const = 0;
 };
 
+class BytePrimitiveProvider : public PrimitiveProvider {
+public:
+    // Input and output are copied across the Wasm/native boundary and are
+    // independently bounded by the descriptor and SandboxLimits. Providers
+    // never receive an unchecked Wasm pointer.
+    virtual std::vector<std::uint8_t> evaluate_bytes(
+        const std::vector<std::uint8_t>& input) const = 0;
+};
+
 using U64PrimitiveFunction = std::function<std::uint64_t(
     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)>;
+using BytePrimitiveFunction = std::function<std::vector<std::uint8_t>(
+    const std::vector<std::uint8_t>&)>;
 
-class FunctionalU64Provider final : public PrimitiveProvider {
+class FunctionalU64Provider final : public U64PrimitiveProvider {
 public:
     FunctionalU64Provider(PrimitiveDescriptor descriptor,
                           U64PrimitiveFunction function);
@@ -67,6 +91,20 @@ private:
     U64PrimitiveFunction function_;
 };
 
+class FunctionalBytesProvider final : public BytePrimitiveProvider {
+public:
+    FunctionalBytesProvider(PrimitiveDescriptor descriptor,
+                            BytePrimitiveFunction function);
+
+    PrimitiveDescriptor descriptor() const override;
+    std::vector<std::uint8_t> evaluate_bytes(
+        const std::vector<std::uint8_t>& input) const override;
+
+private:
+    PrimitiveDescriptor descriptor_;
+    BytePrimitiveFunction function_;
+};
+
 class PrimitiveRegistry {
 public:
     void register_provider(std::shared_ptr<const PrimitiveProvider> provider);
@@ -74,6 +112,10 @@ public:
     const PrimitiveProvider& require(std::uint64_t tag,
                                      std::uint32_t version) const;
     const PrimitiveProvider& require(const PrimitiveRequirement& requirement) const;
+    const U64PrimitiveProvider& require_u64(std::uint64_t tag,
+                                            std::uint32_t version) const;
+    const BytePrimitiveProvider& require_bytes(std::uint64_t tag,
+                                               std::uint32_t version) const;
 
     bool supports(const PrimitiveRequirement& requirement) const;
     std::vector<PrimitiveDescriptor> descriptors() const;
@@ -85,7 +127,7 @@ private:
 
 // Portable transmitted object: Wasm bytecode plus an explicit primitive
 // manifest. The evaluator validates the manifest before running the module and
-// the runtime host call rejects any primitive not declared here.
+// both runtime host calls reject any primitive not declared here.
 struct WasmMathProgram {
     std::vector<std::uint8_t> wasm;
     std::string entrypoint{"v0id_main"};
@@ -101,6 +143,8 @@ struct SandboxLimits {
     int max_wasm_instructions{1'000'000};
     std::uint64_t max_provider_calls{4096};
     std::uint64_t max_provider_cost{1'000'000};
+    std::size_t max_provider_input_bytes{256 * 1024};
+    std::size_t max_provider_output_bytes{256 * 1024};
 };
 
 struct ExecutionReport {
@@ -109,9 +153,10 @@ struct ExecutionReport {
     std::uint64_t provider_cost{};
 };
 
-// Classical native providers shipped with the research scaffold. The toy-LWE
-// entry is only an interface test: one scalar affine relation is NOT an LWE/PQ
-// encryption scheme and must never be advertised as one.
+// Default providers include exact modular arithmetic, SHA3-256, the existing
+// toy affine plumbing primitive, and ML-KEM-768 encapsulation when the linked
+// OpenSSL provider actually exposes ML-KEM (OpenSSL 3.5+ default/FIPS provider).
+// ML-KEM is optional at runtime so V0ID still builds on older OpenSSL 3.x hosts.
 PrimitiveRegistry make_default_registry();
 
 } // namespace v0id::mathvm

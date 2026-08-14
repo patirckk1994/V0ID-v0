@@ -113,6 +113,16 @@ if(V0ID_ENABLE_MATHVM)
         src/mathvm/mathvm_demo.cpp
     )
     target_link_libraries(v0id-mathvm PRIVATE v0id_mathvm)
+
+    # Self-contained host-side sandbox tests. The test executable constructs
+    # tiny Wasm modules in memory, so it does not require a wasm32 clang target.
+    # It exercises successful execution plus rejection of loops, undeclared
+    # primitives, provider-budget exhaustion, excessive memory, WASI imports and
+    # non-Wasm/AOT-like input before MathVM is exposed over the network.
+    add_executable(v0id-mathvm-tests
+        src/mathvm/mathvm_tests.cpp
+    )
+    target_link_libraries(v0id-mathvm-tests PRIVATE v0id_mathvm)
 endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenFHE_CXX_FLAGS}")

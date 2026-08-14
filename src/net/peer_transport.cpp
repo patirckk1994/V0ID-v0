@@ -138,6 +138,10 @@ std::string to_string(MessageType type) {
         case MessageType::job_result: return "JOB_RESULT";
         case MessageType::install_evaluator_session: return "INSTALL_EVALUATOR_SESSION";
         case MessageType::evaluator_session_ready: return "EVALUATOR_SESSION_READY";
+        case MessageType::module_offer: return "MODULE_OFFER";
+        case MessageType::module_request: return "MODULE_REQUEST";
+        case MessageType::module_blob: return "MODULE_BLOB";
+        case MessageType::module_ready: return "MODULE_READY";
         case MessageType::error: return "ERROR";
     }
     return "UNKNOWN";

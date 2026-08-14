@@ -29,6 +29,10 @@ public:
         }
     }
 
+    std::uint32_t word32() {
+        return static_cast<std::uint32_t>(next64() & 0xffffffffu);
+    }
+
 private:
     static void put_u64(std::array<unsigned char, 24>& msg,
                         std::size_t offset,
@@ -87,13 +91,16 @@ MorphSeed ProgramMorpher::random_seed() {
 MorphedProgram ProgramMorpher::morph(const v0id::core::Program& base,
                                      std::size_t base_initial_state,
                                      std::size_t public_state_count,
-                                     const MorphSeed& seed) {
+                                     const MorphSeed& seed,
+                                     std::size_t integrity_candidate_count) {
     base.validate();
 
     if (base_initial_state >= base.states)
         throw std::runtime_error("base initial state out of range");
     if (public_state_count < base.states)
         throw std::runtime_error("public state count smaller than base program");
+    if (integrity_candidate_count == 0)
+        throw std::runtime_error("integrity candidate count must be positive");
 
     KmacMorphRng rng(seed);
 
@@ -105,13 +112,13 @@ MorphedProgram ProgramMorpher::morph(const v0id::core::Program& base,
     MorphedProgram out;
     out.program.states = public_state_count;
     out.program.rules.resize(public_state_count * 2);
-    out.base_to_morphed.resize(base.states);
+    out.manifest.base_to_morphed.resize(base.states);
 
     for (std::size_t q = 0; q < base.states; ++q)
-        out.base_to_morphed[q] = slots[q];
+        out.manifest.base_to_morphed[q] = slots[q];
 
     for (std::size_t q = base.states; q < slots.size(); ++q)
-        out.dummy_states.push_back(slots[q]);
+        out.manifest.dummy_states.push_back(slots[q]);
 
     // Start from a complete fixed-size table of harmless identity states. Since
     // the universal evaluator visits every public state every round, padding also
@@ -125,13 +132,24 @@ MorphedProgram ProgramMorpher::morph(const v0id::core::Program& base,
 
     // Rewrite every semantic transition through the secret state-label mapping.
     for (const auto& r : base.rules) {
-        const auto state = out.base_to_morphed[r.state];
-        const auto next_state = out.base_to_morphed[r.next_state];
+        const auto state = out.manifest.base_to_morphed[r.state];
+        const auto next_state = out.manifest.base_to_morphed[r.next_state];
         out.program.rules[state * 2 + static_cast<std::size_t>(r.read)] =
             v0id::core::Rule{state, r.read, next_state, r.write, r.move};
     }
 
-    out.initial_state = out.base_to_morphed[base_initial_state];
+    out.initial_state = out.manifest.base_to_morphed[base_initial_state];
+
+    // Client-only integrity metadata. None of these plaintext values belongs in
+    // the evaluator protocol. The client will encrypt the nonce/masks before
+    // outsourcing the integrity computation and keep the selected slot private.
+    out.manifest.integrity_nonce = rng.word32();
+    out.manifest.integrity_output_slot =
+        static_cast<std::size_t>(rng.uniform(integrity_candidate_count));
+    out.manifest.integrity_output_masks.reserve(integrity_candidate_count);
+    for (std::size_t i = 0; i < integrity_candidate_count; ++i)
+        out.manifest.integrity_output_masks.push_back(rng.word32());
+
     out.program.validate();
     return out;
 }

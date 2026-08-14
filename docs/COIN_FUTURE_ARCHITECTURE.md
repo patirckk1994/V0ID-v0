@@ -71,6 +71,68 @@ The proof system must resist at least:
 
 Without this layer, useful-compute rewards remain experimental accounting.
 
+## 2A. Verification can itself be a rewarded role
+
+A computation chain may eventually issue rewards not only for producing work but
+also for **checking accepted computation proofs**.
+
+Keep this role separate from the currently tested 2 x 3 `WorkEvent` payout
+primitive. The frozen wrapper classifies mining and compute work; verification is
+a future consensus service performed *over* those claims.
+
+Conceptually:
+
+```text
+executor
+   |
+execution proof
+   |
+   +----------------------+
+   |                      |
+validator/verifier A   validator/verifier B
+   |                      |
+VerificationReceipt    VerificationReceipt
+   |                      |
+   +----------+-----------+
+              |
+      consensus acceptance
+              |
+      optional verifier reward
+```
+
+A verifier reward should be tied to an exact proof/work subject rather than to a
+claim such as "I verified something". A future receipt could bind:
+
+```text
+VerificationReceipt {
+    block_challenge;
+    work_event_id;
+    proof_id;
+    verifier_identity_or_nullifier;
+    verification_profile;
+    result;              // accept / reject
+    receipt_commitment;
+}
+```
+
+Open design choices include whether verification is:
+
+- deterministic validator duty paid from normal block rewards/fees,
+- separately issued verification work,
+- sampled/committee work,
+- challenge-based re-verification,
+- or a mixture.
+
+The design must avoid circular economics where a verifier can mint arbitrary value
+by creating useless proofs for itself to verify. Rewards should therefore be
+anchored to consensus-requested work/proofs and subject to replay/nullifier rules.
+
+If verification ever receives its own token classes, those should be introduced
+as a **new consensus-layer reward role**, not silently overloaded onto
+MI/MV/MC/CI/CV/CC. This preserves compatibility with the current work-token
+primitive while leaving room for a computation blockchain that pays executors,
+miners and verifiers.
+
 ## 3. Hybrid block challenge
 
 A useful-compute job should eventually be bound to live chain state so precomputed or replayed work cannot be freely stockpiled.
@@ -174,6 +236,10 @@ The architecture should preserve one invariant:
 
 > all payout views derived from the same accepted event remain anchored to one `WorkEventId`, so reclassification cannot silently create new underlying work.
 
+Verifier rewards, if added later, remain anchored to verification receipts for
+that same accepted proof/work subject rather than becoming a seventh work-event
+view by accident.
+
 ## 7. Mining and compute complexity remain separate dimensions
 
 Do not bake a permanent equation such as:
@@ -276,8 +342,10 @@ BlockWorkCertificate {
     block_subject;
     accepted_work_events[];
     proof_commitments[];
+    verification_receipts[];
     mining_summary;
     compute_summary;
+    verification_summary;
     payout_policy_id;
     module_policy_root;
 }
@@ -285,7 +353,8 @@ BlockWorkCertificate {
 
 This is only a conceptual boundary, not a finalized serialization.
 
-The certificate should allow validators to verify every accepted event without re-running the expensive useful computation.
+The certificate should allow validators to verify every accepted event without re-running the expensive useful computation. If verifier rewards exist, it should
+also make their subject/replay relationship explicit.
 
 ## 12. Module policy and lifecycle
 
@@ -323,7 +392,8 @@ Open research questions include:
 - how to price memory/communication/FHE bootstrapping costs,
 - whether normalization should be deterministic from job/profile descriptors,
 - how to resist specialized hardware gaming,
-- how to update calibration without invalidating historical work.
+- how to update calibration without invalidating historical work,
+- whether verifier effort needs a separate deterministic cost model or is paid as validator duty.
 
 The cryptographic wrapper should not guess these answers.
 
@@ -343,6 +413,7 @@ Future coin work eventually needs explicit designs for:
 - fee market,
 - difficulty adjustment,
 - work-proof validation,
+- verification receipt/reward rules,
 - replay/double-spend rules,
 - governance/upgrades,
 - module eligibility/deprecation.
@@ -357,9 +428,12 @@ Before production claims, simulate or formally analyze:
 - module-label gaming,
 - fake complexity inflation,
 - proof replay,
+- verifier self-dealing / circular proof farming,
+- duplicate verification-receipt rewards,
+- verifier cartel or censorship incentives,
 - module-specific liquidity fragmentation,
 - invariant denomination dilution,
-- mining/compute subsidy imbalance,
+- mining/compute/verifier subsidy imbalance,
 - denial-of-service through expensive verification,
 - module cartel/whitelist capture,
 - hidden-contract spam,
@@ -385,6 +459,8 @@ accepted block challenge
 canonical WorkEvent
         |
 2 x 3 payout classification
+        |
+consensus verification / optional rewarded VerificationReceipts
         |
 consensus-defined issuance
 ```

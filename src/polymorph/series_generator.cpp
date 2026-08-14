@@ -1,6 +1,8 @@
 #include "series_generator.hpp"
 
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/params.h>
 #include <openssl/rand.h>
 
 #include <algorithm>
@@ -22,13 +24,22 @@ void append_u64(std::vector<unsigned char>& out, std::uint64_t value) {
         out.push_back(static_cast<unsigned char>((value >> shift) & 0xffu));
 }
 
-void append_domain(std::vector<unsigned char>& out, std::string_view domain) {
-    out.insert(out.end(), domain.begin(), domain.end());
-    out.push_back(0);
+void append_blob(std::vector<unsigned char>& out,
+                 const std::uint8_t* data,
+                 std::size_t size) {
+    append_u64(out, static_cast<std::uint64_t>(size));
+    if (size != 0)
+        out.insert(out.end(), data, data + size);
 }
 
-std::vector<unsigned char> kmac_once(const SeriesSeed& key,
-                                     const std::vector<unsigned char>& message) {
+std::vector<std::uint8_t> kmacxof256(
+    const SeriesSeed& key,
+    const std::vector<std::uint8_t>& message,
+    std::string_view customization,
+    std::size_t output_bytes) {
+    if (output_bytes == 0 || output_bytes > MAX_SERIES_BYTES)
+        throw std::runtime_error("KMACXOF256 output length outside local limit");
+
     EVP_MAC* mac = EVP_MAC_fetch(nullptr, "KMAC-256", nullptr);
     if (!mac)
         throw std::runtime_error("OpenSSL KMAC-256 unavailable");
@@ -38,60 +49,62 @@ std::vector<unsigned char> kmac_once(const SeriesSeed& key,
     if (!ctx)
         throw std::runtime_error("EVP_MAC_CTX_new failed");
 
-    std::array<unsigned char, 64> buffer{};
-    std::size_t out_len = 0;
-    const bool ok = EVP_MAC_init(ctx, key.data(), key.size(), nullptr) == 1 &&
-                    EVP_MAC_update(ctx, message.data(), message.size()) == 1 &&
-                    EVP_MAC_final(ctx, buffer.data(), &out_len, buffer.size()) == 1;
+    int xof = 1;
+    std::size_t requested = output_bytes;
+    auto* custom_ptr = const_cast<char*>(customization.data());
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_octet_string(
+            OSSL_MAC_PARAM_CUSTOM, custom_ptr, customization.size()),
+        OSSL_PARAM_construct_int(OSSL_MAC_PARAM_XOF, &xof),
+        OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &requested),
+        OSSL_PARAM_construct_end(),
+    };
+
+    std::vector<std::uint8_t> out(output_bytes);
+    std::size_t written = 0;
+    const bool ok =
+        EVP_MAC_init(ctx, key.data(), key.size(), params) == 1 &&
+        EVP_MAC_update(ctx, message.data(), message.size()) == 1 &&
+        EVP_MAC_final(ctx, out.data(), &written, out.size()) == 1;
     EVP_MAC_CTX_free(ctx);
 
-    if (!ok || out_len == 0 || out_len > buffer.size())
-        throw std::runtime_error("KMAC-256 series derivation failed");
+    if (!ok || written != output_bytes)
+        throw std::runtime_error("OpenSSL KMACXOF256 derivation failed");
+    return out;
+}
 
-    return {buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(out_len)};
+std::vector<std::uint8_t> series_message(
+    const std::vector<std::uint8_t>& input,
+    std::uint64_t epoch) {
+    std::vector<std::uint8_t> message;
+    message.reserve(32 + input.size());
+    append_u64(message, 2); // schedule version
+    append_u64(message, epoch);
+    append_blob(message, input.data(), input.size());
+    return message;
 }
 
 std::vector<std::uint8_t> expand_series(const SeriesSeed& seed,
                                         const std::vector<std::uint8_t>& input,
                                         std::uint64_t epoch,
                                         std::size_t bytes) {
-    std::vector<std::uint8_t> out;
-    out.reserve(bytes);
-
-    std::uint64_t counter = 0;
-    while (out.size() < bytes) {
-        std::vector<unsigned char> message;
-        message.reserve(64 + input.size());
-        append_domain(message, "V0ID-SERIES-v1");
-        append_u64(message, epoch);
-        append_u64(message, counter++);
-        append_u64(message, static_cast<std::uint64_t>(input.size()));
-        message.insert(message.end(), input.begin(), input.end());
-
-        const auto block = kmac_once(seed, message);
-        const auto remaining = bytes - out.size();
-        const auto take = std::min(remaining, block.size());
-        out.insert(out.end(), block.begin(), block.begin() + static_cast<std::ptrdiff_t>(take));
-    }
-    return out;
+    return kmacxof256(seed, series_message(input, epoch),
+                      "V0ID private polymorphic series v2", bytes);
 }
 
 MorphSeed derive_morph_seed(const SeriesSeed& seed,
                             const std::vector<std::uint8_t>& series,
                             std::uint64_t epoch) {
-    std::vector<unsigned char> message;
-    message.reserve(64 + series.size());
-    append_domain(message, "V0ID-SERIES-MORPH-v1");
+    std::vector<std::uint8_t> message;
+    message.reserve(24 + series.size());
+    append_u64(message, 2);
     append_u64(message, epoch);
-    append_u64(message, static_cast<std::uint64_t>(series.size()));
-    message.insert(message.end(), series.begin(), series.end());
+    append_blob(message, series.data(), series.size());
 
-    const auto block = kmac_once(seed, message);
-    if (block.size() < MorphSeed{}.size())
-        throw std::runtime_error("KMAC series output too short for morph seed");
-
+    const auto block = kmacxof256(
+        seed, message, "V0ID trusted ProgramMorpher seed v2", MorphSeed{}.size());
     MorphSeed out{};
-    std::copy_n(block.begin(), out.size(), out.begin());
+    std::copy(block.begin(), block.end(), out.begin());
     return out;
 }
 
@@ -119,21 +132,24 @@ void validate_derived(const DerivedSeries& derived) {
 
 SeriesSeed random_series_seed() {
     SeriesSeed seed{};
-    if (RAND_bytes(seed.data(), static_cast<int>(seed.size())) != 1)
-        throw std::runtime_error("RAND_bytes failed while generating series seed");
+    // This root is intended never to become evaluator-visible. OpenSSL's private
+    // RAND instance separates private values from public random outputs while
+    // retaining the platform-seeded CSPRNG and explicit failure handling.
+    if (RAND_priv_bytes(seed.data(), static_cast<int>(seed.size())) != 1)
+        throw std::runtime_error("RAND_priv_bytes failed while generating private series root");
     return seed;
 }
 
 KmacSeriesGenerator::KmacSeriesGenerator(std::size_t series_bytes)
     : series_bytes_(series_bytes) {
     if (series_bytes_ == 0 || series_bytes_ > MAX_SERIES_BYTES)
-        throw std::runtime_error("KMAC series length outside local limit");
+        throw std::runtime_error("KMACXOF series length outside local limit");
 }
 
 SeriesProfile KmacSeriesGenerator::profile() const {
     SeriesProfile out;
-    out.generator_id = "v0id-series-kmac-v1";
-    out.version = 1;
+    out.generator_id = "v0id-series-kmacxof256-v2";
+    out.version = 2;
     out.parameters.resize(8);
     const auto n = static_cast<std::uint64_t>(series_bytes_);
     for (int i = 0; i < 8; ++i)
@@ -149,17 +165,16 @@ DerivedSeries KmacSeriesGenerator::derive(const std::vector<std::uint8_t>& input
     out.series = expand_series(seed, input, epoch, series_bytes_);
     out.morph_seed = derive_morph_seed(seed, out.series, epoch);
 
-    // Keep a small client-only provenance token so later experiments can bind
-    // trace measurements to a derivation without exposing the series itself.
-    std::vector<unsigned char> manifest_message;
-    manifest_message.reserve(64 + out.series.size());
-    append_domain(manifest_message, "V0ID-SERIES-MANIFEST-v1");
+    // Client-only provenance token under a third customization string. Distinct
+    // domains ensure series bytes, morph material and provenance never reuse the
+    // same KMACXOF output stream as interchangeable key material.
+    std::vector<std::uint8_t> manifest_message;
+    manifest_message.reserve(24 + out.series.size());
+    append_u64(manifest_message, 2);
     append_u64(manifest_message, epoch);
-    manifest_message.insert(manifest_message.end(), out.series.begin(), out.series.end());
-    const auto manifest_block = kmac_once(seed, manifest_message);
-    const auto manifest_size = std::min<std::size_t>(16, manifest_block.size());
-    out.private_manifest.assign(manifest_block.begin(),
-                                manifest_block.begin() + static_cast<std::ptrdiff_t>(manifest_size));
+    append_blob(manifest_message, out.series.data(), out.series.size());
+    out.private_manifest = kmacxof256(
+        seed, manifest_message, "V0ID private series provenance v2", 16);
 
     validate_derived(out);
     return out;

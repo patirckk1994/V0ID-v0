@@ -25,7 +25,6 @@ set(WITH_DOCS OFF CACHE BOOL "" FORCE)
 set(ENABLE_DRAFTS OFF CACHE BOOL "" FORCE)
 set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 
-# Network prototype dependencies.
 FetchContent_Declare(
     libzmq
     GIT_REPOSITORY https://github.com/zeromq/libzmq.git
@@ -42,10 +41,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(cppzmq)
 
-# Shared WAMR runtime profile used by the remote-visible MathVM executable and
-# the separate client-only polymorphism executable. Both use the classic
-# interpreter so instruction metering works; no WASI/libc shims, JIT/AOT,
-# threads/shared memory, mini-loader or configurable bounds bypass are enabled.
 option(V0ID_ENABLE_MATHVM "Build the WAMR-backed V0ID sandbox components" ON)
 if(V0ID_ENABLE_MATHVM)
     FetchContent_Declare(
@@ -156,6 +151,11 @@ target_include_directories(v0id_core PUBLIC
     src/crypto
 )
 target_link_libraries(v0id_core PUBLIC OpenSSL::Crypto)
+
+add_executable(v0id-series-first-kex-tests
+    src/crypto/series_first_schedule_tests.cpp
+)
+target_link_libraries(v0id-series-first-kex-tests PRIVATE v0id_core)
 
 # PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
 # semantic job, exact generator implementation, morphed executable, profile,

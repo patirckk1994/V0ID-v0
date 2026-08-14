@@ -30,8 +30,10 @@ bool bit_at(const std::vector<std::uint8_t>& bytes, std::size_t bit) {
 
 z3::expr xor_all(z3::context& ctx, const std::vector<z3::expr>& terms) {
     z3::expr out = ctx.bool_val(false);
+    // Boolean inequality is XOR. Using only the core C++ expression operators
+    // keeps this compatible with older distro Z3 C++ headers too.
     for (const auto& term : terms)
-        out = z3::xor_(out, term);
+        out = (out != term);
     return out;
 }
 

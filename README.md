@@ -2,7 +2,7 @@
 
 Research prototype for exact encrypted, runtime-programmable computation with client-side polymorphism, series-first morph derivation, remote BinFHE evaluation and a sandboxed mathematical extension layer.
 
-**Current research scaffold: V0.4.2.**
+**Current research scaffold: V0.4.3.**
 
 V0ID is experimental research code, not audited production cryptography. The repository intentionally distinguishes proven plumbing milestones from security conjectures and future work.
 
@@ -22,6 +22,8 @@ V0ID is experimental research code, not audited production cryptography. The rep
         |                              /       |        \
  remote evaluator                 classical   PQ   experimental
         |                                     |
+ cached evaluator session                     |
+        |                                     |
         +------------------+------------------+
                            |
                  series / polymorphism
@@ -30,7 +32,7 @@ V0ID is experimental research code, not audited production cryptography. The rep
 The two execution paths currently serve different purposes:
 
 - the encrypted Turing-machine-like interpreter is the universal exact encrypted reference path;
-- MathVM is the new bounded, faster, portable way to compose mathematical primitives without allowing peers to transmit native plugins.
+- MathVM is the bounded, faster, portable way to compose mathematical primitives without allowing peers to transmit native plugins.
 
 ## Proven V0.4 remote-machine milestone
 
@@ -58,18 +60,18 @@ The client recovered:
 
 and verified its private integrity candidate.
 
-The successful run transferred roughly:
+The successful V0.4 run transferred roughly:
 
 ```text
 request: ~551 MB
 result : ~666 KB
 ```
 
-because BinFHE context/bootstrap material is still resent with every full-machine job. Persistent evaluator session/key caching is therefore a near-term engineering priority.
+The large request was dominated by BinFHE context/bootstrap material being resent with the job. V0.4.3 now addresses that engineering bottleneck by separating evaluator-session setup from recurring RMJ3 jobs.
 
 ## V0.4.1: series first -> morph later
 
-The client-side morph path now supports a `PolymorphicSeriesGenerator`:
+The client-side morph path supports a `PolymorphicSeriesGenerator`:
 
 ```text
 semantic input
@@ -98,21 +100,57 @@ This is an implementation of the **series-first research direction**, not a proo
 
 See `docs/SERIES_GENERATOR.md`.
 
-## V0.4.1 remote profile identifiers
+## V0.4.3: cached BinFHE evaluator sessions
 
-The bounded remote-machine wire format is now `V0IDRMJ2` / `V0IDRMR2` and carries public profile identifiers such as:
+V0.4.1 introduced public crypto/profile IDs in RMJ2/RMR2. V0.4.3 bumps the remote-machine protocol to RMS3/RMJ3/RMR3 and removes the expensive evaluator material from each job.
+
+Old shape:
+
+```text
+RMJ2 every job
+    BinFHEContext
+    refresh/bootstrap key
+    switching key
+    encrypted machine
+```
+
+V0.4.3 shape:
+
+```text
+RMS3 once per evaluator session
+    256-bit public session id
+    BinFHEContext
+    refresh/bootstrap key
+    switching key
+          |
+          v
+ evaluator BTKeyLoad + process-local cache
+          |
+          v
+RMJ3 each job
+    session id
+    encrypted machine only
+```
+
+The evaluator demo currently retains up to four loaded sessions in memory. Sessions are not persisted to disk and disappear when the process exits. Duplicate/all-zero IDs are rejected.
+
+The session ID is generated independently of `SeriesSeed`; it is public routing/cache state, not secret key material.
+
+Current job profile:
 
 ```text
 primitive             openfhe-binfhe
 parameter set         STD128
-machine protocol      v0id-remote-machine-v2
+machine protocol      v0id-remote-machine-v3
 integrity profile     toy-fingerprint32-v1
 series generator      v0id-series-kmac-v1 / v1
 ```
 
-The evaluator fails closed on unsupported execution/integrity profiles and returns the profile with the result. The client requires an exact match.
+An RMJ3 job must reference an installed session whose primitive and parameter set match the job profile. The server echoes both session ID and full profile in RMR3 and the client requires exact matches.
 
-This is self-description, not yet a full authenticated capability-negotiation protocol.
+This is still self-description rather than authenticated negotiation. Session/profile authentication and downgrade protection remain future work.
+
+See `docs/REMOTE_MACHINE.md`.
 
 ## V0.4.2: WAMR MathVM sandbox
 
@@ -130,6 +168,7 @@ V0ID moves toward:
 peer/user
     -> portable Wasm mathematical composition
     -> explicit primitive manifest
+    -> V0ID Wasm pre-validator
     -> WAMR sandbox
     -> locally installed trusted primitive providers
 ```
@@ -161,7 +200,7 @@ v0id_math.primitive_u64(
 ) -> u64
 ```
 
-Every call is checked against the program's declared `PrimitiveRequirement` manifest.
+Every call is checked against the program's declared `PrimitiveRequirement` manifest. Before WAMR loads the module, V0ID also rejects non-allowlisted imports and linear-memory declarations outside the sandbox policy.
 
 Current built-in providers:
 
@@ -198,34 +237,31 @@ provider cost           <= 1,000,000 units
 
 Native provider work has a separate call/cost budget because time spent inside a native accelerator is not represented by Wasm instruction count.
 
-## Proven V0.4.2 local MathVM sandbox milestone
+## Proven V0.4.2 local MathVM milestone
 
-The WAMR MathVM host and rejection-boundary suite have now been compiled and run successfully on the project's Linux development host.
-
-`v0id-mathvm-tests` constructs its Wasm modules directly in memory and reported:
+The WAMR host and rejection-boundary suite have been compiled and run successfully on the project's Linux development host:
 
 ```text
 V0ID MathVM sandbox tests: 11 passed, 0 failed
 OK: local MathVM sandbox rejection boundary exercised
 ```
 
-The verified cases are:
+Verified cases include valid execution, manifest enforcement, undeclared-provider rejection, provider-budget exhaustion, infinite-loop instruction metering, module-size/memory limits, non-Wasm rejection, WASI/non-allowlisted-import rejection and recovery after trapped jobs.
 
-- normal Wasm execution,
-- a declared provider call,
-- manifest id/tag mismatch rejection,
-- undeclared provider rejection,
-- provider call-budget exhaustion,
-- infinite-loop instruction metering,
-- oversized module rejection,
-- excessive linear-memory rejection before WAMR execution,
-- non-Wasm/AOT-like input rejection,
-- WASI/other non-allowlisted host import rejection before WAMR execution,
-- recovery after trapped/rejected jobs.
+The externally compiled no-WASI guest has also been run successfully. With the current clang/wasm-ld toolchain it produced a 458-byte module and reported:
 
-Two useful hardening findings were discovered during this test pass: WAMR's memory override warning was not itself fail-closed, and an unused unresolved WASI import could remain linked as a warning when WASI support was disabled. V0ID therefore now pre-validates the Wasm memory and import sections itself before handing bytecode to WAMR.
+```text
+V0ID MathVM ABI      : v1
+module bytes         : 458
+result               : 1596
+provider calls       : 3
+provider cost        : 130
+OK: sandboxed Wasm composed locally installed math/PQ-test providers
+```
 
-Build and rerun the verified gate with:
+This is a functional local sandbox/ABI milestone, not a proof that WAMR or the V0ID host ABI is vulnerability-free.
+
+Build and rerun the rejection gate with:
 
 ```sh
 git pull
@@ -234,9 +270,7 @@ cmake --build build -j --target v0id-mathvm-tests
 ./build/v0id-mathvm-tests
 ```
 
-Passing this suite is a functional sandbox-policy milestone, not a proof that WAMR or the V0ID host ABI is vulnerability-free.
-
-## Optional MathVM guest demo
+## MathVM guest demo
 
 Build the host:
 
@@ -257,35 +291,23 @@ clang --target=wasm32 -O2 -nostdlib \
   -o build/series_math.wasm
 ```
 
-`wasm-ld` reserves linear-memory space for the guest stack plus a small data area. A one-page (64 KiB) initial memory is too small for the current toolchain; two pages (128 KiB) is the explicit portable floor used by this example and remains well below V0ID's 16-page sandbox cap.
-
 Run:
 
 ```sh
 ./build/v0id-mathvm build/series_math.wasm
 ```
 
-Expected result:
+## V0.4.3 remote encrypted-machine demo
 
-```text
-13 + 29 mod 97      = 42
-5*7 + 3 mod 12289   = 38
-42 * 38 mod 65537   = 1596
-
-result: 1596
-provider calls: 3
-```
-
-## Remote encrypted-machine demo
-
-Build:
+Build both client and evaluator from the same checkout because RMJ3 is wire-incompatible with RMJ2:
 
 ```sh
+git pull
 cmake -S . -B build
 cmake --build build -j --target v0id-remote-machine
 ```
 
-Evaluator:
+Evaluator (`1` counts jobs; the RMS3 setup message does not consume the count):
 
 ```sh
 ./build/v0id-remote-machine server EVAL tcp://*:7003 1
@@ -297,7 +319,18 @@ Client:
 ./build/v0id-remote-machine client CLIENT tcp://127.0.0.1:7003
 ```
 
-The V0.4.1 series/profile revision still needs an end-to-end regression run after the proven V0.4 baseline.
+The client prints the one-time session setup size and the new RMJ3 per-job size separately:
+
+```text
+session setup bytes
+  context bytes
+  refresh key bytes
+  switching key bytes
+RMJ3 per-job bytes
+cached setup resent: NO
+```
+
+V0.4.3 is implemented but has not yet been rebuilt/run locally. The next runtime milestone is to confirm the existing series-derived `13 -> 14` computation and private self-check still pass while measuring how far the recurring RMJ3 payload falls below the old ~551 MB request.
 
 ## Integrity status
 
@@ -354,10 +387,10 @@ src/polymorph/program_morpher.*         semantic morph compiler + private manife
 src/polymorph/series_generator.*        series-first generator layer
 src/integrity/toy_fingerprint.*         test-only plaintext/FHE fingerprint
 src/fhe/fhe_codec.hpp                   OpenFHE serialization helpers
-src/fhe/remote_machine_codec.hpp        RMJ2/RMR2 machine/profile wire format
+src/fhe/remote_machine_codec.hpp        RMS3/RMJ3/RMR3 session/job wire format
 src/fhe/remote_machine.*                fixed-path encrypted evaluator
 src/net/peer_transport.*                binary ZeroMQ envelope transport
-src/net/remote_machine_demo.cpp         remote encrypted whole-machine demo
+src/net/remote_machine_demo.cpp         cached remote encrypted-machine demo
 src/mathvm/mathvm.*                     primitive registry / MathVM ABI
 src/mathvm/wamr_sandbox.*               WAMR sandbox wrapper and resource limits
 src/mathvm/mathvm_demo.cpp               external Wasm guest demo runner
@@ -365,7 +398,7 @@ src/mathvm/mathvm_tests.cpp              self-contained sandbox rejection tests
 examples/mathvm/series_math.c            no-WASI mathematical guest
 docs/POLYMORPHISM.md                    morph/correlation threat model
 docs/SERIES_GENERATOR.md                series-first research boundary
-docs/REMOTE_MACHINE.md                  remote encrypted-machine protocol
+docs/REMOTE_MACHINE.md                  remote encrypted-machine/session protocol
 docs/MATHVM.md                          WAMR sandbox/provider architecture
 ```
 
@@ -374,13 +407,13 @@ docs/MATHVM.md                          WAMR sandbox/provider architecture
 Immediate order:
 
 ```text
-1. compile/run the external no-WASI MathVM guest and confirm result 1596
-2. regression-run V0.4.1 series -> morph -> BinFHE -> remote -> 14
-3. add persistent evaluator session/evaluation-key caching
+1. rebuild/run V0.4.3 RMS3 -> cached evaluator -> RMJ3 -> BinFHE -> remote -> 14
+2. record actual one-time setup bytes vs recurring per-job bytes
+3. add multi-job/session lifecycle tests and authenticated session/profile binding
 4. define and transmit RemoteMathProgram
 5. add authenticated MathVM/provider capability negotiation + downgrade protection
 6. integrate a real standardized PQ provider
-7. only then experiment with generated-relation / series-first key-exchange research
+7. experiment with generated-relation / series-first key-exchange research only under explicit assumptions
 ```
 
 Parallel later work includes distributed encrypted tape, trace classification, stronger polymorphism, encrypted halt/no-op semantics, checkpoint/resume and real hidden-integrity machinery.

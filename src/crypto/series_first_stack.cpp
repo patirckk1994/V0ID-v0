@@ -161,6 +161,8 @@ StackContextHash512 hash_series_first_stack_context(
                 context.generator_binding.size());
     append_blob(canonical, context.kex_transcript_binding.data(),
                 context.kex_transcript_binding.size());
+    append_blob(canonical, context.shared_modules_binding.data(),
+                context.shared_modules_binding.size());
     append_blob(canonical, context.outer_channel_binding.data(),
                 context.outer_channel_binding.size());
     return sha3_512(canonical);

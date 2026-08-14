@@ -236,6 +236,14 @@ target_link_libraries(v0id-remote-machine PRIVATE
     v0id_core
     OpenSSL::Crypto
 )
+if(V0ID_ENABLE_MATHVM)
+    # The remote executable only uses WAMR on the client side. `--series-wasm`
+    # derives private morph material locally, then the existing RMJ3 path sends
+    # only the resulting encrypted machine. No Wasm module is sent to the peer.
+    target_link_libraries(v0id-remote-machine PRIVATE v0id_wasm_polymorph)
+    target_compile_definitions(v0id-remote-machine PRIVATE
+        V0ID_HAVE_WASM_POLYMORPH=1)
+endif()
 v0id_use_openfhe(v0id-remote-machine)
 
 if(UNIX AND NOT APPLE)

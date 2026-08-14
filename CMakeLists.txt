@@ -8,6 +8,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(OpenFHE CONFIG REQUIRED)
 find_package(OpenSSL 3 REQUIRED)
 
+# CMake 4 removed compatibility with policy versions older than 3.5. libzmq
+# v4.3.5 still declares a 2.8.12...3.31 compatibility range, so a modern
+# top-level build otherwise dies while configuring the fetched dependency.
+# This is the supported compatibility escape hatch suggested by CMake itself;
+# it avoids patching the upstream libzmq source tree.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING
+        "Minimum policy compatibility for legacy fetched dependencies" FORCE)
+endif()
+
 # Network prototype dependencies are fetched from their upstream public repos.
 # libzmq provides the transport; cppzmq is the header-only C++ binding included
 # by src/net/peer_transport.hpp as <zmq.hpp>.

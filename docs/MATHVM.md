@@ -60,7 +60,7 @@ It does **not** receive direct filesystem, socket, process, environment, thread 
 
 The module must also travel with a `PrimitiveRequirement` manifest. Before execution V0ID verifies every requirement against the local `PrimitiveRegistry`. During execution the generic host call rejects any `(tag, version)` that was not declared by that program, even if the evaluator has such a provider installed.
 
-This means a module cannot silently discover/use extra locally installed provider capabilities.
+V0ID also pre-validates the raw Wasm binary before WAMR loads it. V0.4.2 permits only the function import `v0id_math.primitive_u64`; non-allowlisted imports, WASI imports, imported memories, tables and globals are rejected before runtime linking. This is intentionally stricter than relying on a disabled feature to remain unusable.
 
 ## Resource bounds
 
@@ -77,7 +77,7 @@ provider calls          4,096
 provider cost           1,000,000 abstract units
 ```
 
-The WAMR runtime itself is initialized from the fixed V0ID pool. The module is instantiated with a maximum page count and executed under WAMR instruction metering.
+The WAMR runtime itself is initialized from the fixed V0ID pool. Before WAMR receives a module, the V0ID pre-validator checks the memory section and requires any declared Wasm32 linear memory to have an explicit maximum no greater than the sandbox cap. Shared-memory, memory64, imported-memory and unbounded-memory forms are outside the V0.4.2 ABI and fail closed.
 
 Native providers need a separate budget because time spent inside a native accelerator is not represented by Wasm bytecode instruction count. Every provider therefore has a declared cost; the host import counts both calls and accumulated provider cost and traps when either public limit is exhausted.
 
@@ -119,6 +119,44 @@ b = a*s + e mod q
 for scalar `u64` inputs. It exists solely to prove the provider/plugin plumbing. It is **not LWE encryption, not a post-quantum primitive, and carries no security claim**. Real LWE-style work requires dimensions, distributions, parameter selection and analysis that are intentionally absent here.
 
 Trusted local applications can register additional `PrimitiveProvider` implementations. Remote peers still exchange only Wasm + identifiers/manifests; they do not install native code.
+
+## Verified local rejection-boundary milestone
+
+The V0.4.2 WAMR host and `v0id-mathvm-tests` suite have now been built and run successfully on the project's Linux development host.
+
+The suite reported:
+
+```text
+V0ID MathVM sandbox tests: 11 passed, 0 failed
+OK: local MathVM sandbox rejection boundary exercised
+```
+
+Verified cases:
+
+- valid Wasm execution,
+- declared provider execution,
+- manifest id/tag mismatch rejection,
+- undeclared provider call rejection,
+- provider call-budget exhaustion,
+- infinite-loop instruction-limit trap,
+- oversized-module rejection before load,
+- linear-memory declarations above the sandbox cap rejected before load,
+- non-Wasm/AOT-like input rejection,
+- WASI/non-allowlisted import rejection before WAMR linking,
+- clean recovery after rejected/trapped jobs.
+
+The test pass exposed two useful implementation details. First, WAMR's `max_memory_pages` override behavior could warn without rejecting a module whose own declared memory exceeded V0ID's intended policy. Second, with WASI support disabled, an unused unresolved WASI import could remain only a linker warning and the entrypoint could still execute. V0ID therefore moved both decisions into its own pre-validator instead of treating runtime warnings as policy enforcement.
+
+This verifies the intended local rejection behavior exercised by the suite. It does **not** constitute a proof that WAMR or the V0ID host ABI is vulnerability-free.
+
+Run the gate with:
+
+```sh
+git pull
+cmake -S . -B build
+cmake --build build -j --target v0id-mathvm-tests
+./build/v0id-mathvm-tests
+```
 
 ## Demo guest
 
@@ -237,4 +275,4 @@ V0.4.2 does not yet provide:
 - a proof that WAMR + the V0ID host ABI is vulnerability-free,
 - a proof that any user-defined series or primitive is post-quantum secure.
 
-The immediate milestone is much narrower: compile the pinned WAMR profile, execute the bundled no-WASI module, verify resource limits and provider allowlisting, then fuzz/reject malformed modules before putting MathVM programs on the network.
+The next immediate milestones are to run the external no-WASI guest, regression-run the V0.4.1 series-derived remote encrypted machine, add evaluator-session/key caching, and only then put a `RemoteMathProgram` transport on the network.

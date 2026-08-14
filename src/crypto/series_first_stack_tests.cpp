@@ -41,6 +41,7 @@ SeriesFirstStackContext base_context() {
         c.semantic_binding[i] = static_cast<std::uint8_t>((i * 7 + 1) & 0xffu);
         c.generator_binding[i] = static_cast<std::uint8_t>((i * 11 + 3) & 0xffu);
         c.kex_transcript_binding[i] = static_cast<std::uint8_t>((i * 13 + 5) & 0xffu);
+        c.shared_modules_binding[i] = static_cast<std::uint8_t>((i * 17 + 9) & 0xffu);
     }
     return c;
 }
@@ -107,6 +108,11 @@ int main() try {
     changed.kex_transcript_binding[0] ^= 1u;
     r.check(v0id::crypto::hash_series_first_stack_context(changed) != h,
             "KEX transcript substitution changes whole-stack context");
+
+    changed = base;
+    changed.shared_modules_binding[0] ^= 1u;
+    r.check(v0id::crypto::hash_series_first_stack_context(changed) != h,
+            "shared module-set substitution changes whole-stack context");
 
     changed = base;
     changed.outer_channel_binding = {0x54, 0x4c, 0x53, 0x2d, 0x45, 0x58, 0x50};

@@ -3,6 +3,7 @@
 #include "mathvm.hpp"
 
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace v0id::mathvm {
@@ -29,6 +30,7 @@ public:
 private:
     SandboxLimits limits_;
     std::vector<std::uint8_t> runtime_pool_;
+    std::mutex execution_mutex_;
     bool initialized_{};
 };
 

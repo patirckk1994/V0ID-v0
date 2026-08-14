@@ -107,7 +107,7 @@ if(V0ID_ENABLE_MATHVM)
         src/mathvm/wamr_sandbox.cpp
     )
     target_include_directories(v0id_mathvm PUBLIC src/mathvm)
-    target_link_libraries(v0id_mathvm PUBLIC v0id_wamr)
+    target_link_libraries(v0id_mathvm PUBLIC v0id_wamr OpenSSL::Crypto)
 
     add_executable(v0id-mathvm
         src/mathvm/mathvm_demo.cpp
@@ -116,9 +116,9 @@ if(V0ID_ENABLE_MATHVM)
 
     # Self-contained host-side sandbox tests. The test executable constructs
     # tiny Wasm modules in memory, so it does not require a wasm32 clang target.
-    # It exercises successful execution plus rejection of loops, undeclared
-    # primitives, provider-budget exhaustion, excessive memory, WASI imports and
-    # non-Wasm/AOT-like input before MathVM is exposed over the network.
+    # It exercises successful scalar/byte providers plus rejection of loops,
+    # undeclared primitives, provider-budget exhaustion, excessive memory, WASI
+    # imports and non-Wasm/AOT-like input before MathVM is exposed over a network.
     add_executable(v0id-mathvm-tests
         src/mathvm/mathvm_tests.cpp
     )

@@ -58,9 +58,19 @@ function(v0id_use_openfhe target)
     target_link_libraries(${target} PRIVATE ${V0ID_OPENFHE_LIBRARIES})
 endfunction()
 
+# Client-side program representation and precomputed polymorphism compiler.
+add_library(v0id_core
+    src/polymorph/program_morpher.cpp
+)
+target_include_directories(v0id_core PUBLIC
+    src/core
+    src/polymorph
+)
+target_link_libraries(v0id_core PUBLIC OpenSSL::Crypto)
+
 add_executable(v0id src/main.cpp)
+target_link_libraries(v0id PRIVATE v0id_core OpenSSL::Crypto)
 v0id_use_openfhe(v0id)
-target_link_libraries(v0id PRIVATE OpenSSL::Crypto)
 
 # Binary-safe transport layer. The envelope payload is deliberately opaque so
 # OpenFHE serialized ciphertext bytes can be placed directly inside it.

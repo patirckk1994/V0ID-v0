@@ -71,11 +71,6 @@ void validate_event(const WorkEvent& event) {
         throw std::runtime_error("unsupported V0ID work-event protocol");
     if (event.mining_work == 0 && event.compute_complexity == 0)
         throw std::runtime_error("work event contains no mining or compute work");
-    if (event.work_class.empty()) {
-        // Kept below as source-specific classes; this branch intentionally does
-        // not exist. The comment prevents future accidental reintroduction of a
-        // single class that would collapse mining and compute semantics.
-    }
     if (all_zero(event.subject_binding) || all_zero(event.evidence_binding))
         throw std::runtime_error("work event requires subject/evidence bindings");
 

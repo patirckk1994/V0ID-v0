@@ -123,6 +123,13 @@ if(V0ID_ENABLE_MATHVM)
         src/mathvm/mathvm_tests.cpp
     )
     target_link_libraries(v0id-mathvm-tests PRIVATE v0id_mathvm)
+
+    # Final ABI-v2 byte boundary gate: explicit Wasm pointer/length OOB,
+    # host byte-budget rejection, and successful recovery after both traps.
+    add_executable(v0id-mathvm-byte-boundary-tests
+        src/mathvm/byte_boundary_tests.cpp
+    )
+    target_link_libraries(v0id-mathvm-byte-boundary-tests PRIVATE v0id_mathvm)
 endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenFHE_CXX_FLAGS}")

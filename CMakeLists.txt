@@ -165,11 +165,32 @@ target_link_libraries(v0id-series-first-stack-tests PRIVATE v0id_core)
 
 # Phase-1 polymorphism leakage benchmark. It separates deliberately public fixed
 # evaluator shape from a stronger plaintext diagnostic that the current BinFHE
-# evaluator does not receive. Later phases add encrypted wire-size/timing traces.
+# evaluator does not receive. Later wire/timing work is deferred behind execution
+# soundness because honest-execution verification is the critical-path problem.
 add_executable(v0id-polymorphism-distinguisher
     src/integrity/polymorphism_distinguisher.cpp
 )
 target_link_libraries(v0id-polymorphism-distinguisher PRIVATE v0id_core)
+
+# Defensive malicious-evaluator harness. It uses the real ProgramMorpher,
+# RemoteEncryptedMachine and legacy FHE fingerprint plumbing to demonstrate that
+# an evaluator can skip requested rounds while preserving an accepted final
+# output for a fixed-point job. Exit 1 means the expected architectural break was
+# reproduced; this target exists to define the execution-proof requirement.
+add_executable(v0id-malicious-evaluator-harness
+    src/integrity/malicious_evaluator_harness.cpp
+    src/integrity/toy_fingerprint.cpp
+    src/fhe/remote_machine.cpp
+)
+target_include_directories(v0id-malicious-evaluator-harness PRIVATE
+    src/fhe
+    src/integrity
+)
+target_link_libraries(v0id-malicious-evaluator-harness PRIVATE
+    v0id_core
+    OpenSSL::Crypto
+)
+v0id_use_openfhe(v0id-malicious-evaluator-harness)
 
 # Real standardized KEM composition gate. OpenSSL 3.5+ supplies ML-KEM-768;
 # when the provider is unavailable the executable reports SKIP rather than
@@ -337,4 +358,5 @@ if(UNIX AND NOT APPLE)
     target_link_options(v0id PRIVATE -Wl,--no-as-needed)
     target_link_options(v0id-fhe-peer PRIVATE -Wl,--no-as-needed)
     target_link_options(v0id-remote-machine PRIVATE -Wl,--no-as-needed)
+    target_link_options(v0id-malicious-evaluator-harness PRIVATE -Wl,--no-as-needed)
 endif()

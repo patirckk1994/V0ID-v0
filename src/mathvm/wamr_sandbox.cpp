@@ -307,6 +307,28 @@ std::int32_t primitive_bytes_native(wasm_exec_env_t exec_env,
         if (output_capacity > context->limits->max_provider_output_bytes)
             throw std::runtime_error("MathVM byte-provider output capacity exceeds limit");
 
+        // The NativeSymbol pointer marker translates Wasm offsets to native
+        // pointers, but V0ID does not rely on that translation to validate the
+        // entire pointer+length range. Validate both directions explicitly before
+        // copying input or invoking any native crypto provider.
+        if (input_len != 0 &&
+            (!input ||
+             !wasm_runtime_validate_native_addr(
+                 module_inst,
+                 const_cast<std::uint8_t*>(input),
+                 static_cast<std::uint64_t>(input_len))))
+            throw std::runtime_error(
+                "MathVM byte-provider input range is outside Wasm memory");
+
+        if (output_capacity != 0 &&
+            (!output ||
+             !wasm_runtime_validate_native_addr(
+                 module_inst,
+                 output,
+                 static_cast<std::uint64_t>(output_capacity))))
+            throw std::runtime_error(
+                "MathVM byte-provider output range is outside Wasm memory");
+
         std::vector<std::uint8_t> input_copy;
         if (input_len != 0)
             input_copy.assign(input, input + input_len);

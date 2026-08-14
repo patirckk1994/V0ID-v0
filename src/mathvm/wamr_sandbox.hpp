@@ -8,10 +8,10 @@
 
 namespace v0id::mathvm {
 
-// Process-local WAMR runtime wrapper. V0.4.2 intentionally allows only one
-// active sandbox instance at a time because WAMR's runtime initialization is
-// process-global. WAMR itself executes only portable Wasm bytecode here; AOT/JIT
-// and WASI are disabled by the build.
+// Process-local WAMR runtime wrapper. The current profile intentionally allows
+// only one active sandbox instance at a time because WAMR runtime initialization
+// is process-global. WAMR executes only portable Wasm bytecode here; AOT/JIT and
+// WASI are disabled. ABI v2 exposes typed scalar and bounded-byte host calls.
 class WamrMathSandbox {
 public:
     explicit WamrMathSandbox(SandboxLimits limits = {});

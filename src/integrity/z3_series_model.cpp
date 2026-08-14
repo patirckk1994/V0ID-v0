@@ -42,7 +42,9 @@ std::vector<z3::expr> z3_reduced_series(
     const z3::expr& reduced_root_bv8,
     const ReducedSeriesTable& table,
     std::size_t output_bytes) {
-    if (!reduced_root_bv8.is_bv() || reduced_root_bv8.get_sort().bv_size() != 8)
+    const Z3_sort sort = reduced_root_bv8.get_sort();
+    if (Z3_get_sort_kind(ctx, sort) != Z3_BV_SORT ||
+        Z3_get_bv_sort_size(ctx, sort) != 8)
         throw std::runtime_error("Z3 reduced-series root must be an 8-bit bit-vector");
     if (output_bytes == 0)
         throw std::runtime_error("Z3 reduced-series model requires output bytes");

@@ -100,9 +100,9 @@ add_executable(v0id-peer
 )
 target_link_libraries(v0id-peer PRIVATE v0id_net)
 
-# Actual FHE-over-network smoke test. The client sends a key-independent BinFHE
-# context, bootstrapping keys and ciphertext; the server evaluates NOT without
-# receiving the LWE secret key and returns only a result ciphertext.
+# Single-ciphertext FHE-over-network smoke test. The client sends a key-independent
+# BinFHE context, bootstrapping material and ciphertext; the server evaluates NOT
+# without receiving the LWE secret key and returns only a result ciphertext.
 add_executable(v0id-fhe-peer
     src/net/fhe_peer_demo.cpp
 )
@@ -110,7 +110,29 @@ target_include_directories(v0id-fhe-peer PRIVATE src/fhe)
 target_link_libraries(v0id-fhe-peer PRIVATE v0id_net)
 v0id_use_openfhe(v0id-fhe-peer)
 
+# V0.4 full-machine remote execution. The client morphs and encrypts the entire
+# transition table, one-hot state/head, tape, nonce and integrity masks. The
+# evaluator receives no MorphManifest and no secret key, runs the same fixed
+# public round budget, and returns encrypted final state/head/tape plus the full
+# masked integrity candidate bank.
+add_executable(v0id-remote-machine
+    src/net/remote_machine_demo.cpp
+    src/fhe/remote_machine.cpp
+    src/integrity/toy_fingerprint.cpp
+)
+target_include_directories(v0id-remote-machine PRIVATE
+    src/fhe
+    src/integrity
+)
+target_link_libraries(v0id-remote-machine PRIVATE
+    v0id_net
+    v0id_core
+    OpenSSL::Crypto
+)
+v0id_use_openfhe(v0id-remote-machine)
+
 if(UNIX AND NOT APPLE)
     target_link_options(v0id PRIVATE -Wl,--no-as-needed)
     target_link_options(v0id-fhe-peer PRIVATE -Wl,--no-as-needed)
+    target_link_options(v0id-remote-machine PRIVATE -Wl,--no-as-needed)
 endif()

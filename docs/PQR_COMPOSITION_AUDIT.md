@@ -60,7 +60,9 @@ job/epoch before it drives polymorphism.
 - OpenSSL KMAC-256 with domain separation for private audit challenges.
 - OpenSSL SHA3-512 for the plaintext quine commitment and transcript hashes.
 - OpenFHE `STD128Q` for the remote BinFHE quantum-security profile.
-- Optional Microsoft Z3 audit target for symbolic Boolean-relation synthesis.
+- Exact bit-packed Gaussian elimination for the affine/degree-2 GF(2) audit.
+- Optional Microsoft Z3 only for the bounded bit-vector attacker language where
+  general SMT solving earns its cost.
 
 The repository does not claim that these choices prove the entire V0ID
 composition post-quantum secure. They remove avoidable custom-primitive risk and
@@ -198,44 +200,74 @@ lineage. Polymorphism needs an evaluator-visible trace distinguisher benchmark.
 If morphing does not reduce classifier advantage, that layer has not earned its
 existence.
 
-### Quantum structural attacks on series output
+### Quantum/structural attacks on series output
 
 **Falsification gates present; universal claim impossible.**
 
 `v0id-quine-audit-tests` exhaustively screens a reduced private-root domain for
 an exact XOR period and checks coarse avalanche behavior.
 
-`v0id-symbolic-series-audit`, when Z3 is installed, asks whether one shared
-oracle-free affine or quadratic Boolean expression can recover reduced private
-root bits from series-output bits over the complete reduced domain.
+`v0id-symbolic-series-audit` does **not** use Z3. It exactly solves the affine
+GF(2) and degree<=2 ANF recovery systems with bit-packed Gaussian elimination over
+the complete 8-bit reduced-root domain. `UNSAT` there is exact for that specified
+attacker class rather than a timeout or failed heuristic search.
 
-An `UNSAT` result closes that **defined attacker language on that reduced model**.
-It is not a proof that no arbitrary Turing machine, hidden-subgroup algorithm or
-future quantum algorithm can attack the full construction.
+`v0id-bitvector-series-audit` is the next attacker language and uses Z3 plus a
+CEGIS loop. One shared bounded 8-bit straight-line program is synthesized across
+the reduced family. The current DSL contains:
+
+```text
+XOR  AND  ADD  NOT
+SHL  SHR  ROTL ROTR
+XORI ADDI ANDI
+```
+
+Z3 may select source registers, shared 8-bit immediates, the observed output bit
+and the target secret-root bit. The program is the same for every reduced root;
+there is no per-root lookup table. Candidate programs are validated against all
+256 reduced roots. Counterexamples are fed back to the solver.
+
+The bit-vector audit is deliberately tri-state:
+
+```text
+UNSAT   -> this bounded attacker class is closed for the constrained subset;
+           therefore no full-domain breaker in that class can exist
+SAT     -> print the candidate and validate it against all 256 roots
+UNKNOWN -> INCONCLUSIVE; timeout/interruption is never accepted as PASS
+```
+
+A validated SAT program is a structural cryptanalytic lead and should be analyzed
+and then tested on independent wider reduced families. An UNSAT result closes
+only the exact configured step/input-byte attacker language. It is not a proof
+that no arbitrary Turing machine, hidden-subgroup algorithm or future quantum
+algorithm can attack the full construction.
 
 ## Oracle-free symbolic attacker rule
 
 A useful synthesized breaker must generalize across many/all instances of a
-reduced model. It may use a fixed instruction set and universal constants such
-as Boolean `0/1`, but it must not contain a table of challenge-specific answers
-or select a different program per challenge.
+reduced model. It may contain its algorithm and shared universal constants, but
+it must not contain a table of challenge-specific answers or select a different
+program per challenge.
 
-The eventual research harness can expand the DSL in stages:
+The research harness expands the DSL in stages:
 
 ```text
-level 0: XOR / NOT / permutations
-level 1: affine GF(2)
-level 2: low-degree ANF / AND
-level 3: add / rotate / shift / bit-vector arithmetic
-level 4: bounded loops / small straight-line programs
-level 5: bounded Turing-machine/program synthesis
+level 0: exact XOR-period screen                         implemented
+level 1: affine GF(2)                                   implemented / exact
+level 2: degree<=2 ANF / AND                            implemented / exact
+level 3: bounded bit-vector straight-line program       implemented / Z3+CEGIS
+         XOR/AND/ADD/NOT/shift/rotate/immediates
+level 4: conditionals / selects / richer word programs  future
+level 5: bounded loops / register machines              future
+level 6: bounded Turing-machine/program synthesis       future
 ```
 
-For each level the desired result is either:
+For each bounded level the desired result is one of:
 
 ```text
-SAT   -> a generic candidate breaker exists; analyze/fix immediately
-UNSAT -> this bounded attacker class is closed for the specified reduced model
+SAT     -> a generic candidate breaker exists; analyze/fix immediately
+UNSAT   -> this bounded attacker class is closed for the specified model
+UNKNOWN -> no conclusion; increase resources or reduce/partition the search
 ```
 
 A breaker must then be validated on fresh widths/seeds/jobs before it is treated

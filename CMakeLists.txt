@@ -68,9 +68,12 @@ function(v0id_use_openfhe target)
     target_link_libraries(${target} PRIVATE ${V0ID_OPENFHE_LIBRARIES})
 endfunction()
 
-# Client-side program representation and precomputed polymorphism compiler.
+# Client-side program representation, series-first derivation and precomputed
+# polymorphism compiler. User-defined series patterns are local trusted code;
+# peers exchange identifiers only, never executable crypto plugins.
 add_library(v0id_core
     src/polymorph/program_morpher.cpp
+    src/polymorph/series_generator.cpp
 )
 target_include_directories(v0id_core PUBLIC
     src/core
@@ -110,11 +113,10 @@ target_include_directories(v0id-fhe-peer PRIVATE src/fhe)
 target_link_libraries(v0id-fhe-peer PRIVATE v0id_net)
 v0id_use_openfhe(v0id-fhe-peer)
 
-# V0.4 full-machine remote execution. The client morphs and encrypts the entire
-# transition table, one-hot state/head, tape, nonce and integrity masks. The
-# evaluator receives no MorphManifest and no secret key, runs the same fixed
-# public round budget, and returns encrypted final state/head/tape plus the full
-# masked integrity candidate bank.
+# V0.4/V0.4.1 full-machine remote execution. The client derives a private series,
+# uses it to seed the morph compiler, encrypts the full machine, and attaches a
+# bounded public crypto/profile identifier. The series, series seed, MorphManifest
+# and LWE secret key remain client-side.
 add_executable(v0id-remote-machine
     src/net/remote_machine_demo.cpp
     src/fhe/remote_machine.cpp

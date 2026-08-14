@@ -207,16 +207,39 @@ add_executable(v0id-symbolic-series-audit
 target_link_libraries(v0id-symbolic-series-audit PRIVATE v0id_core)
 
 # Next attacker language: one shared bounded 8-bit straight-line program across
-# the reduced-root family. Z3 may choose sources, immediates, output/root bits and
-# operations from XOR/AND/ADD/NOT/shift/rotate. The CEGIS loop rejects candidates
-# against all 256 reduced roots and treats solver UNKNOWN as inconclusive, never
-# as PASS. This dependency is audit-only and never enters production V0ID.
+# the reduced-root family. Z3 may choose sources, immediates and output bits from
+# XOR/AND/ADD/NOT/shift/rotate. Root bits are searched independently so UNKNOWN
+# remains localized. The CEGIS loop rejects candidates against all 256 reduced
+# roots and treats solver UNKNOWN as inconclusive, never as PASS. Z3 remains an
+# audit-only dependency and never enters production V0ID.
 option(V0ID_ENABLE_Z3_BITVECTOR_AUDIT
     "Build the optional Z3 bounded bitvector attacker audit" ON)
 if(V0ID_ENABLE_Z3_BITVECTOR_AUDIT)
     find_path(V0ID_Z3_INCLUDE_DIR z3++.h)
     find_library(V0ID_Z3_LIBRARY NAMES z3 libz3)
     if(V0ID_Z3_INCLUDE_DIR AND V0ID_Z3_LIBRARY)
+        # Exact reduced-domain lifting of production KMAC series outputs into Z3.
+        # This does not symbolically implement SHA3/KMAC; it is a 256-root audit
+        # model used by stronger symbolic experiments.
+        add_library(v0id_z3_series_model
+            src/integrity/z3_series_model.cpp
+        )
+        target_include_directories(v0id_z3_series_model PUBLIC
+            src/integrity
+            ${V0ID_Z3_INCLUDE_DIR}
+        )
+        target_link_libraries(v0id_z3_series_model PUBLIC
+            v0id_core
+            ${V0ID_Z3_LIBRARY}
+        )
+
+        add_executable(v0id-z3-series-model-tests
+            src/integrity/z3_series_model_tests.cpp
+        )
+        target_link_libraries(v0id-z3-series-model-tests PRIVATE
+            v0id_z3_series_model
+        )
+
         add_executable(v0id-bitvector-series-audit
             src/integrity/bitvector_series_audit.cpp
         )
@@ -227,9 +250,9 @@ if(V0ID_ENABLE_Z3_BITVECTOR_AUDIT)
             v0id_core
             ${V0ID_Z3_LIBRARY}
         )
-        message(STATUS "V0ID bitvector audit: Z3 enabled")
+        message(STATUS "V0ID bitvector audit + reduced Z3 series model: Z3 enabled")
     else()
-        message(STATUS "V0ID bitvector audit: Z3 not found; target disabled")
+        message(STATUS "V0ID bitvector audit: Z3 not found; targets disabled")
     endif()
 endif()
 

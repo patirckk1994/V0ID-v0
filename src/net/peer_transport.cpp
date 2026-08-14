@@ -136,6 +136,8 @@ std::string to_string(MessageType type) {
         case MessageType::slot_value: return "SLOT_VALUE";
         case MessageType::execute_job: return "EXECUTE_JOB";
         case MessageType::job_result: return "JOB_RESULT";
+        case MessageType::install_evaluator_session: return "INSTALL_EVALUATOR_SESSION";
+        case MessageType::evaluator_session_ready: return "EVALUATOR_SESSION_READY";
         case MessageType::error: return "ERROR";
     }
     return "UNKNOWN";

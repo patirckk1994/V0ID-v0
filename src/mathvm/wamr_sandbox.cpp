@@ -29,6 +29,179 @@ struct ExecutionContext {
 std::mutex g_runtime_mutex;
 bool g_runtime_active = false;
 
+// Small policy parser used before WAMR sees attacker-supplied bytecode. WAMR is
+// still responsible for full Wasm validation; this parser only extracts the two
+// pieces V0ID must fail closed on independently of optional WAMR features:
+// host imports and declared linear-memory bounds.
+class WasmCursor {
+public:
+    WasmCursor(const std::vector<std::uint8_t>& bytes,
+               std::size_t begin,
+               std::size_t end)
+        : bytes_(bytes), pos_(begin), end_(end) {
+        if (begin > end || end > bytes.size())
+            throw std::runtime_error("invalid MathVM Wasm cursor range");
+    }
+
+    bool empty() const noexcept { return pos_ == end_; }
+    std::size_t remaining() const noexcept { return end_ - pos_; }
+    std::size_t position() const noexcept { return pos_; }
+
+    std::uint8_t read_u8() {
+        if (pos_ >= end_)
+            throw std::runtime_error("truncated MathVM Wasm binary");
+        return bytes_[pos_++];
+    }
+
+    std::uint32_t read_uleb32() {
+        std::uint64_t value = 0;
+        unsigned shift = 0;
+
+        for (unsigned i = 0; i < 5; ++i) {
+            const auto byte = read_u8();
+            value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+            if ((byte & 0x80u) == 0) {
+                if (value > std::numeric_limits<std::uint32_t>::max())
+                    throw std::runtime_error("MathVM Wasm u32 LEB overflow");
+                return static_cast<std::uint32_t>(value);
+            }
+            shift += 7;
+        }
+
+        throw std::runtime_error("MathVM Wasm u32 LEB is too long");
+    }
+
+    std::string read_name() {
+        const auto length = static_cast<std::size_t>(read_uleb32());
+        if (length > remaining())
+            throw std::runtime_error("truncated MathVM Wasm name");
+
+        const auto begin = bytes_.begin() + static_cast<std::ptrdiff_t>(pos_);
+        const auto end = begin + static_cast<std::ptrdiff_t>(length);
+        pos_ += length;
+        return std::string(begin, end);
+    }
+
+    void skip(std::size_t count) {
+        if (count > remaining())
+            throw std::runtime_error("truncated MathVM Wasm section");
+        pos_ += count;
+    }
+
+private:
+    const std::vector<std::uint8_t>& bytes_;
+    std::size_t pos_{};
+    std::size_t end_{};
+};
+
+void validate_import_section(WasmCursor& section) {
+    const auto count = section.read_uleb32();
+    std::uint32_t allowed_import_count = 0;
+
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto module_name = section.read_name();
+        const auto import_name = section.read_name();
+        const auto kind = section.read_u8();
+
+        // V0ID MathVM v1 exposes exactly one host function and no imported
+        // memory/table/global objects. In particular this rejects WASI imports
+        // before WAMR's optional WASI/linker code is involved.
+        if (kind != 0x00)
+            throw std::runtime_error(
+                "MathVM forbids non-function Wasm imports");
+
+        (void)section.read_uleb32(); // function type index; WAMR validates it.
+
+        if (module_name != "v0id_math" || import_name != "primitive_u64")
+            throw std::runtime_error(
+                "MathVM Wasm import is not on the V0ID host allowlist");
+
+        ++allowed_import_count;
+        if (allowed_import_count > 1)
+            throw std::runtime_error(
+                "MathVM permits only one primitive_u64 host import");
+    }
+
+    if (!section.empty())
+        throw std::runtime_error("malformed MathVM Wasm import section");
+}
+
+void validate_memory_section(WasmCursor& section,
+                             std::uint32_t max_memory_pages) {
+    const auto count = section.read_uleb32();
+    if (count > 1)
+        throw std::runtime_error("MathVM permits at most one linear memory");
+
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto flags = section.read_uleb32();
+
+        // V0.4.2 intentionally accepts only ordinary Wasm32 memory with an
+        // explicit min+max. Shared-memory/memory64 flags and unbounded memories
+        // are outside the current ABI and are rejected before instantiation.
+        if (flags != 0x01)
+            throw std::runtime_error(
+                "MathVM linear memory must declare an explicit Wasm32 maximum");
+
+        const auto min_pages = section.read_uleb32();
+        const auto max_pages = section.read_uleb32();
+
+        if (max_pages < min_pages)
+            throw std::runtime_error("MathVM linear memory max is below min");
+        if (min_pages > max_memory_pages || max_pages > max_memory_pages)
+            throw std::runtime_error(
+                "MathVM linear memory declaration exceeds sandbox cap");
+    }
+
+    if (!section.empty())
+        throw std::runtime_error("malformed MathVM Wasm memory section");
+}
+
+void validate_wasm_policy(const std::vector<std::uint8_t>& wasm,
+                          std::uint32_t max_memory_pages) {
+    static constexpr std::uint8_t header[] = {
+        0x00, 0x61, 0x73, 0x6d, // \0asm
+        0x01, 0x00, 0x00, 0x00, // Wasm binary version 1
+    };
+
+    if (wasm.size() < sizeof(header))
+        throw std::runtime_error("MathVM Wasm binary is too short");
+    for (std::size_t i = 0; i < sizeof(header); ++i) {
+        if (wasm[i] != header[i])
+            throw std::runtime_error("MathVM requires Wasm binary version 1");
+    }
+
+    WasmCursor cursor(wasm, sizeof(header), wasm.size());
+    bool saw_import_section = false;
+    bool saw_memory_section = false;
+
+    while (!cursor.empty()) {
+        const auto section_id = cursor.read_u8();
+        const auto section_size = static_cast<std::size_t>(cursor.read_uleb32());
+        if (section_size > cursor.remaining())
+            throw std::runtime_error("truncated MathVM Wasm section payload");
+
+        const auto section_begin = cursor.position();
+        const auto section_end = section_begin + section_size;
+
+        if (section_id == 2) {
+            if (saw_import_section)
+                throw std::runtime_error("duplicate MathVM Wasm import section");
+            saw_import_section = true;
+            WasmCursor section(wasm, section_begin, section_end);
+            validate_import_section(section);
+        }
+        else if (section_id == 5) {
+            if (saw_memory_section)
+                throw std::runtime_error("duplicate MathVM Wasm memory section");
+            saw_memory_section = true;
+            WasmCursor section(wasm, section_begin, section_end);
+            validate_memory_section(section, max_memory_pages);
+        }
+
+        cursor.skip(section_size);
+    }
+}
+
 std::uint64_t primitive_u64_native(wasm_exec_env_t exec_env,
                                    std::uint64_t tag,
                                    std::uint64_t version64,
@@ -180,6 +353,11 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
             throw std::runtime_error("duplicate MathVM primitive requirement");
     }
 
+    // Enforce the V0ID host-surface and memory policy ourselves before WAMR's
+    // loader/linker runs. This remains active even though WAMR is compiled with
+    // WASI support disabled and therefore cannot rely on WASI helper symbols.
+    validate_wasm_policy(program.wasm, limits_.max_memory_pages);
+
     auto wasm_bytes = program.wasm;
     const auto package_type = wasm_runtime_get_file_package_type(
         wasm_bytes.data(), static_cast<std::uint32_t>(wasm_bytes.size()));
@@ -220,11 +398,6 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
             static_cast<std::uint32_t>(sizeof(error_buf)));
         if (!module_inst)
             throw std::runtime_error(std::string("WAMR instantiate failed: ") + error_buf);
-
-#if defined(WASM_ENABLE_LIBC_WASI) && WASM_ENABLE_LIBC_WASI != 0
-        if (wasm_runtime_is_wasi_mode(module_inst))
-            throw std::runtime_error("WASI modules are forbidden by V0ID MathVM");
-#endif
 
         wasm_runtime_set_custom_data(module_inst, &context);
 

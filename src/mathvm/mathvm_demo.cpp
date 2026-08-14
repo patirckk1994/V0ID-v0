@@ -26,7 +26,7 @@ void print_usage(const char* argv0) {
         << "Build the bundled no-WASI guest with clang, for example:\n"
         << "  clang --target=wasm32 -O2 -nostdlib -Wl,--no-entry "
            "-Wl,--allow-undefined -Wl,--export=v0id_main "
-           "-Wl,--initial-memory=65536 -Wl,--max-memory=1048576 "
+           "-Wl,--initial-memory=131072 -Wl,--max-memory=1048576 "
            "examples/mathvm/series_math.c -o build/series_math.wasm\n";
 }
 

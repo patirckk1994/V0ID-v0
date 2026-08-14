@@ -356,9 +356,12 @@ static void run_fhe_case(BinFHEContext& cc,
     const auto encrypted_input = v0id::integrity::encrypt_plain_bits(cc, sk, input);
     const auto encrypted_nonce = v0id::integrity::encrypt_u32_bits(
         cc, sk, morph.manifest.integrity_nonce);
+    const auto encrypted_mixer_state = v0id::integrity::encrypt_u32_bits(
+        cc, sk, v0id::integrity::TOY_FINGERPRINT_INITIAL_STATE);
 
     const auto digest = v0id::integrity::toy_fingerprint32_fhe(
-        cc, encrypted_program_bits, encrypted_input, encrypted_nonce);
+        cc, encrypted_program_bits, encrypted_input, encrypted_nonce,
+        encrypted_mixer_state);
 
     std::vector<EncryptedDigest32> candidate_bank;
     candidate_bank.reserve(morph.manifest.integrity_output_masks.size());

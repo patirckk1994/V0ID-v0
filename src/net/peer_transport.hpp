@@ -17,6 +17,8 @@ enum class MessageType : std::uint8_t {
     slot_value = 5,
     execute_job = 6,
     job_result = 7,
+    install_evaluator_session = 8,
+    evaluator_session_ready = 9,
     error = 255,
 };
 

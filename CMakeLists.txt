@@ -176,12 +176,38 @@ target_link_libraries(v0id-quine-audit-tests PRIVATE v0id_quine)
 # Exact reduced-domain symbolic falsification gate. Affine and degree<=2 ANF
 # recovery are linear in the unknown attacker coefficients, so a bit-packed
 # Gaussian elimination over GF(2) is both complete for this attacker class and
-# dramatically cheaper than a general SMT solver. Z3 is reserved for the next
-# audit DSL, where rotate/shift/add/control-flow actually require SMT machinery.
+# dramatically cheaper than a general SMT solver.
 add_executable(v0id-symbolic-series-audit
     src/integrity/symbolic_series_audit.cpp
 )
 target_link_libraries(v0id-symbolic-series-audit PRIVATE v0id_core)
+
+# Next attacker language: one shared bounded 8-bit straight-line program across
+# the reduced-root family. Z3 may choose sources, immediates, output/root bits and
+# operations from XOR/AND/ADD/NOT/shift/rotate. The CEGIS loop rejects candidates
+# against all 256 reduced roots and treats solver UNKNOWN as inconclusive, never
+# as PASS. This dependency is audit-only and never enters production V0ID.
+option(V0ID_ENABLE_Z3_BITVECTOR_AUDIT
+    "Build the optional Z3 bounded bitvector attacker audit" ON)
+if(V0ID_ENABLE_Z3_BITVECTOR_AUDIT)
+    find_path(V0ID_Z3_INCLUDE_DIR z3++.h)
+    find_library(V0ID_Z3_LIBRARY NAMES z3 libz3)
+    if(V0ID_Z3_INCLUDE_DIR AND V0ID_Z3_LIBRARY)
+        add_executable(v0id-bitvector-series-audit
+            src/integrity/bitvector_series_audit.cpp
+        )
+        target_include_directories(v0id-bitvector-series-audit PRIVATE
+            ${V0ID_Z3_INCLUDE_DIR}
+        )
+        target_link_libraries(v0id-bitvector-series-audit PRIVATE
+            v0id_core
+            ${V0ID_Z3_LIBRARY}
+        )
+        message(STATUS "V0ID bitvector audit: Z3 enabled")
+    else()
+        message(STATUS "V0ID bitvector audit: Z3 not found; target disabled")
+    endif()
+endif()
 
 if(V0ID_ENABLE_MATHVM)
     add_library(v0id_wasm_polymorph

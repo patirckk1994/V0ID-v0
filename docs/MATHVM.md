@@ -27,27 +27,28 @@ visible mathematical / crypto composition
 
 This is experimental research code, not an audited cryptographic sandbox.
 
-## Relationship to the encrypted Turing-machine path
+## Relationship to the encrypted-machine path
 
-MathVM does **not** replace V0ID's encrypted Turing machine.
-
-The two paths solve different problems:
+MathVM does **not** replace V0ID's encrypted Turing-machine-like interpreter.
 
 ```text
-encrypted TM
+encrypted machine
     hidden program semantics
     encrypted state/head/tape
     BinFHE evaluator executes a fixed universal path
 
 remote MathVM
-    evaluator is allowed to see the Wasm composition
+    evaluator may see the Wasm composition
     Wasm selects/composes locally installed math/crypto providers
     no peer-supplied native code
+
+local Wasm polymorphism (V0.4.5)
+    client-only private strategy
+    derives series/MorphSeed before ProgramMorpher
+    Wasm is never transmitted to the evaluator
 ```
 
-Therefore an encrypted-TM job does not need to transmit Wasm alongside its encrypted transition table.
-
-A second, separate use of WAMR is planned on the **client only**: a future `WasmSeriesGenerator` / polymorphism generator can run private user-defined morph logic locally before the machine is encrypted. That Wasm would not be sent to the evaluator.
+The local polymorphism layer has its own stricter ABI and is documented in `docs/POLYMORPH_WASM.md`.
 
 ## WAMR profile
 
@@ -67,57 +68,42 @@ mini-loader                OFF
 configurable bounds bypass OFF
 ```
 
-V0ID still owns the security policy. WAMR supplies bytecode validation/execution, linear-memory isolation and instruction metering.
+V0ID owns the policy. WAMR supplies bytecode validation/execution, linear-memory isolation and instruction metering.
 
-Before WAMR loads a module, V0ID also parses enough of the raw Wasm binary to fail closed on the host surface and memory policy. Only the two `v0id_math` function imports below are accepted. WASI, other host modules, imported memories/tables/globals, unbounded memory, memory64 and shared-memory forms are rejected.
+Before WAMR loads a MathVM module, V0ID parses enough raw Wasm to fail closed on the host surface and memory policy. Only `v0id_math.primitive_u64` and `v0id_math.primitive_bytes` imports are accepted. WASI, other host modules, imported memories/tables/globals, unbounded memory, memory64 and shared-memory forms are rejected.
 
 ## ABI v2 host imports
 
-ABI v2 is additive. Existing scalar guests keep using:
+Scalar ABI:
 
 ```text
-module: v0id_math
-import: primitive_u64
-
-(tag:u64,
- version:u64,
- a:u64,
- b:u64,
- c:u64,
- d:u64) -> u64
+v0id_math.primitive_u64(
+    tag:u64,
+    version:u64,
+    a:u64, b:u64, c:u64, d:u64
+) -> u64
 ```
 
-ABI v2 adds:
+Bounded byte ABI:
 
 ```text
-module: v0id_math
-import: primitive_bytes
-
-(tag:u64,
- version:u64,
- input:*u8,
- input_len:u32,
- output:*u8,
- output_capacity:u32) -> i32 written
+v0id_math.primitive_bytes(
+    tag:u64,
+    version:u64,
+    input_ptr:*u8,
+    input_len:u32,
+    output_ptr:*u8,
+    output_capacity:u32
+) -> i32 written
 ```
 
-WAMR's native signature is `(II*~*~)i`, so it converts the two Wasm offsets to native addresses only after checking each pointer against the following byte length. V0ID then copies the input into host-owned memory before invoking the provider and copies the bounded result back into the validated Wasm output buffer.
+The WAMR native signature is `(II*~*~)i`, which supplies Wasm buffer address conversion/bounds handling. V0ID additionally validates the complete native input and output pointer+length ranges before copying bytes or invoking a provider. Input is copied into host-owned memory before provider execution, so guest input/output aliasing cannot hand an unchecked Wasm pointer to native crypto code.
 
-A byte call traps if:
-
-- the primitive is undeclared,
-- the tag/version refers to a scalar provider,
-- input exceeds the provider or sandbox input limit,
-- output exceeds the provider or sandbox output limit,
-- the supplied Wasm output buffer is too small,
-- provider call/cost budgets are exhausted,
-- the provider itself rejects the input.
-
-This keeps raw unchecked Wasm pointers out of the provider interface.
+A byte call traps if the primitive is undeclared, the ABI type is wrong, input/output limits are exceeded, the output buffer is too small, the provider/cost budget is exhausted, a Wasm pointer range is invalid, or the provider rejects the input.
 
 ## Primitive manifests and registry
 
-Every `WasmMathProgram` carries `PrimitiveRequirement` entries:
+Each `WasmMathProgram` declares required primitives by:
 
 ```text
 numeric tag
@@ -125,23 +111,19 @@ canonical textual id
 version
 ```
 
-The local `PrimitiveDescriptor` additionally declares:
+Each local `PrimitiveDescriptor` additionally declares:
 
 ```text
 abstract cost
 experimental flag
 ABI kind: u64 | bytes
-maximum input bytes       (byte providers)
-maximum output bytes      (byte providers)
+maximum input bytes
+maximum output bytes
 ```
 
-The registry refuses duplicate tag/version registrations and verifies the canonical id. At runtime the selected host import must also match the provider ABI: a byte provider cannot be invoked through `primitive_u64`, and vice versa.
-
-The numeric tags are protocol dispatch values, not secrets or cryptographic hashes.
+The registry rejects duplicate tag/version registrations and checks canonical ids. A byte provider cannot be invoked through `primitive_u64`, and vice versa.
 
 ## Built-in providers
-
-Current built-ins are:
 
 ```text
 0x00010001  v0id.math.add-mod-u64/v1
@@ -157,30 +139,21 @@ Current built-ins are:
 0x00030301  v0id.pq.ml-kem-768.encapsulate/v1
             ABI: bytes
             optional standardized ML-KEM-768 encapsulation
-            registered only when the linked OpenSSL provider exposes ML-KEM
 
 0x7fff0001  v0id.experimental.toy-lwe-affine-u64/v1
             ABI: u64
             EXPERIMENTAL / NO SECURITY CLAIM
 ```
 
-The toy affine provider still computes only:
+The toy affine provider still computes only `b = a*s + e mod q`; it is interface plumbing, **not LWE encryption and not a post-quantum primitive**.
 
-```text
-b = a*s + e mod q
-```
+### SHA3-256
 
-for scalar integers. It remains interface plumbing, **not LWE encryption and not a post-quantum primitive**.
+Input is an arbitrary bounded byte string and output is exactly 32 bytes. The test suite checks the SHA3-256 digest of `"abc"` and exercises the provider through the actual WAMR byte import.
 
-### SHA3-256 byte provider
+### Optional ML-KEM-768
 
-Input is an arbitrary bounded byte string. Output is exactly 32 bytes.
-
-The test suite checks the standard SHA3-256 digest of `"abc"` and also calls the provider from an in-memory Wasm module through `primitive_bytes`.
-
-### Optional ML-KEM-768 provider
-
-V0ID does not implement ML-KEM arithmetic itself. When the linked OpenSSL installation exposes `ML-KEM-768`, the default registry installs an encapsulation-only provider around OpenSSL's EVP KEM API.
+V0ID does not implement ML-KEM arithmetic. When the linked OpenSSL provider exposes `ML-KEM-768`, the default registry installs an encapsulation-only provider.
 
 Input:
 
@@ -188,7 +161,7 @@ Input:
 raw ML-KEM-768 public key bytes
 ```
 
-Output uses one canonical V0ID envelope:
+Output:
 
 ```text
 u32be ciphertext_length
@@ -197,21 +170,17 @@ ciphertext[ciphertext_length]
 shared_secret[shared_secret_length]
 ```
 
-Only encapsulation is exposed. There is deliberately no remote MathVM decapsulation provider in this scaffold because blindly moving a client's private KEM key into an untrusted evaluator would defeat the intended trust boundary.
-
-The provider is an optional capability rather than a build requirement. OpenSSL versions/providers without ML-KEM still build ABI v2 and advertise SHA3/scalar providers normally.
-
-When ML-KEM is available, `v0id-mathvm-tests` generates an ML-KEM-768 keypair, exports the public key, encapsulates through the V0ID provider, decapsulates with OpenSSL and requires the two shared secrets to match.
+There is deliberately no remote MathVM decapsulation provider in this scaffold. When ML-KEM is available, the test suite generates a keypair, encapsulates through the V0ID provider, decapsulates with OpenSSL and requires the secrets to match.
 
 ## Resource bounds
 
-Default `SandboxLimits` are:
+Default `SandboxLimits`:
 
 ```text
 Wasm module bytes         1 MiB
 linear memory             16 pages = 1 MiB
 Wasm stack                64 KiB
-host-managed app heap     64 KiB
+host-managed app heap     disabled
 WAMR runtime pool         16 MiB
 Wasm instructions         1,000,000
 provider calls            4,096
@@ -220,43 +189,61 @@ provider input buffer     256 KiB
 provider output buffer    256 KiB
 ```
 
-Provider byte limits may not exceed the entire linear-memory sandbox cap. Individual byte-provider descriptors can impose smaller limits.
+The host-managed WAMR app heap is disabled. WAMR inserts that heap into the module's linear-memory allocation; with it enabled, the actually addressable memory can exceed the module-declared page boundary. Keeping it at zero makes the V0ID `max_memory_pages` policy a meaningful hard ceiling for this profile.
 
-Native provider work has a separate call/cost budget because time spent inside a native implementation is not represented by Wasm instruction count.
+Provider byte limits may not exceed the entire linear-memory sandbox cap. Individual providers can impose smaller limits. Native provider work has a separate call/cost budget because it is not represented by Wasm instruction count.
 
-V0ID pre-validates each module's declared linear-memory min/max against the sandbox cap. Because that policy is already fail-closed, ABI v2 no longer asks WAMR to override a module's smaller maximum at instantiation; this removes the harmless `Cannot override max memory with value greater than module max memory` warning seen in the earlier external demo.
+## Runtime-verified V0.4.4 gate
 
-## Runtime-verified baseline vs ABI v2 status
-
-The earlier scalar/rejection boundary is runtime-verified on the project's Linux host:
+The development host has run the completed ABI-v2 suite:
 
 ```text
-V0ID MathVM sandbox tests: 11 passed, 0 failed
+V0ID MathVM sandbox/provider tests: 16 passed, 0 failed
+V0ID MathVM byte-boundary tests:    4 passed, 0 failed
 ```
 
-and the external scalar guest was also run successfully:
+The passing boundary gate includes:
 
 ```text
-module bytes         : 458
-result               : 1596
-provider calls       : 3
-provider cost        : 130
+valid scalar/byte execution
+SHA3-256 known-answer test
+ML-KEM-768 encapsulate/decapsulate round trip
+undersized output rejection
+scalar/byte ABI mismatch rejection
+undeclared primitive rejection
+provider call budget
+instruction budget
+module/memory policy rejection
+WASI rejection
+OOB input pointer+length rejection
+OOB output pointer+length rejection
+recovery after trapped/rejected jobs
 ```
 
-ABI v2, the byte-provider tests, SHA3 guest and optional ML-KEM round-trip are **implemented but still require the next local rebuild/run**. Do not treat them as runtime-verified until that output is recorded.
+The external compiled SHA3 guest also ran successfully:
 
-Run the gate with:
+```text
+V0ID MathVM ABI      : v2
+module bytes         : 671
+result               : 32
+provider calls       : 1
+provider cost        : 256
+```
+
+A UBSan-aware WAMR build also completed the 16-test suite. The separate ASan build is currently blocked by a WAMR 2.4.0 `native stack overflow` trap before the test body; V0ID therefore does **not** claim an ASan-clean run.
+
+## Test commands
 
 ```sh
-git pull
 cmake -S . -B build
-cmake --build build -j --target v0id-mathvm-tests v0id-mathvm
+cmake --build build -j \
+  --target v0id-mathvm-tests v0id-mathvm-byte-boundary-tests v0id-mathvm
+
 ./build/v0id-mathvm-tests
+./build/v0id-mathvm-byte-boundary-tests
 ```
 
-## External scalar demo
-
-Compile:
+External scalar guest:
 
 ```sh
 clang --target=wasm32 -O2 -nostdlib \
@@ -267,21 +254,11 @@ clang --target=wasm32 -O2 -nostdlib \
   -Wl,--max-memory=1048576 \
   examples/mathvm/series_math.c \
   -o build/series_math.wasm
-```
 
-Run:
-
-```sh
 ./build/v0id-mathvm build/series_math.wasm series
 ```
 
-Expected result remains `1596` with three provider calls.
-
-## External byte-provider demo
-
-`examples/mathvm/sha3_bytes.c` hashes `"abc"` through `primitive_bytes`, compares all 32 returned digest bytes against the known SHA3-256 value inside Wasm, and returns `32` only when they match.
-
-Compile:
+External SHA3 byte guest:
 
 ```sh
 clang --target=wasm32 -O2 -nostdlib \
@@ -292,66 +269,24 @@ clang --target=wasm32 -O2 -nostdlib \
   -Wl,--max-memory=1048576 \
   examples/mathvm/sha3_bytes.c \
   -o build/sha3_bytes.wasm
-```
 
-Run:
-
-```sh
 ./build/v0id-mathvm build/sha3_bytes.wasm sha3
-```
-
-Expected ABI-v2 result after runtime validation:
-
-```text
-result               : 32
-provider calls       : 1
-provider cost        : 256
 ```
 
 ## What may be transmitted later
 
-For a **visible MathVM computation**, the network object can eventually be:
+A future visible remote MathVM object can contain the ABI version, Wasm bytes, entrypoint, primitive manifest and public resource profile. Authenticated negotiation must eventually bind the agreed VM ABI/provider set/resource profile to prevent substitution or downgrade.
 
-```cpp
-struct RemoteMathProgram {
-    uint32_t mathvm_abi_version;
-    bytes wasm;
-    string entrypoint;
-    vector<PrimitiveRequirement> required_primitives;
-    public SandboxLimits limits;
-};
-```
+That object is not needed for the encrypted-machine protocol. The encrypted-machine path already carries its program semantics as encrypted transition/state data.
 
-The receiver can reject unsupported provider ids/versions before execution. An authenticated negotiation must eventually bind the agreed VM ABI, provider set and resource profile to prevent downgrade/substitution.
+## Primitive-layer status
 
-This object is not needed for the encrypted-TM protocol. The TM path already transmits its program as encrypted transition data.
+The generic provider architecture is now intentionally considered complete enough for current research: scalar calls, bounded bytes, explicit provider type, manifests, resource budgets, one always-available standardized byte provider and one optional standardized PQ provider.
 
-## Remaining primitive-layer work
+Further provider formats should be added only when a real workload needs them. Candidate byte encodings include big integers, mod-q vectors/matrices, polynomials/NTT operands and standardized signature operations whose trust boundary makes sense.
 
-The basic provider architecture is now feature-complete enough for useful cryptographic work: scalar calls, bounded bytes, explicit provider type, manifests, resource budgets, one always-available standardized byte provider and one optional standardized PQ provider.
+## Non-claims
 
-Further additions should earn their existence. Useful next extensions include bounded structured encodings for:
+MathVM still does not provide audited sandbox security, authenticated remote capability negotiation, signatures over Wasm/manifests, canonical Wasm normalization, privacy for a remotely transmitted MathVM program, or a new post-quantum hardness assumption.
 
-```text
-big integers
-mod-q vectors
-matrices
-polynomials / NTT operands
-standardized signature operations where the trust boundary makes sense
-```
-
-Those do not require another VM architecture; they are provider formats layered on the existing bounded byte call.
-
-## Non-claims / open work
-
-MathVM still does not provide:
-
-- audited sandbox security,
-- authenticated remote capability negotiation,
-- signatures over Wasm/manifests,
-- canonical Wasm normalization/hashing,
-- privacy for the Wasm program itself when it is sent to an evaluator,
-- a proof that arbitrary user-defined mathematics is secure,
-- a new post-quantum hardness assumption.
-
-ML-KEM security, when available, comes from the standardized ML-KEM implementation supplied by OpenSSL; V0ID's contribution here is the bounded provider/orchestration boundary, not a new KEM.
+ML-KEM security comes from the standardized ML-KEM implementation supplied by OpenSSL; V0ID's contribution here is the bounded provider/orchestration boundary, not a new KEM.

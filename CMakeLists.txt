@@ -173,30 +173,15 @@ add_executable(v0id-quine-audit-tests
 )
 target_link_libraries(v0id-quine-audit-tests PRIVATE v0id_quine)
 
-# Optional symbolic falsification layer. Z3 is audit-only: production V0ID has
-# no solver dependency. The harness synthesizes one shared affine/quadratic
-# Boolean recovery expression across every reduced-root instance; UNSAT closes
-# only that defined attacker language, not arbitrary future algorithms.
-option(V0ID_ENABLE_Z3_AUDIT "Build the optional Z3 symbolic series audit" ON)
-if(V0ID_ENABLE_Z3_AUDIT)
-    find_path(V0ID_Z3_INCLUDE_DIR z3++.h)
-    find_library(V0ID_Z3_LIBRARY NAMES z3 libz3)
-    if(V0ID_Z3_INCLUDE_DIR AND V0ID_Z3_LIBRARY)
-        add_executable(v0id-symbolic-series-audit
-            src/integrity/symbolic_series_audit.cpp
-        )
-        target_include_directories(v0id-symbolic-series-audit PRIVATE
-            ${V0ID_Z3_INCLUDE_DIR}
-        )
-        target_link_libraries(v0id-symbolic-series-audit PRIVATE
-            v0id_core
-            ${V0ID_Z3_LIBRARY}
-        )
-        message(STATUS "V0ID symbolic audit: Z3 enabled")
-    else()
-        message(STATUS "V0ID symbolic audit: Z3 not found; target disabled")
-    endif()
-endif()
+# Exact reduced-domain symbolic falsification gate. Affine and degree<=2 ANF
+# recovery are linear in the unknown attacker coefficients, so a bit-packed
+# Gaussian elimination over GF(2) is both complete for this attacker class and
+# dramatically cheaper than a general SMT solver. Z3 is reserved for the next
+# audit DSL, where rotate/shift/add/control-flow actually require SMT machinery.
+add_executable(v0id-symbolic-series-audit
+    src/integrity/symbolic_series_audit.cpp
+)
+target_link_libraries(v0id-symbolic-series-audit PRIVATE v0id_core)
 
 if(V0ID_ENABLE_MATHVM)
     add_library(v0id_wasm_polymorph

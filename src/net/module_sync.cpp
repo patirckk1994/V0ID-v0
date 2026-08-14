@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 namespace v0id::net {
@@ -92,6 +93,21 @@ void validate_visibility(ModuleVisibility visibility) {
     throw std::runtime_error("unknown module visibility");
 }
 
+void validate_shared_descriptor(const ModuleDescriptor& d) {
+    if (d.protocol_id != "v0id-module-sync-v1")
+        throw std::runtime_error("unsupported module-sync protocol");
+    validate_kind(d.kind);
+    validate_visibility(d.visibility);
+    if (d.visibility != ModuleVisibility::shared_sync)
+        throw std::runtime_error("private-local module cannot enter shared module set");
+    if (d.module_id.empty() || d.module_version == 0)
+        throw std::runtime_error("module descriptor missing id/version");
+    if (d.byte_size == 0)
+        throw std::runtime_error("shared module descriptor has zero byte size");
+    if (digest_all_zero(d.digest))
+        throw std::runtime_error("module descriptor has zero digest");
+}
+
 } // namespace
 
 ModuleDigest512 module_digest512(const std::vector<std::uint8_t>& bytes) {
@@ -135,6 +151,40 @@ ModuleDescriptor describe_module(ModuleKind kind,
     out.byte_size = static_cast<std::uint64_t>(bytes.size());
     out.digest = module_digest512(bytes);
     return out;
+}
+
+ModuleDigest512 shared_module_set_digest512(
+    const std::vector<ModuleDescriptor>& descriptors) {
+    std::vector<ModuleDescriptor> sorted = descriptors;
+    for (const auto& d : sorted) validate_shared_descriptor(d);
+
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.kind, a.module_id, a.module_version, a.digest, a.byte_size) <
+               std::tie(b.kind, b.module_id, b.module_version, b.digest, b.byte_size);
+    });
+
+    for (std::size_t i = 1; i < sorted.size(); ++i) {
+        const auto& a = sorted[i - 1];
+        const auto& b = sorted[i];
+        if (a.kind == b.kind && a.module_id == b.module_id &&
+            a.module_version == b.module_version)
+            throw std::runtime_error(
+                "duplicate shared module kind/id/version in module set");
+    }
+
+    std::vector<std::uint8_t> canonical;
+    put_string(canonical, "V0ID-SHARED-MODULE-SET-v1");
+    put_u64(canonical, static_cast<std::uint64_t>(sorted.size()));
+    for (const auto& d : sorted) {
+        put_string(canonical, d.protocol_id);
+        put_u64(canonical, static_cast<std::uint64_t>(d.kind));
+        put_u64(canonical, static_cast<std::uint64_t>(d.visibility));
+        put_string(canonical, d.module_id);
+        put_u64(canonical, d.module_version);
+        put_u64(canonical, d.byte_size);
+        put_blob(canonical, d.digest.data(), d.digest.size());
+    }
+    return module_digest512(canonical);
 }
 
 void verify_module_bundle(const ModuleBundle& bundle,

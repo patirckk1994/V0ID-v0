@@ -7,6 +7,10 @@
 #include "series_generator.hpp"
 #include "toy_fingerprint.hpp"
 
+#ifdef V0ID_HAVE_WASM_POLYMORPH
+#include "wasm_series_generator.hpp"
+#endif
+
 #include "binfhecontext.h"
 
 #include <algorithm>
@@ -14,8 +18,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -50,6 +56,7 @@ using v0id::fhe::RemoteMachineResult;
 using v0id::integrity::EncryptedDigest32;
 using v0id::polymorph::KmacSeriesGenerator;
 using v0id::polymorph::MorphedProgram;
+using v0id::polymorph::PolymorphicSeriesGenerator;
 using v0id::polymorph::ProgramMorpher;
 using v0id::polymorph::SeriesProfile;
 
@@ -65,12 +72,45 @@ void usage(const char* argv0) {
     std::cerr
         << "usage:\n"
         << "  " << argv0 << " server <peer-id> <bind-endpoint> [job-count]\n"
-        << "  " << argv0 << " client <peer-id> <connect-endpoint>\n\n"
+        << "  " << argv0 << " client <peer-id> <connect-endpoint>\n"
+        << "  " << argv0 << " client <peer-id> <connect-endpoint> --series kmac\n"
+        << "  " << argv0 << " client <peer-id> <connect-endpoint> --series-wasm <file.wasm>\n\n"
         << "The client installs expensive BinFHE evaluator material once, then\n"
         << "sends an RMJ3 encrypted-machine job that references that cached session.\n"
-        << "The server executes four fixed BinFHE rounds and returns encrypted\n"
-        << "machine state plus four masked integrity candidates. The private series,\n"
-        << "series seed, MorphManifest and LWE secret key never leave the client.\n";
+        << "KMAC is the default local series generator. When built with WAMR,\n"
+        << "--series-wasm runs a zero-import polymorphism module locally before\n"
+        << "ProgramMorpher. The Wasm, private series, series seed, MorphManifest\n"
+        << "and LWE secret key never leave the client.\n";
+}
+
+std::vector<std::uint8_t> read_binary_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("cannot open local polymorphism Wasm file: " + path);
+
+    return std::vector<std::uint8_t>(
+        std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+std::unique_ptr<PolymorphicSeriesGenerator> make_series_generator(
+    const std::string& wasm_path) {
+    if (wasm_path.empty())
+        return std::make_unique<KmacSeriesGenerator>(64);
+
+#ifdef V0ID_HAVE_WASM_POLYMORPH
+    auto wasm = read_binary_file(wasm_path);
+    SeriesProfile profile{
+        "v0id-local-wasm-v1",
+        1,
+        {},
+    };
+    return std::make_unique<v0id::polymorph::WasmSeriesGenerator>(
+        std::move(wasm), std::move(profile));
+#else
+    (void)wasm_path;
+    throw std::runtime_error(
+        "--series-wasm requires a build with V0ID_ENABLE_MATHVM=ON");
+#endif
 }
 
 PublicMachineShape demo_shape() {
@@ -328,6 +368,7 @@ int run_server(const std::string& peer_id,
                           << bundle.profile.series_generator_id << "/v"
                           << bundle.profile.series_generator_version << '\n';
                 std::cout << "cached evaluator keys: YES\n"
+                          << "polymorph Wasm recv  : NO\n"
                           << "private series recv  : NO\n"
                           << "series seed received : NO\n"
                           << "manifest received    : NO\n"
@@ -411,7 +452,8 @@ int run_server(const std::string& peer_id,
 }
 
 int run_client(const std::string& peer_id,
-               const std::string& endpoint) {
+               const std::string& endpoint,
+               const std::string& wasm_path) {
     const Program increment{2, {
         {0, 0, 1, 1,  0},
         {0, 1, 0, 0, +1},
@@ -427,11 +469,11 @@ int run_client(const std::string& peer_id,
     for (const int bit : input)
         series_input.push_back(static_cast<std::uint8_t>(bit & 1));
 
-    KmacSeriesGenerator series_generator(64);
-    const auto series_profile = series_generator.profile();
+    auto series_generator = make_series_generator(wasm_path);
+    const auto series_profile = series_generator->profile();
     const auto series_seed = v0id::polymorph::random_series_seed();
     const auto derived_series =
-        series_generator.derive(series_input, series_seed, DEMO_EPOCH);
+        series_generator->derive(series_input, series_seed, DEMO_EPOCH);
 
     auto morph = ProgramMorpher::morph(
         increment, 0, PUBLIC_STATES, derived_series.morph_seed, INTEGRITY_SLOTS);
@@ -443,7 +485,11 @@ int run_client(const std::string& peer_id,
     print_msb_first(input);
     std::cout << "series generator     : " << series_profile.generator_id
               << "/v" << series_profile.version << '\n'
-              << "private series bytes : " << derived_series.series.size() << '\n'
+              << "series source        : "
+              << (wasm_path.empty() ? "built-in KMAC" : "local Wasm") << '\n';
+    if (!wasm_path.empty())
+        std::cout << "local Wasm file      : " << wasm_path << '\n';
+    std::cout << "private series bytes : " << derived_series.series.size() << '\n'
               << "public state count   : " << PUBLIC_STATES << '\n'
               << "public tape cells    : " << TAPE_CELLS << '\n'
               << "public round budget  : " << FIXED_ROUNDS << '\n'
@@ -536,12 +582,15 @@ int run_client(const std::string& peer_id,
     Envelope request;
     request.type = MessageType::execute_job;
     request.peer_id = peer_id;
-    request.job_id = "v0id-v043-cached-series-first-remote-increment";
+    request.job_id = wasm_path.empty()
+        ? "v0id-v043-cached-series-first-remote-increment"
+        : "v0id-v045-wasm-morphed-rmj3-remote-increment";
     request.epoch = DEMO_EPOCH;
     request.payload = v0id::fhe::pack_remote_machine_bundle(bundle);
 
     std::cout << "RMJ3 per-job bytes    : " << request.payload.size() << '\n'
               << "cached setup resent  : NO\n"
+              << "sending polymorph Wasm: NO\n"
               << "sending private series: NO\n"
               << "sending series seed  : NO\n"
               << "sending MorphManifest: NO\n"
@@ -587,12 +636,12 @@ int run_client(const std::string& peer_id,
     std::cout << "OK: cached series-derived morphed encrypted machine executed remotely\n"
                  "    + expensive BinFHE evaluator material installed once\n"
                  "    + RMJ3 job references process-local evaluator session\n"
-                 "    + private series derived before ProgramMorpher\n"
+                 "    + selected local series generator derived before ProgramMorpher\n"
                  "    + public crypto/profile identifiers round-tripped\n"
                  "    + encrypted program/state/head/tape crossed the network\n"
                  "    + fixed public round budget executed by server\n"
                  "    + all integrity candidates returned\n"
-                 "    + private series/seed remained client-side\n"
+                 "    + polymorphism Wasm/private series/seed remained client-side\n"
                  "    + MorphManifest remained client-side\n"
                  "    + secret key remained client-side\n"
                  "    + client decrypted 00001110 and verified private self-check\n";
@@ -612,14 +661,36 @@ int main(int argc, char** argv) try {
     const std::string endpoint = argv[3];
 
     if (mode == "server") {
+        if (argc > 5) {
+            usage(argv[0]);
+            return 2;
+        }
         const int count = argc >= 5 ? std::stoi(argv[4]) : 1;
         if (count <= 0)
             throw std::runtime_error("job-count must be positive");
         return run_server(peer_id, endpoint, count);
     }
 
-    if (mode == "client")
-        return run_client(peer_id, endpoint);
+    if (mode == "client") {
+        std::string wasm_path;
+        if (argc == 4) {
+            // Built-in KMAC remains the default.
+        }
+        else if (argc == 6 && std::string(argv[4]) == "--series" &&
+                 std::string(argv[5]) == "kmac") {
+            // Explicit default.
+        }
+        else if (argc == 6 && std::string(argv[4]) == "--series-wasm") {
+            wasm_path = argv[5];
+            if (wasm_path.empty())
+                throw std::runtime_error("--series-wasm path must not be empty");
+        }
+        else {
+            usage(argv[0]);
+            return 2;
+        }
+        return run_client(peer_id, endpoint, wasm_path);
+    }
 
     usage(argv[0]);
     return 2;

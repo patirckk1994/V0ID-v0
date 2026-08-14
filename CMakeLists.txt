@@ -171,6 +171,16 @@ add_executable(v0id-series-first-mlkem-tests
 )
 target_link_libraries(v0id-series-first-mlkem-tests PRIVATE v0id_core OpenSSL::Crypto)
 
+# Future coin/blockchain wrapper only: one accepted event may contain mining
+# work, useful-compute complexity, or both. The six MI/MV/MC + CI/CV/CC payout
+# primitives are classifications over that same event, not an issuance policy.
+add_library(v0id_coin src/coin/work_token.cpp)
+target_include_directories(v0id_coin PUBLIC src/coin)
+target_link_libraries(v0id_coin PUBLIC OpenSSL::Crypto)
+
+add_executable(v0id-work-token-tests src/coin/work_token_tests.cpp)
+target_link_libraries(v0id-work-token-tests PRIVATE v0id_coin)
+
 # PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
 # semantic job, exact generator implementation, morphed executable, profile,
 # session/job/epoch and issuer-private challenge. This does not claim to prove

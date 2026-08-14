@@ -177,11 +177,13 @@ clang --target=wasm32 -O2 -nostdlib \
   -Wl,--no-entry \
   -Wl,--allow-undefined \
   -Wl,--export=v0id_main \
-  -Wl,--initial-memory=65536 \
+  -Wl,--initial-memory=131072 \
   -Wl,--max-memory=1048576 \
   examples/mathvm/series_math.c \
   -o build/series_math.wasm
 ```
+
+The linker reserves linear-memory space for the guest stack plus a small data region. On the current clang/wasm-ld toolchain the guest needs 66,560 bytes, so one 64 KiB Wasm page is insufficient. The explicit two-page (128 KiB) initial memory remains far below V0ID's 16-page/1 MiB sandbox ceiling.
 
 Run:
 

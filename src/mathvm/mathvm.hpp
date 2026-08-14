@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -10,76 +11,27 @@
 
 namespace v0id::mathvm {
 
-inline constexpr std::uint32_t MATHVM_VERSION = 1;
+inline constexpr std::uint32_t MATHVM_ABI_VERSION = 1;
 
-// Exact, bounded value container. A scalar is represented by exactly one word;
-// providers may consume/produce bounded vectors of words. No pointers, handles,
-// files, sockets or host objects can exist in a MathVM value.
-struct MathValue {
-    std::vector<std::uint64_t> words;
-
-    static MathValue scalar(std::uint64_t value) { return MathValue{{value}}; }
-    bool is_scalar() const noexcept { return words.size() == 1; }
-    std::uint64_t scalar_value() const;
-};
-
-enum class Opcode : std::uint8_t {
-    constant_u64 = 1,
-    add_u64 = 2,
-    sub_u64 = 3,
-    xor_u64 = 4,
-    and_u64 = 5,
-    or_u64 = 6,
-    add_mod_u64 = 7,
-    mul_mod_u64 = 8,
-    select_u64 = 9,
-    provider_call = 32,
-};
-
-// Straight-line SSA instruction. Inputs occupy registers [0,input_count).
-// Every instruction writes one previously-undefined destination register and
-// may only read registers that have already been defined. There are no jumps.
-struct Instruction {
-    Opcode opcode{Opcode::constant_u64};
-    std::uint32_t dst{};
-    std::vector<std::uint32_t> src;
-    std::uint64_t immediate{};
-
-    // provider_call only. Peers exchange identifiers/versions and MathVM code;
-    // they never transmit native libraries through this interface.
-    std::string primitive_id;
-    std::uint32_t primitive_version{};
-    std::vector<std::uint8_t> parameters;
-};
-
-struct Program {
-    std::uint32_t vm_version{MATHVM_VERSION};
-    std::uint32_t input_count{};
-    std::uint32_t register_count{};
-    std::vector<Instruction> instructions;
-    std::vector<std::uint32_t> outputs;
-};
-
-struct SandboxLimits {
-    std::size_t max_instructions{4096};
-    std::size_t max_registers{4096};
-    std::size_t max_inputs{128};
-    std::size_t max_outputs{128};
-    std::size_t max_sources_per_instruction{16};
-    std::size_t max_parameter_bytes{64 * 1024};
-    std::size_t max_total_parameter_bytes{1024 * 1024};
-    std::size_t max_words_per_value{4096};
-    std::size_t max_total_words{65536};
-    std::uint64_t max_cost{10'000'000};
-};
+// Stable numeric tags used by the generic Wasm host import. They are protocol
+// identifiers, not security values. The textual id remains the canonical name
+// used in manifests/logging and later capability negotiation.
+inline constexpr std::uint64_t PRIMITIVE_ADD_MOD_U64 = 0x0001'0001ull;
+inline constexpr std::uint64_t PRIMITIVE_MUL_MOD_U64 = 0x0001'0002ull;
+inline constexpr std::uint64_t PRIMITIVE_TOY_LWE_AFFINE_U64 = 0x7fff'0001ull;
 
 struct PrimitiveDescriptor {
+    std::uint64_t tag{};
     std::string id;
     std::uint32_t version{};
-    std::size_t min_inputs{};
-    std::size_t max_inputs{};
-    std::size_t max_output_words{};
-    std::uint64_t max_cost{};
+    std::uint64_t cost{};
+    bool experimental{};
+};
+
+struct PrimitiveRequirement {
+    std::uint64_t tag{};
+    std::string id;
+    std::uint32_t version{};
 };
 
 class PrimitiveProvider {
@@ -87,52 +39,79 @@ public:
     virtual ~PrimitiveProvider() = default;
     virtual PrimitiveDescriptor descriptor() const = 0;
 
-    // Must be deterministic from call metadata and must not inspect host state.
-    // It is used before execution so the sandbox can reject oversized work.
-    virtual std::uint64_t estimate_cost(
-        const std::vector<std::uint8_t>& parameters,
-        std::size_t input_count) const = 0;
+    // V0.4.2 starts with a deliberately tiny exact scalar ABI. Larger vectors,
+    // matrices and polynomial buffers can be added later behind separate bounded
+    // imports without changing the trust model.
+    virtual std::uint64_t evaluate_u64(std::uint64_t a,
+                                       std::uint64_t b,
+                                       std::uint64_t c,
+                                       std::uint64_t d) const = 0;
+};
 
-    // Trusted local implementation of a mathematical primitive. The registry is
-    // populated by the embedding process; remote peers cannot load code here.
-    virtual MathValue evaluate(
-        const std::vector<MathValue>& inputs,
-        const std::vector<std::uint8_t>& parameters) const = 0;
+using U64PrimitiveFunction = std::function<std::uint64_t(
+    std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)>;
+
+class FunctionalU64Provider final : public PrimitiveProvider {
+public:
+    FunctionalU64Provider(PrimitiveDescriptor descriptor,
+                          U64PrimitiveFunction function);
+
+    PrimitiveDescriptor descriptor() const override;
+    std::uint64_t evaluate_u64(std::uint64_t a,
+                               std::uint64_t b,
+                               std::uint64_t c,
+                               std::uint64_t d) const override;
+
+private:
+    PrimitiveDescriptor descriptor_;
+    U64PrimitiveFunction function_;
 };
 
 class PrimitiveRegistry {
 public:
     void register_provider(std::shared_ptr<const PrimitiveProvider> provider);
-    const PrimitiveProvider& require(const std::string& id,
+
+    const PrimitiveProvider& require(std::uint64_t tag,
                                      std::uint32_t version) const;
+    const PrimitiveProvider& require(const PrimitiveRequirement& requirement) const;
+
+    bool supports(const PrimitiveRequirement& requirement) const;
     std::vector<PrimitiveDescriptor> descriptors() const;
 
 private:
-    using Key = std::pair<std::string, std::uint32_t>;
+    using Key = std::pair<std::uint64_t, std::uint32_t>;
     std::map<Key, std::shared_ptr<const PrimitiveProvider>> providers_;
 };
 
-struct ValidationResult {
-    std::uint64_t estimated_cost{};
-    std::size_t provider_calls{};
-    std::vector<PrimitiveDescriptor> required_providers;
+// Portable transmitted object: Wasm bytecode plus an explicit primitive
+// manifest. The evaluator validates the manifest before running the module and
+// the runtime host call rejects any primitive not declared here.
+struct WasmMathProgram {
+    std::vector<std::uint8_t> wasm;
+    std::string entrypoint{"v0id_main"};
+    std::vector<PrimitiveRequirement> required_primitives;
 };
 
-ValidationResult validate_program(const Program& program,
-                                  const PrimitiveRegistry& registry,
-                                  const SandboxLimits& limits = {});
-
-struct ExecutionResult {
-    std::vector<MathValue> outputs;
-    std::uint64_t estimated_cost{};
-    std::size_t total_words_materialized{};
+struct SandboxLimits {
+    std::size_t max_module_bytes{1024 * 1024};
+    std::uint32_t max_memory_pages{16};            // 16 * 64 KiB = 1 MiB
+    std::uint32_t stack_bytes{64 * 1024};
+    std::uint32_t host_managed_heap_bytes{64 * 1024};
+    std::size_t runtime_pool_bytes{16 * 1024 * 1024};
+    int max_wasm_instructions{1'000'000};
+    std::uint64_t max_provider_calls{4096};
+    std::uint64_t max_provider_cost{1'000'000};
 };
 
-ExecutionResult execute_classical(const Program& program,
-                                  const std::vector<MathValue>& inputs,
-                                  const PrimitiveRegistry& registry,
-                                  const SandboxLimits& limits = {});
+struct ExecutionReport {
+    std::uint64_t result{};
+    std::uint64_t provider_calls{};
+    std::uint64_t provider_cost{};
+};
 
-std::string to_string(Opcode opcode);
+// Classical native providers shipped with the research scaffold. The toy-LWE
+// entry is only an interface test: one scalar affine relation is NOT an LWE/PQ
+// encryption scheme and must never be advertised as one.
+PrimitiveRegistry make_default_registry();
 
 } // namespace v0id::mathvm

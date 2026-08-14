@@ -2,69 +2,95 @@
 
 Tiny research prototype for an exact encrypted, runtime-programmable Turing-machine interpreter.
 
-Current V0.2 + network scaffold:
+Current V0.3 + network scaffold:
 
 - **Encryption-lite:** OpenFHE BinFHE (`STD128`) exact Boolean gates; no approximate arithmetic.
 - **Encrypted program:** transition semantics are encrypted as one-hot next-state selectors plus encrypted write/move selectors.
 - **UTM-lite:** one fixed interpreter executes encrypted transition tables over encrypted one-hot state, encrypted one-hot head and encrypted tape. The demo is bounded to 8 cells.
 - **Fixed work schedule:** execution uses a public fixed round budget rather than secret-dependent termination.
 - **Remap-lite:** OpenSSL 3 `KMAC-256` derives epoch-specific logical-to-physical tape permutations; remaps move ciphertexts only.
-- **Precomputed polymorphism:** implemented client-side state-label permutation plus fixed-size dummy-state padding. Different morph seeds produce semantically equivalent machine images with the same public state count and evaluator path.
+- **Precomputed polymorphism:** client-side state-label permutation plus fixed-size dummy-state padding. Different morph seeds produce semantically equivalent machine images with the same public shape.
+- **Private morph manifest:** the client keeps the semantic state map, dummy-state map, integrity nonce, selected integrity return slot and output masks. This manifest is not part of the evaluator job.
+- **Toy encrypted self-fingerprint:** a test-only 32-bit Boolean mixer consumes the encrypted morphed transition table, encrypted initial tape and encrypted nonce. A plaintext reference computes the same value client-side.
+- **Masked integrity bank:** the evaluator produces a fixed public number of encrypted candidate digests. Candidate masks are encrypted; only the client manifest says which slot it checks and how to unmask it.
 - **P2P scaffold:** ZeroMQ/cppzmq binary-safe envelopes carry peer id, job id, epoch, message type and opaque payload bytes.
 - **FHE-over-network smoke test:** a remote process receives a key-independent BinFHE context, bootstrapping material and ciphertext, evaluates `NOT`, and returns a ciphertext without receiving the LWE secret key.
 
 Correctness and exact encrypted state semantics are invariants; speed and memory are expendable. Experimental research code, not audited production cryptography.
 
-## Precomputed polymorphism
+## Precomputed polymorphism + self-check
 
-V0ID polymorphism does **not** require runtime self-modifying code. Before encryption, the client can generate a semantically equivalent machine image from a private morph seed.
+V0ID polymorphism does **not** require runtime self-modifying code. Before encryption, the client generates a semantically equivalent machine image from a private 256-bit morph seed.
 
-The first implemented `ProgramMorpher` does two things:
-
-```text
-base state IDs
-    -> KMAC-derived secret permutation
-    -> different public state IDs
-
-base program size
-    -> fixed configured public state count
-    -> remaining states become harmless identity/no-op states
-```
-
-Every morph keeps the same configured public dimensions:
+The current morpher produces:
 
 ```text
-same tape size
-same public state count
-same binary alphabet
-same fixed round budget
-same evaluator implementation
+base program
+    -> KMAC-derived state permutation
+    -> fixed-size dummy-state padding
+    -> private MorphManifest
 ```
 
-The state mapping is client-side metadata and is not intended to be sent to an untrusted evaluator. Because the universal evaluator visits every public state every round, dummy states pad actual evaluator work as well as the encrypted transition table.
-
-Current demo generation looks conceptually like:
+The manifest currently contains client-only metadata approximately equivalent to:
 
 ```text
-increment
-   -> Morph(seed A) -> encrypted morph A -> 14
-   -> Morph(seed B) -> encrypted morph B -> 14
-
-decrement
-   -> Morph(seed C) -> encrypted morph C -> 12
+base semantic state -> morphed state map
+dummy state IDs
+integrity nonce
+selected integrity output slot
+per-slot integrity masks
 ```
 
-The different morphs can place the original semantic states at different public state IDs while producing identical logical results.
+The encrypted self-fingerprint then binds the toy check to the **actual morphed encrypted transition semantics**, not merely a client-provided plaintext program tag:
 
-Future morphing stages will add randomized scratch/output placement, equivalent subroutine variants, discardable work and interleaved hidden integrity logic. The goal is to prevent the evaluator from acquiring a stable semantic map such as "these states are the hash checker". FHE provides confidentiality; polymorphism is an additional structural anti-correlation layer.
+```text
+encrypted morphed transition bits
+        + encrypted initial tape
+        + encrypted nonce
+                |
+                v
+        ToyFingerprint32
+                |
+                v
+      encrypted digest
+                |
+        encrypted masks
+                |
+                v
+     fixed candidate bank
+```
 
-See `docs/POLYMORPHISM.md` for the design and threat-model notes.
+The client computes the expected toy digest from the same morphed plaintext program/input/nonce, decrypts only the manifest-selected candidate, removes its private mask, and compares.
+
+`ToyFingerprint32` is deliberately **not a cryptographic hash**. It is a plumbing test for exact FHE self-fingerprinting, private placement metadata and later polymorphic integrity work. Replacing it with a real Keccak/KMAC-style circuit is a later step.
+
+The current evaluator can still recognize that a dedicated fingerprint subcircuit exists. Therefore this version does **not** yet solve the harder problem of hiding where integrity work lives from structural/timing/correlation analysis. Future morphing must interleave or otherwise disguise integrity work inside the general computation.
+
+## Known correlation / PQ-facing research issue
+
+The 256-bit morph seed is generated client-side with `RAND_bytes` and expanded with KMAC-256. Seed quality is security-sensitive: weak entropy, seed reuse or accidental deterministic reuse would immediately weaken polymorphic diversity.
+
+Even with strong seed generation, encryption can remain intact while repeated jobs leak **behavioral fingerprints** through observable execution patterns. Candidate correlation features include timing, repeated state/dependency shapes, message sizes, peer access order, remap cadence and future `STORE_SLOT` / `FETCH_SLOT` patterns.
+
+So the remaining polymorphism problem is not merely cryptanalytic. It is also statistical: can an evaluator classify equivalent encrypted computations from their observable traces without decrypting anything? That is a planned adversarial-testing target.
+
+The current BinFHE demo uses `STD128` because this repository is still a functional prototype; parameter selection for a post-quantum security claim is not finalized or audited.
+
+See `docs/POLYMORPHISM.md` for the fuller threat model.
 
 ## Hidden vs public
 
-The local prototype encrypts tape bits, active state, head position, transition next-state choice, transition write bit and transition movement choice.
+Encrypted locally:
 
-The evaluator still learns public shape information such as tape length, public state count, alphabet and fixed round count. Morph variants are therefore padded to identical public dimensions.
+- tape bits,
+- active state,
+- head position,
+- transition next-state choice,
+- transition write bit,
+- transition movement choice,
+- toy fingerprint nonce/masks during evaluation.
+
+Public shape currently includes tape length, public state count, binary alphabet, fixed round count and integrity candidate count.
 
 ## Dependencies
 
@@ -92,7 +118,7 @@ cmake --build build -j
 ./build/v0id
 ```
 
-The demo first checks the base increment/decrement machines with a plaintext reference interpreter. It then generates two distinct increment morphs and one decrement morph, each padded to the same public state count, verifies plaintext equivalence, encrypts all three programs and executes them through the same fixed BinFHE evaluator.
+The demo generates two independently morphed increment programs and one morphed decrement program, verifies plaintext equivalence, then executes each through BinFHE. Each FHE run also computes and checks the encrypted toy self-fingerprint.
 
 Expected logical outputs remain:
 
@@ -101,7 +127,7 @@ Expected logical outputs remain:
 00001101 -> decrement -> 00001100
 ```
 
-The program also prints client-side state mappings so the local test visibly demonstrates that two equivalent morphs need not use the same state IDs. Those mappings are debugging output only and would not be transmitted to a remote evaluator.
+The local demo prints client-side state maps and selected integrity slots for visibility. Those values are debugging output only and would not be transmitted to an untrusted evaluator.
 
 ### Local peer transport smoke test
 
@@ -133,30 +159,30 @@ Other terminals:
 ./build/v0id-fhe-peer client CLIENT2 tcp://127.0.0.1:7002 0
 ```
 
-The evaluator reconstructs the key-independent BinFHE context, loads refresh/switching keys, evaluates the gate and returns a serialized result ciphertext. The secret key remains client-side.
-
 ## Source layout
 
 ```text
 src/core/program.hpp                 Rule / Program representation
-src/polymorph/program_morpher.*      precomputed semantic morph compiler
-src/main.cpp                         local plaintext + FHE morph tests
+src/polymorph/program_morpher.*      precomputed semantic morph compiler + private manifest
+src/integrity/toy_fingerprint.*      test-only plaintext/FHE self-fingerprint
+src/main.cpp                         local plaintext + FHE morph/integrity tests
 src/fhe/fhe_codec.hpp                OpenFHE binary serialization helpers
 src/net/peer_transport.*             V0ID binary envelope / ZeroMQ transport
 src/net/peer_demo.cpp                plain network smoke test
 src/net/fhe_peer_demo.cpp            remote BinFHE smoke test
-docs/POLYMORPHISM.md                 polymorphism design
+docs/POLYMORPHISM.md                 polymorphism / correlation threat model
 ```
 
 ## Next research milestones
 
 - randomized logical scratch/output relocation before physical KMAC remapping,
-- a small hidden integrity/self-fingerprint computation embedded into morphed programs,
-- equivalent subroutine variants and interleaving of useful/integrity/discardable work,
+- move the fingerprint work from a recognizable dedicated subcircuit toward morphed/interleaved integrity computation,
+- equivalent subroutine variants and discardable work,
+- distributed encrypted tape with `(peer_id, local_slot)`,
+- trace instrumentation for timing/message/peer-access correlation experiments,
 - serialization of an entire encrypted machine/program rather than one ciphertext,
-- mapping remapped tape slots onto `(peer_id, local_slot)`,
 - `STORE_SLOT` / `FETCH_SLOT` for ciphertext-resident remote tape cells,
 - encrypted halted/no-op semantics under the fixed work budget,
-- probabilistic audit experiments before heavier verifiable-computation machinery.
+- eventually replace the toy mixer with a real cryptographic construction and stronger verification machinery.
 
 If CMake/compiler complains, report the exact error and installation layout. The code intentionally favors explicit research scaffolding over pretending this is production cryptography.

@@ -8,21 +8,107 @@ The purpose is not to replace FHE. FHE hides encrypted transition semantics and 
 
 ## Current implementation
 
-The first `ProgramMorpher` stage is implemented in `src/polymorph/program_morpher.*`.
+`ProgramMorpher` currently provides:
 
-It currently provides:
-
-- a 256-bit client-side morph seed,
+- a 256-bit client-side morph seed generated with `RAND_bytes`,
 - KMAC-256-derived deterministic pseudorandom state placement,
 - a secret mapping from base semantic states to configured public state IDs,
 - fixed-size dummy-state padding,
 - remapping of the initial state and every next-state transition,
 - harmless identity/no-op semantics for unused padded states,
-- client-side mapping metadata for testing only.
+- a client-only `MorphManifest`,
+- a KMAC-derived integrity nonce,
+- a private selected integrity return slot,
+- private per-slot integrity masks.
 
-The universal FHE evaluator already processes every configured public state every round, so padded states also pad evaluator work rather than merely changing serialized metadata.
+The universal FHE evaluator processes every configured public state every round, so padded states pad evaluator work rather than merely changing serialized metadata.
 
-`src/main.cpp` tests two independently generated morphs of the same increment program and a morph of the decrement program. It checks plaintext semantic equivalence before running the morphs through BinFHE.
+`src/integrity/toy_fingerprint.*` adds the first encrypted self-fingerprint plumbing test.
+
+## Private MorphManifest
+
+The manifest is generated alongside each morph and must remain client-side:
+
+```cpp
+struct MorphManifest {
+    std::vector<std::size_t> base_to_morphed;
+    std::vector<std::size_t> dummy_states;
+
+    std::uint32_t integrity_nonce;
+    std::size_t integrity_output_slot;
+    std::vector<std::uint32_t> integrity_output_masks;
+};
+```
+
+The evaluator receives the encrypted machine material needed to perform its job, but not this plaintext semantic map.
+
+The client therefore knows exactly where a generated morph placed its semantic states and which returned integrity slot it intends to check, while the evaluator should not receive those labels.
+
+## Implemented toy self-fingerprint
+
+The current integrity primitive is intentionally small and explicitly **not cryptographically strong**. It exists to prove that plaintext and BinFHE evaluation can compute the same exact fingerprint over the same machine representation.
+
+The canonical semantic input to the toy mixer is:
+
+```text
+for every public (state, read) row:
+    encrypted next-state one-hot bits
+    encrypted write bit
+    encrypted move-left/stay/right bits
+
+then:
+    encrypted initial tape
+    encrypted nonce
+```
+
+The plaintext reference consumes the corresponding plaintext bits in exactly the same order.
+
+Conceptually:
+
+```text
+morphed Program
+       |
+       +--> canonical plaintext semantic bits ---> ToyFingerprint32 ---> expected digest
+       |
+       +--> encrypt transition semantics
+                    |
+                    v
+          canonical encrypted semantic bits
+                    + encrypted initial tape
+                    + encrypted nonce
+                    |
+                    v
+             ToyFingerprint32/FHE
+                    |
+                    v
+              encrypted digest
+```
+
+This is closer to a self-fingerprint than merely hashing a client-provided program tag: the FHE path consumes the encrypted morphed transition table itself.
+
+## Masked integrity candidate bank
+
+The toy digest is copied into a fixed public number of encrypted candidate outputs under different **encrypted client masks**.
+
+For candidate `i`:
+
+```text
+candidate_i = digest XOR Enc(mask_i)
+```
+
+Only the client manifest contains the plaintext masks and selected output slot.
+
+The client:
+
+```text
+1. decrypts manifest.integrity_output_slot
+2. XORs the result with manifest.integrity_output_masks[slot]
+3. compares the recovered digest with its expected plaintext reference
+```
+
+The candidate count is public and fixed across jobs. The selected slot and mask values are client-side secrets.
+
+This is still only experimental uncertainty, not a proof of correct computation.
 
 ## Goal
 
@@ -47,6 +133,7 @@ same tape size
 same state count
 same alphabet
 same fixed round budget
+same integrity-bank size
 same wire format
 same evaluator implementation
 ```
@@ -63,7 +150,7 @@ A KMAC-derived random placement rewrites every transition:
 (q, bit) -> (q2, write, move)
 ```
 
-into the equivalent transition over mapped state IDs:
+into:
 
 ```text
 (pi(q), bit) -> (pi(q2), write, move)
@@ -73,103 +160,130 @@ The initial state is mapped through the same permutation.
 
 ### 2. Padded dummy states — implemented
 
-Every morph is padded to a configured public state count. Unused states currently act as harmless identity states:
+Every morph is padded to a configured public state count. Unused states currently act as harmless identity states and are still processed by the fixed evaluator.
 
-```text
-(dummy, 0) -> (dummy, 0, stay)
-(dummy, 1) -> (dummy, 1, stay)
-```
+### 3. Private integrity placement metadata — implemented
 
-They are unreachable from the semantic base program, but the fixed evaluator still processes them homomorphically every round.
+The morph seed derives the client-only nonce, candidate selection and output masks used by the first self-fingerprint test.
 
-### 3. Scratch/output relocation — next
+### 4. Scratch/output relocation — next
 
-Randomize logical scratch and output locations before the existing KMAC physical-remapping layer is applied. No public constant should identify a special `HASH_OUTPUT_SLOT` or similar distinguished location.
+Randomize logical scratch and output locations before the existing KMAC physical-remapping layer is applied. No public constant should identify a special integrity or digest slot.
 
-### 4. Equivalent subroutine variants
+### 5. Equivalent subroutine variants
 
 Maintain multiple equivalent implementations of selected Boolean/Turing-machine operations. A morph seed chooses among them before encryption.
 
-### 5. Interleaved integrity work
+### 6. Interleaved integrity work
 
-The integrity/self-fingerprint computation should not exist as one obvious contiguous public phase such as:
+The current toy fingerprint is a recognizable dedicated evaluator subcircuit. That is useful for correctness testing but **not** sufficient for the final threat model.
+
+The intended later design must avoid a stable public phase such as:
 
 ```text
 real computation
-then hash computation
+then obvious fingerprint circuit
 ```
 
-Instead the client compiler may interleave fragments of useful work, integrity work and discardable work into one fixed-shape encrypted program.
+Instead, useful work, integrity work and discardable work should be transformed into a fixed-shape machine whose semantic roles cannot be identified reliably from public execution structure.
 
-The server executes the same universal interpreter and should not know which encrypted transitions contribute to the user-visible result, hidden integrity result or decoy work.
+## Correlation is a primary remaining weakness
 
-## Planned hidden self-fingerprint
+A strong FHE scheme can remain cryptographically intact while the evaluator learns from **patterns**.
 
-The planned integrity mechanism is a computation embedded into the encrypted machine image that computes a fingerprint over a canonical representation of the intended job, excluding the digest slot itself.
+Possible observable features include:
+
+```text
+execution timing
+bootstrapping bursts
+dependency depth
+message sizes
+peer access sequence
+STORE/FETCH rhythm
+slot reuse patterns
+remap cadence
+repeated fixed-shape subcircuits
+```
+
+Therefore polymorphism has a different failure mode from encryption: an attacker may not recover any plaintext but may still classify jobs or locate recurring semantic roles statistically.
+
+A future test harness should generate many morphs of several computation families and train/measure distinguishers using **only evaluator-visible traces**.
 
 Conceptually:
 
 ```text
-digest = H(
-    domain_separator ||
-    canonical_program ||
-    canonical_input ||
-    nonce ||
-    epoch
-)
+morph generator G
+       |
+       v
+many equivalent encrypted jobs
+       |
+       v
+observable traces only
+       |
+       v
+attacker / distinguisher D
+       |
+       +--> which computation family?
+       +--> same lineage as previous job?
+       +--> where is integrity work likely located?
 ```
 
-The client can compute the expected digest independently before outsourcing the job. The evaluator homomorphically computes the corresponding hidden digest while operating on encrypted program/data semantics and returns the encrypted digest with the encrypted result.
+A later adversarial morph generator can optimize transformations against such distinguishers while retaining semantic equivalence.
 
-The digest location and internal transitions used to compute it may change between precomputed morphs. There is intentionally no recursive definition such as `digest = H(program || digest)`; the digest field is excluded from its own hash domain.
+The cryptographic RNG should provide unpredictability; a learned model should not be treated as an entropy source.
+
+## Seed entropy / post-quantum-facing note
+
+The morph seed is a security-sensitive input. Weak entropy, seed reuse, deterministic reuse across jobs or compromise of the client RNG can collapse the diversity of generated variants and enable straightforward correlation.
+
+The current seed is 256 bits from OpenSSL `RAND_bytes` and is expanded through KMAC-256. This is intended as a strong symmetric construction, but the repository does not claim that its complete composition or current BinFHE parameter selection has been audited for post-quantum deployment.
+
+The local demo currently uses OpenFHE `STD128`; parameter migration/hardening for a formal post-quantum claim remains separate from the polymorphism problem.
 
 ## Threat-model interpretation
 
-This mechanism is intended to make selective cheating and structural correlation harder, not to claim formal Byzantine/verifiable-computation security.
+The current mechanism is intended to make selective cheating and structural correlation harder, not to claim formal Byzantine/verifiable-computation security.
 
-FHE provides confidentiality of hidden data/program semantics. Precomputed polymorphism aims to make questions like these difficult for the evaluator:
+The toy fingerprint currently proves:
 
 ```text
-Which state corresponds to the same semantic state as last job?
-Where is the integrity calculation?
-Which encrypted transitions affect the final useful output?
-Which encrypted transitions are decoys?
-Which logical tape region contains the digest?
+client plaintext reference
+    == evaluator BinFHE fingerprint
 ```
 
-If selective cheating cannot reliably distinguish useful, audit and discardable work, the evaluator risks corrupting a hidden check whenever it skips or fabricates work.
+for the same morphed program/input/nonce.
 
-This can later be combined with hidden known-answer jobs, occasional replication, peer scoring and stronger verifiable-computation mechanisms.
+It does **not** prove that a malicious evaluator executed the useful Turing-machine computation correctly. A malicious evaluator may still identify the dedicated toy fingerprint circuit and evaluate it honestly while cheating elsewhere.
+
+That limitation is deliberate and documented. The next integrity research problem is making the audit computation semantically ambiguous inside the same polymorphic execution structure.
+
+This can later be combined with hidden known-answer jobs, replication, peer scoring, authenticated transport and stronger verifiable-computation mechanisms.
 
 ## Current API
 
 ```cpp
 using MorphSeed = std::array<unsigned char, 32>;
 
+struct MorphManifest {
+    std::vector<std::size_t> base_to_morphed;
+    std::vector<std::size_t> dummy_states;
+    std::uint32_t integrity_nonce;
+    std::size_t integrity_output_slot;
+    std::vector<std::uint32_t> integrity_output_masks;
+};
+
 struct MorphedProgram {
     Program program;
     std::size_t initial_state;
-    std::vector<std::size_t> base_to_morphed;
-    std::vector<std::size_t> dummy_states;
-};
-
-class ProgramMorpher {
-public:
-    static MorphSeed random_seed();
-
-    static MorphedProgram morph(
-        const Program& base,
-        std::size_t base_initial_state,
-        std::size_t public_state_count,
-        const MorphSeed& seed);
+    MorphManifest manifest;
 };
 ```
 
-`base_to_morphed` and `dummy_states` are compiler/test metadata. They are not intended to accompany an encrypted job to an untrusted evaluator.
+The local demo deliberately prints manifest details to make morph differences visible during development. Production evaluator jobs should not receive that plaintext manifest.
 
 ## Required tests
 
-The local demo currently checks:
+The local demo now checks both computation semantics and integrity plumbing:
 
 ```text
 plaintext(base, input, N)
@@ -179,12 +293,17 @@ plaintext(base, input, N)
     == decrypt(FHE(morph(seed_B), Enc(input), N))
 ```
 
-and verifies that generated variants expose the same configured public state count and fixed work budget.
+plus:
 
-More exhaustive randomized differential tests should be added as the morph compiler gains scratch relocation, subroutine variants and integrity work.
+```text
+ToyFingerprint32(plaintext morphed program, input, nonce)
+    == unmask(decrypt(FHE ToyFingerprint32(encrypted morphed program, encrypted input, encrypted nonce)))
+```
+
+More exhaustive randomized differential tests should be added as scratch relocation, subroutine variants, integrity interleaving and distributed storage are introduced.
 
 ## Summary
 
 V0ID polymorphism means:
 
-> The program does not have to change while the evaluator watches it. The client can precompute a different semantically equivalent encrypted machine image for every job, so the evaluator never receives a stable map of where any particular computation — especially the hidden self-check — lives.
+> The client precomputes a different semantically equivalent encrypted machine image for each job and keeps the semantic decoding manifest private. FHE hides the values; polymorphism attempts to deny the evaluator a stable map of what those values and operations mean across repeated jobs.

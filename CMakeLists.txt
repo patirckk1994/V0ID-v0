@@ -168,6 +168,27 @@ target_include_directories(v0id_core PUBLIC
 )
 target_link_libraries(v0id_core PUBLIC OpenSSL::Crypto)
 
+# PQ-facing plaintext quine commitment. This uses OpenSSL SHA3-512/KMAC-256 and
+# binds the morphed executable, issuer semantic job, generator implementation,
+# session/job/epoch and crypto profile. It is intentionally distinct from the
+# legacy toy FHE fingerprint and does not claim to prove remote execution.
+add_library(v0id_quine
+    src/integrity/quine_hash.cpp
+)
+target_include_directories(v0id_quine PUBLIC
+    src/integrity
+    src/fhe
+)
+target_link_libraries(v0id_quine PUBLIC v0id_core OpenSSL::Crypto)
+
+# Composition/falsification gate: known-answer SHA3-512, seam substitution tests,
+# private-root challenge sensitivity, and exhaustive reduced-domain XOR-period
+# screening of the built-in series schedule.
+add_executable(v0id-quine-audit-tests
+    src/integrity/quine_audit_tests.cpp
+)
+target_link_libraries(v0id-quine-audit-tests PRIVATE v0id_quine)
+
 if(V0ID_ENABLE_MATHVM)
     # Client-only portable polymorphism strategy. Unlike remote MathVM this
     # sandbox exposes zero host imports: seed/input/epoch enter through bounded
@@ -195,7 +216,7 @@ add_executable(v0id
     src/integrity/toy_fingerprint.cpp
 )
 target_include_directories(v0id PRIVATE src/integrity)
-target_link_libraries(v0id PRIVATE v0id_core OpenSSL::Crypto)
+target_link_libraries(v0id PRIVATE v0id_core v0id_quine OpenSSL::Crypto)
 v0id_use_openfhe(v0id)
 
 # Binary-safe transport layer. The envelope payload is deliberately opaque so
@@ -234,6 +255,7 @@ target_include_directories(v0id-remote-machine PRIVATE
 target_link_libraries(v0id-remote-machine PRIVATE
     v0id_net
     v0id_core
+    v0id_quine
     OpenSSL::Crypto
 )
 if(V0ID_ENABLE_MATHVM)

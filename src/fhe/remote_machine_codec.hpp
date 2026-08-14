@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace v0id::fhe {
@@ -19,10 +20,26 @@ struct PublicMachineShape {
     std::uint64_t integrity_slots{};
 };
 
-// Everything in this structure is evaluator-visible. Secret-key material and
-// the client MorphManifest are intentionally absent.
+// Public self-description only. This is intentionally not yet a negotiated
+// plugin ABI: peers identify already-installed protocol families and versions.
+// The series generator runs on the client; its id/version is provenance for
+// later correlation experiments, not executable code sent to the evaluator.
+struct CryptoProfileId {
+    std::string primitive_id;
+    std::string parameter_set;
+    std::string machine_protocol;
+    std::string integrity_profile;
+    std::string series_generator_id;
+    std::uint64_t series_generator_version{};
+
+    bool operator==(const CryptoProfileId&) const = default;
+};
+
+// Everything in this structure is evaluator-visible. Secret-key material, the
+// private polymorphic series/seed and client MorphManifest are absent.
 struct RemoteMachineBundle {
     PublicMachineShape shape;
+    CryptoProfileId profile;
 
     ByteBlob context;
     ByteBlob refresh_key;
@@ -45,6 +62,7 @@ struct RemoteMachineBundle {
 
 struct RemoteMachineResult {
     PublicMachineShape shape;
+    CryptoProfileId profile;
     std::vector<ByteBlob> state_bits;
     std::vector<ByteBlob> head_bits;
     std::vector<ByteBlob> tape_bits;
@@ -54,14 +72,15 @@ struct RemoteMachineResult {
 namespace remote_detail {
 
 inline constexpr std::array<std::uint8_t, 8> JOB_MAGIC{
-    'V','0','I','D','R','M','J','1'};
+    'V','0','I','D','R','M','J','2'};
 inline constexpr std::array<std::uint8_t, 8> RESULT_MAGIC{
-    'V','0','I','D','R','M','R','1'};
+    'V','0','I','D','R','M','R','2'};
 
 inline constexpr std::uint64_t MAX_STATES = 128;
 inline constexpr std::uint64_t MAX_TAPE_CELLS = 65536;
 inline constexpr std::uint64_t MAX_ROUNDS = 1000000;
 inline constexpr std::uint64_t MAX_INTEGRITY_SLOTS = 1024;
+inline constexpr std::uint64_t MAX_PROFILE_FIELD_BYTES = 96;
 inline constexpr std::uint64_t MAX_BLOB_BYTES = 512ull * 1024ull * 1024ull;
 inline constexpr std::uint64_t MAX_WIRE_BYTES = 2ull * 1024ull * 1024ull * 1024ull;
 
@@ -74,6 +93,23 @@ inline void validate_shape(const PublicMachineShape& shape) {
         throw std::runtime_error("remote machine round budget outside limit");
     if (shape.integrity_slots == 0 || shape.integrity_slots > MAX_INTEGRITY_SLOTS)
         throw std::runtime_error("remote machine integrity slot count outside limit");
+}
+
+inline void validate_profile_field(const std::string& value, const char* what) {
+    if (value.empty())
+        throw std::runtime_error(std::string(what) + " must not be empty");
+    if (value.size() > MAX_PROFILE_FIELD_BYTES)
+        throw std::runtime_error(std::string(what) + " exceeds protocol limit");
+}
+
+inline void validate_profile(const CryptoProfileId& profile) {
+    validate_profile_field(profile.primitive_id, "primitive id");
+    validate_profile_field(profile.parameter_set, "parameter set");
+    validate_profile_field(profile.machine_protocol, "machine protocol");
+    validate_profile_field(profile.integrity_profile, "integrity profile");
+    validate_profile_field(profile.series_generator_id, "series generator id");
+    if (profile.series_generator_version == 0)
+        throw std::runtime_error("series generator version must be positive");
 }
 
 inline std::size_t checked_size(std::uint64_t value, const char* what) {
@@ -119,6 +155,48 @@ inline PublicMachineShape get_shape(const std::uint8_t*& p, const std::uint8_t* 
     shape.integrity_slots = get_u64(p, end);
     validate_shape(shape);
     return shape;
+}
+
+inline void put_string(ByteBlob& out, const std::string& value, const char* what) {
+    validate_profile_field(value, what);
+    put_u64(out, static_cast<std::uint64_t>(value.size()));
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+inline std::string get_string(const std::uint8_t*& p,
+                              const std::uint8_t* end,
+                              const char* what) {
+    const auto size = get_u64(p, end);
+    if (size == 0 || size > MAX_PROFILE_FIELD_BYTES)
+        throw std::runtime_error(std::string("invalid ") + what + " length");
+    if (size > static_cast<std::uint64_t>(end - p))
+        throw std::runtime_error(std::string("truncated ") + what);
+    const auto n = checked_size(size, "profile string size overflow");
+    std::string out(reinterpret_cast<const char*>(p), n);
+    p += n;
+    return out;
+}
+
+inline void put_profile(ByteBlob& out, const CryptoProfileId& profile) {
+    validate_profile(profile);
+    put_string(out, profile.primitive_id, "primitive id");
+    put_string(out, profile.parameter_set, "parameter set");
+    put_string(out, profile.machine_protocol, "machine protocol");
+    put_string(out, profile.integrity_profile, "integrity profile");
+    put_string(out, profile.series_generator_id, "series generator id");
+    put_u64(out, profile.series_generator_version);
+}
+
+inline CryptoProfileId get_profile(const std::uint8_t*& p, const std::uint8_t* end) {
+    CryptoProfileId profile;
+    profile.primitive_id = get_string(p, end, "primitive id");
+    profile.parameter_set = get_string(p, end, "parameter set");
+    profile.machine_protocol = get_string(p, end, "machine protocol");
+    profile.integrity_profile = get_string(p, end, "integrity profile");
+    profile.series_generator_id = get_string(p, end, "series generator id");
+    profile.series_generator_version = get_u64(p, end);
+    validate_profile(profile);
+    return profile;
 }
 
 inline void append_blob(ByteBlob& out, const ByteBlob& blob) {
@@ -179,6 +257,7 @@ inline void require_exact_size(std::size_t actual,
 inline ByteBlob pack_remote_machine_bundle(const RemoteMachineBundle& bundle) {
     using namespace remote_detail;
     validate_shape(bundle.shape);
+    validate_profile(bundle.profile);
 
     require_exact_size(bundle.program_bits.size(), program_bit_count(bundle.shape),
                        "wrong encrypted program bit count");
@@ -195,6 +274,7 @@ inline ByteBlob pack_remote_machine_bundle(const RemoteMachineBundle& bundle) {
     ByteBlob out;
     out.insert(out.end(), JOB_MAGIC.begin(), JOB_MAGIC.end());
     put_shape(out, bundle.shape);
+    put_profile(out, bundle.profile);
 
     append_blob(out, bundle.context);
     append_blob(out, bundle.refresh_key);
@@ -226,6 +306,7 @@ inline RemoteMachineBundle unpack_remote_machine_bundle(const ByteBlob& wire) {
 
     RemoteMachineBundle bundle;
     bundle.shape = get_shape(p, end);
+    bundle.profile = get_profile(p, end);
     bundle.context = read_blob(p, end);
     bundle.refresh_key = read_blob(p, end);
     bundle.switching_key = read_blob(p, end);
@@ -259,6 +340,7 @@ inline RemoteMachineBundle unpack_remote_machine_bundle(const ByteBlob& wire) {
 inline ByteBlob pack_remote_machine_result(const RemoteMachineResult& result) {
     using namespace remote_detail;
     validate_shape(result.shape);
+    validate_profile(result.profile);
     require_exact_size(result.state_bits.size(), checked_size(result.shape.states, "state count overflow"),
                        "wrong result state bit count");
     require_exact_size(result.head_bits.size(), checked_size(result.shape.tape_cells, "head count overflow"),
@@ -272,6 +354,7 @@ inline ByteBlob pack_remote_machine_result(const RemoteMachineResult& result) {
     ByteBlob out;
     out.insert(out.end(), RESULT_MAGIC.begin(), RESULT_MAGIC.end());
     put_shape(out, result.shape);
+    put_profile(out, result.profile);
     for (const auto& blob : result.state_bits) append_blob(out, blob);
     for (const auto& blob : result.head_bits) append_blob(out, blob);
     for (const auto& blob : result.tape_bits) append_blob(out, blob);
@@ -293,6 +376,7 @@ inline RemoteMachineResult unpack_remote_machine_result(const ByteBlob& wire) {
 
     RemoteMachineResult result;
     result.shape = get_shape(p, end);
+    result.profile = get_profile(p, end);
 
     result.state_bits.resize(checked_size(result.shape.states, "state count overflow"));
     for (auto& blob : result.state_bits) blob = read_blob(p, end);

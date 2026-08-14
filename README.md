@@ -198,11 +198,18 @@ provider cost           <= 1,000,000 units
 
 Native provider work has a separate call/cost budget because time spent inside a native accelerator is not represented by Wasm instruction count.
 
-## V0.4.2 sandbox self-tests
+## Proven V0.4.2 local MathVM sandbox milestone
 
-`v0id-mathvm-tests` constructs its Wasm modules directly in memory, so it does not need a wasm32 compiler.
+The WAMR MathVM host and rejection-boundary suite have now been compiled and run successfully on the project's Linux development host.
 
-The suite exercises:
+`v0id-mathvm-tests` constructs its Wasm modules directly in memory and reported:
+
+```text
+V0ID MathVM sandbox tests: 11 passed, 0 failed
+OK: local MathVM sandbox rejection boundary exercised
+```
+
+The verified cases are:
 
 - normal Wasm execution,
 - a declared provider call,
@@ -211,12 +218,14 @@ The suite exercises:
 - provider call-budget exhaustion,
 - infinite-loop instruction metering,
 - oversized module rejection,
-- excessive linear-memory rejection,
+- excessive linear-memory rejection before WAMR execution,
 - non-Wasm/AOT-like input rejection,
-- WASI import rejection,
+- WASI/other non-allowlisted host import rejection before WAMR execution,
 - recovery after trapped/rejected jobs.
 
-Build and run:
+Two useful hardening findings were discovered during this test pass: WAMR's memory override warning was not itself fail-closed, and an unused unresolved WASI import could remain linked as a warning when WASI support was disabled. V0ID therefore now pre-validates the Wasm memory and import sections itself before handing bytecode to WAMR.
+
+Build and rerun the verified gate with:
 
 ```sh
 git pull
@@ -225,7 +234,7 @@ cmake --build build -j --target v0id-mathvm-tests
 ./build/v0id-mathvm-tests
 ```
 
-This test target is the immediate validation gate before MathVM bytecode is placed on the network.
+Passing this suite is a functional sandbox-policy milestone, not a proof that WAMR or the V0ID host ABI is vulnerability-free.
 
 ## Optional MathVM guest demo
 
@@ -363,14 +372,13 @@ docs/MATHVM.md                          WAMR sandbox/provider architecture
 Immediate order:
 
 ```text
-1. compile/run v0id-mathvm-tests
-2. fix every sandbox rejection failure until fail-closed behavior is confirmed
-3. regression-run V0.4.1 series -> morph -> BinFHE -> remote -> 14
-4. add persistent evaluator session/evaluation-key caching
-5. define and transmit RemoteMathProgram
-6. add authenticated MathVM/provider capability negotiation + downgrade protection
-7. integrate a real standardized PQ provider
-8. only then experiment with generated-relation / series-first key-exchange research
+1. compile/run the external no-WASI MathVM guest and confirm result 1596
+2. regression-run V0.4.1 series -> morph -> BinFHE -> remote -> 14
+3. add persistent evaluator session/evaluation-key caching
+4. define and transmit RemoteMathProgram
+5. add authenticated MathVM/provider capability negotiation + downgrade protection
+6. integrate a real standardized PQ provider
+7. only then experiment with generated-relation / series-first key-exchange research
 ```
 
 Parallel later work includes distributed encrypted tape, trace classification, stronger polymorphism, encrypted halt/no-op semantics, checkpoint/resume and real hidden-integrity machinery.

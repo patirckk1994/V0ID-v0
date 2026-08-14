@@ -45,6 +45,12 @@ ModuleDescriptor describe_module(ModuleKind kind,
                                  std::uint64_t module_version,
                                  const std::vector<std::uint8_t>& bytes);
 
+// Canonical, order-independent commitment to the exact shared module set
+// expected by a session/job. Duplicate (kind,id,version) identities fail closed.
+// Feed this digest into SeriesFirstStackContext::shared_modules_binding.
+ModuleDigest512 shared_module_set_digest512(
+    const std::vector<ModuleDescriptor>& descriptors);
+
 // Canonical content-addressed transport representation. Private-local modules
 // fail closed here and cannot accidentally be serialized onto the network.
 std::vector<std::uint8_t> encode_shared_module_bundle(const ModuleBundle& bundle);

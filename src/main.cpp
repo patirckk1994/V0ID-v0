@@ -1,5 +1,6 @@
 #include "program.hpp"
 #include "program_morpher.hpp"
+#include "toy_fingerprint.hpp"
 
 #include "binfhecontext.h"
 #include <openssl/evp.h>
@@ -16,6 +17,7 @@
 
 using namespace lbcrypto;
 using v0id::core::Program;
+using v0id::integrity::EncryptedDigest32;
 using v0id::polymorph::MorphedProgram;
 using v0id::polymorph::ProgramMorpher;
 
@@ -64,6 +66,25 @@ public:
         if (state >= states_ || (read != 0 && read != 1))
             throw std::runtime_error("encrypted transition index out of range");
         return table_.at(state * 2 + static_cast<std::size_t>(read));
+    }
+
+    // Same canonical semantic layout as integrity::canonical_program_bits().
+    // This lets the toy self-fingerprint consume the encrypted program itself.
+    std::vector<LWECiphertext> canonical_bits() const {
+        std::vector<LWECiphertext> bits;
+        bits.reserve(states_ * 2 * (states_ + 4));
+
+        for (std::size_t q = 0; q < states_; ++q) {
+            for (int read = 0; read <= 1; ++read) {
+                const auto& t = transition(q, read);
+                bits.insert(bits.end(), t.next_state.begin(), t.next_state.end());
+                bits.push_back(t.write_one);
+                bits.push_back(t.move_left);
+                bits.push_back(t.move_stay);
+                bits.push_back(t.move_right);
+            }
+        }
+        return bits;
     }
 
 private:
@@ -272,16 +293,16 @@ static void print_msb_first(const std::vector<int>& bits) {
 
 static void print_state_map(const std::string& name, const MorphedProgram& morph) {
     std::cout << name << " state map    : ";
-    for (std::size_t q = 0; q < morph.base_to_morphed.size(); ++q) {
+    for (std::size_t q = 0; q < morph.manifest.base_to_morphed.size(); ++q) {
         if (q) std::cout << ", ";
-        std::cout << q << "->" << morph.base_to_morphed[q];
+        std::cout << q << "->" << morph.manifest.base_to_morphed[q];
     }
     std::cout << " | dummy=";
-    for (std::size_t i = 0; i < morph.dummy_states.size(); ++i) {
+    for (std::size_t i = 0; i < morph.manifest.dummy_states.size(); ++i) {
         if (i) std::cout << ',';
-        std::cout << morph.dummy_states[i];
+        std::cout << morph.manifest.dummy_states[i];
     }
-    std::cout << '\n';
+    std::cout << " | client integrity slot=" << morph.manifest.integrity_output_slot << '\n';
 }
 
 static std::vector<int> run_plaintext(const Program& program,
@@ -327,7 +348,28 @@ static void run_fhe_case(BinFHEContext& cc,
                          const std::vector<int>& input,
                          const std::vector<int>& expected,
                          std::size_t fixed_steps) {
+    const auto expected_digest = v0id::integrity::toy_fingerprint32_plain(
+        morph.program, input, morph.manifest.integrity_nonce);
+
     auto encrypted_program = EncryptedProgram::encrypt(cc, sk, morph.program);
+    const auto encrypted_program_bits = encrypted_program.canonical_bits();
+    const auto encrypted_input = v0id::integrity::encrypt_plain_bits(cc, sk, input);
+    const auto encrypted_nonce = v0id::integrity::encrypt_u32_bits(
+        cc, sk, morph.manifest.integrity_nonce);
+
+    const auto digest = v0id::integrity::toy_fingerprint32_fhe(
+        cc, encrypted_program_bits, encrypted_input, encrypted_nonce);
+
+    std::vector<EncryptedDigest32> candidate_bank;
+    candidate_bank.reserve(morph.manifest.integrity_output_masks.size());
+    for (const auto mask : morph.manifest.integrity_output_masks) {
+        const auto encrypted_mask = v0id::integrity::encrypt_u32_bits(cc, sk, mask);
+        candidate_bank.push_back(v0id::integrity::mask_digest_fhe(
+            cc, digest, encrypted_mask));
+    }
+
+    if (morph.manifest.integrity_output_slot >= candidate_bank.size())
+        throw std::runtime_error("client integrity slot outside candidate bank");
 
     EncryptedMachine machine(cc, sk, std::move(encrypted_program), input,
                              morph.initial_state, 0, remap_key, 1);
@@ -339,11 +381,24 @@ static void run_fhe_case(BinFHEContext& cc,
 
     if (output != expected)
         throw std::runtime_error(name + " encrypted morph result mismatch");
+
+    const auto slot = morph.manifest.integrity_output_slot;
+    const auto masked_digest = v0id::integrity::decrypt_u32_bits(
+        cc, sk, candidate_bank[slot]);
+    const auto recovered_digest =
+        masked_digest ^ morph.manifest.integrity_output_masks[slot];
+
+    std::cout << name << " self-check  : 0x" << std::hex << recovered_digest
+              << std::dec << " (client slot " << slot << ")\n";
+
+    if (recovered_digest != expected_digest)
+        throw std::runtime_error(name + " encrypted self-fingerprint mismatch");
 }
 
 int main() try {
     constexpr std::size_t FIXED_STEPS = 4;
     constexpr std::size_t PUBLIC_STATES = 4;
+    constexpr std::size_t INTEGRITY_SLOTS = 4;
 
     // State 0 = carry/borrow; state 1 = halted self-loop.
     Program increment{2, {
@@ -369,28 +424,34 @@ int main() try {
         throw std::runtime_error("base plaintext reference program mismatch");
 
     auto inc_a = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
-                                       ProgramMorpher::random_seed());
+                                       ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
     auto inc_b = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
-                                       ProgramMorpher::random_seed());
+                                       ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
 
-    // Avoid an uninteresting demo collision where two random seeds happen to
-    // place the semantic states at the same public IDs.
+    // For the demo, insist that both the semantic state placement and private
+    // integrity return slot differ. Production only needs fresh strong seeds.
     for (int retry = 0;
-         retry < 32 && inc_b.base_to_morphed == inc_a.base_to_morphed;
+         retry < 32 &&
+         (inc_b.manifest.base_to_morphed == inc_a.manifest.base_to_morphed ||
+          inc_b.manifest.integrity_output_slot == inc_a.manifest.integrity_output_slot);
          ++retry) {
         inc_b = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
-                                      ProgramMorpher::random_seed());
+                                      ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
     }
-    if (inc_b.base_to_morphed == inc_a.base_to_morphed)
+    if (inc_b.manifest.base_to_morphed == inc_a.manifest.base_to_morphed ||
+        inc_b.manifest.integrity_output_slot == inc_a.manifest.integrity_output_slot)
         throw std::runtime_error("failed to generate visibly distinct increment morphs");
 
     auto dec_a = ProgramMorpher::morph(decrement, 0, PUBLIC_STATES,
-                                       ProgramMorpher::random_seed());
+                                       ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
 
     if (inc_a.program.states != PUBLIC_STATES ||
         inc_b.program.states != PUBLIC_STATES ||
-        dec_a.program.states != PUBLIC_STATES)
-        throw std::runtime_error("morph leaked variable public state count");
+        dec_a.program.states != PUBLIC_STATES ||
+        inc_a.manifest.integrity_output_masks.size() != INTEGRITY_SLOTS ||
+        inc_b.manifest.integrity_output_masks.size() != INTEGRITY_SLOTS ||
+        dec_a.manifest.integrity_output_masks.size() != INTEGRITY_SLOTS)
+        throw std::runtime_error("morph leaked variable public shape");
 
     require_plain_equivalent("increment morph A", inc_a, input, expected_inc, FIXED_STEPS);
     require_plain_equivalent("increment morph B", inc_b, input, expected_inc, FIXED_STEPS);
@@ -399,7 +460,8 @@ int main() try {
     std::cout << "input               : ";
     print_msb_first(input);
     std::cout << "public state count  : " << PUBLIC_STATES << '\n'
-              << "fixed round budget  : " << FIXED_STEPS << '\n';
+              << "fixed round budget  : " << FIXED_STEPS << '\n'
+              << "integrity bank slots: " << INTEGRITY_SLOTS << '\n';
     print_state_map("increment morph A", inc_a);
     print_state_map("increment morph B", inc_b);
     print_state_map("decrement morph A", dec_a);
@@ -425,6 +487,9 @@ int main() try {
     std::cout << "OK: precomputed polymorphism preserves semantics\n"
                  "    + KMAC-derived secret state-label permutation\n"
                  "    + fixed-size dummy-state padding\n"
+                 "    + client-only morph manifest\n"
+                 "    + encrypted toy self-fingerprint over morphed program + input\n"
+                 "    + private masked integrity candidate bank\n"
                  "    + identical public evaluator dimensions across morphs\n"
                  "    + exact encrypted state/tape semantics\n"
                  "    + ciphertext-only epoch remap\n";

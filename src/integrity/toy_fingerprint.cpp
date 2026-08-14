@@ -10,8 +10,6 @@
 namespace v0id::integrity {
 namespace {
 
-constexpr std::uint32_t INITIAL_STATE = 0x56304944u; // "V0ID"
-
 std::vector<int> append_nonce_bits(std::vector<int> bits, std::uint32_t nonce) {
     for (std::size_t i = 0; i < 32; ++i)
         bits.push_back(static_cast<int>((nonce >> i) & 1u));
@@ -24,7 +22,7 @@ std::uint32_t mix_plain(const std::vector<int>& source_bits) {
 
     std::array<int, 32> state{};
     for (std::size_t i = 0; i < state.size(); ++i)
-        state[i] = static_cast<int>((INITIAL_STATE >> i) & 1u);
+        state[i] = static_cast<int>((TOY_FINGERPRINT_INITIAL_STATE >> i) & 1u);
 
     for (std::size_t i = 0; i < source_bits.size(); ++i) {
         const int x = source_bits[i] & 1;
@@ -115,7 +113,8 @@ EncryptedDigest32 toy_fingerprint32_fhe(
     lbcrypto::BinFHEContext& cc,
     const std::vector<lbcrypto::LWECiphertext>& encrypted_program_bits,
     const std::vector<lbcrypto::LWECiphertext>& encrypted_initial_tape,
-    const EncryptedDigest32& encrypted_nonce_bits) {
+    const EncryptedDigest32& encrypted_nonce_bits,
+    const EncryptedDigest32& encrypted_initial_state_bits) {
 
     std::vector<lbcrypto::LWECiphertext> source;
     source.reserve(encrypted_program_bits.size() + encrypted_initial_tape.size() +
@@ -127,12 +126,11 @@ EncryptedDigest32 toy_fingerprint32_fhe(
     if (source.empty())
         throw std::runtime_error("toy encrypted fingerprint needs source ciphertexts");
 
-    auto zero = cc.EvalBinGate(lbcrypto::XOR, source.front(), source.front());
-    auto one = cc.EvalNOT(zero);
-
-    EncryptedDigest32 state{};
-    for (std::size_t i = 0; i < state.size(); ++i)
-        state[i] = ((INITIAL_STATE >> i) & 1u) ? one : zero;
+    // Each element was independently encrypted by the client. Do not synthesize
+    // constants with EvalBinGate(ct, ct): BinFHE explicitly rejects identical
+    // ciphertext operands, and aliasing a single zero/one object across state
+    // positions could trigger the same check later in the mixing network.
+    EncryptedDigest32 state = encrypted_initial_state_bits;
 
     for (std::size_t i = 0; i < source.size(); ++i) {
         const std::size_t j = (i * 13 + 5) & 31u;

@@ -1,7 +1,7 @@
 #include "peer_transport.hpp"
 
+#include <algorithm>
 #include <array>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
 

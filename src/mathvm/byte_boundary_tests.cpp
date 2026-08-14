@@ -76,8 +76,8 @@ Bytes make_byte_call_module(std::uint32_t input_offset,
     append_uleb(types, 2);
     append_function_type(types,
                          {0x7e, 0x7e, 0x7f, 0x7f, 0x7f, 0x7f},
-                         {0x7f}); // primitive_bytes -> i32 output length
-    append_function_type(types, {}, {0x7e}); // v0id_main -> i64
+                         {0x7f});
+    append_function_type(types, {}, {0x7e});
     append_section(module, 1, types);
 
     Bytes imports;
@@ -93,12 +93,9 @@ Bytes make_byte_call_module(std::uint32_t input_offset,
     append_uleb(functions, 1);
     append_section(module, 3, functions);
 
-    // Exactly one 64 KiB page. Boundary tests deliberately supply ranges that
-    // cross this boundary. V0ID's native host boundary must reject the complete
-    // pointer+length range before any copy/provider call occurs.
     Bytes memories;
     append_uleb(memories, 1);
-    memories.push_back(0x01); // explicit min + max
+    memories.push_back(0x01);
     append_uleb(memories, 1);
     append_uleb(memories, 1);
     append_section(module, 5, memories);
@@ -107,26 +104,26 @@ Bytes make_byte_call_module(std::uint32_t input_offset,
     append_uleb(exports, 1);
     append_name(exports, "v0id_main");
     exports.push_back(0x00);
-    append_uleb(exports, 1); // imported primitive is function index 0
+    append_uleb(exports, 1);
     append_section(module, 7, exports);
 
     Bytes body;
-    append_uleb(body, 0); // no locals
-    body.push_back(0x42); // i64.const tag
-    append_sleb_i64(body, static_cast<std::int64_t>(PRIMITIVE_SHA3_256_BYTES));
-    body.push_back(0x42); // i64.const version
-    append_sleb_i64(body, 1);
-    body.push_back(0x41); // i32.const input offset
-    append_sleb_i64(body, input_offset);
-    body.push_back(0x41); // i32.const input length
-    append_sleb_i64(body, input_length);
-    body.push_back(0x41); // i32.const output offset
-    append_sleb_i64(body, output_offset);
-    body.push_back(0x41); // i32.const output capacity
-    append_sleb_i64(body, output_capacity);
-    body.push_back(0x10); // call primitive_bytes
     append_uleb(body, 0);
-    body.push_back(0xad); // i64.extend_i32_u
+    body.push_back(0x42);
+    append_sleb_i64(body, static_cast<std::int64_t>(PRIMITIVE_SHA3_256_BYTES));
+    body.push_back(0x42);
+    append_sleb_i64(body, 1);
+    body.push_back(0x41);
+    append_sleb_i64(body, input_offset);
+    body.push_back(0x41);
+    append_sleb_i64(body, input_length);
+    body.push_back(0x41);
+    append_sleb_i64(body, output_offset);
+    body.push_back(0x41);
+    append_sleb_i64(body, output_capacity);
+    body.push_back(0x10);
+    append_uleb(body, 0);
+    body.push_back(0xad);
     body.push_back(0x0b);
 
     Bytes code;
@@ -138,8 +135,8 @@ Bytes make_byte_call_module(std::uint32_t input_offset,
     if (!initial_data.empty()) {
         Bytes data;
         append_uleb(data, 1);
-        append_uleb(data, 0); // active segment, memory 0
-        data.push_back(0x41);  // i32.const 0
+        append_uleb(data, 0);
+        data.push_back(0x41);
         append_sleb_i64(data, 0);
         data.push_back(0x0b);
         append_uleb(data, initial_data.size());
@@ -203,7 +200,7 @@ int main() try {
     limits.max_module_bytes = 64 * 1024;
     limits.max_memory_pages = 1;
     limits.stack_bytes = 64 * 1024;
-    limits.host_managed_heap_bytes = 64 * 1024;
+    limits.host_managed_heap_bytes = 0;
     limits.runtime_pool_bytes = 16 * 1024 * 1024;
     limits.max_wasm_instructions = 10'000;
     limits.max_provider_calls = 4;
@@ -214,16 +211,12 @@ int main() try {
     WamrMathSandbox sandbox(limits);
 
     tests.expect_throw("OOB Wasm byte-provider input range rejected", [&] {
-        // 65535 is the final byte of a one-page memory. A two-byte range crosses
-        // the 65536-byte boundary and must never reach the native provider.
         auto program = program_from(make_byte_call_module(
             65535, 2, 64, 32, Bytes{}));
         (void)sandbox.execute(program, registry);
     });
 
     tests.expect_throw("OOB Wasm byte-provider output range rejected", [&] {
-        // SHA3 wants to write 32 bytes. Starting at the final byte of memory must
-        // be rejected before provider execution/memcpy.
         auto program = program_from(make_byte_call_module(
             0, 3, 65535, 32, Bytes{'a', 'b', 'c'}));
         (void)sandbox.execute(program, registry);

@@ -6,12 +6,14 @@
 #include "program_morpher.hpp"
 #include "series_generator.hpp"
 #include "toy_fingerprint.hpp"
+#include "quine_hash.hpp"
 
 #ifdef V0ID_HAVE_WASM_POLYMORPH
 #include "wasm_series_generator.hpp"
 #endif
 
 #include "binfhecontext.h"
+#include <openssl/rand.h>
 
 #include <algorithm>
 #include <array>
@@ -77,10 +79,10 @@ void usage(const char* argv0) {
         << "  " << argv0 << " client <peer-id> <connect-endpoint> --series-wasm <file.wasm>\n\n"
         << "The client installs expensive BinFHE evaluator material once, then\n"
         << "sends an RMJ3 encrypted-machine job that references that cached session.\n"
-        << "KMAC is the default local series generator. When built with WAMR,\n"
-        << "--series-wasm runs a zero-import polymorphism module locally before\n"
-        << "ProgramMorpher. The Wasm, private series, series seed, MorphManifest\n"
-        << "and LWE secret key never leave the client.\n";
+        << "KMACXOF256 is the default private series-first generator. When built\n"
+        << "with WAMR, --series-wasm runs a zero-import polymorphism module locally\n"
+        << "before ProgramMorpher. The Wasm, private series/root, quine commitment,\n"
+        << "MorphManifest and LWE secret key never leave the client.\n";
 }
 
 std::vector<std::uint8_t> read_binary_file(const std::string& path) {
@@ -93,21 +95,20 @@ std::vector<std::uint8_t> read_binary_file(const std::string& path) {
 }
 
 std::unique_ptr<PolymorphicSeriesGenerator> make_series_generator(
-    const std::string& wasm_path) {
-    if (wasm_path.empty())
+    const std::vector<std::uint8_t>& wasm_bytes) {
+    if (wasm_bytes.empty())
         return std::make_unique<KmacSeriesGenerator>(64);
 
 #ifdef V0ID_HAVE_WASM_POLYMORPH
-    auto wasm = read_binary_file(wasm_path);
     SeriesProfile profile{
         "v0id-local-wasm-v1",
         1,
         {},
     };
     return std::make_unique<v0id::polymorph::WasmSeriesGenerator>(
-        std::move(wasm), std::move(profile));
+        wasm_bytes, std::move(profile));
 #else
-    (void)wasm_path;
+    (void)wasm_bytes;
     throw std::runtime_error(
         "--series-wasm requires a build with V0ID_ENABLE_MATHVM=ON");
 #endif
@@ -125,9 +126,9 @@ PublicMachineShape demo_shape() {
 CryptoProfileId demo_profile(const SeriesProfile& series) {
     return CryptoProfileId{
         "openfhe-binfhe",
-        "STD128",
+        "STD128Q",
         "v0id-remote-machine-v3",
-        "toy-fingerprint32-v1",
+        "toy-fingerprint32-v1+quine-sha3-512-client-v1",
         series.generator_id,
         series.version,
     };
@@ -136,23 +137,24 @@ CryptoProfileId demo_profile(const SeriesProfile& series) {
 void require_supported_execution_profile(const CryptoProfileId& profile) {
     if (profile.primitive_id != "openfhe-binfhe")
         throw std::runtime_error("unsupported FHE primitive profile");
-    if (profile.parameter_set != "STD128")
-        throw std::runtime_error("unsupported BinFHE parameter profile");
+    if (profile.parameter_set != "STD128Q")
+        throw std::runtime_error("unsupported BinFHE quantum-security parameter profile");
     if (profile.machine_protocol != "v0id-remote-machine-v3")
         throw std::runtime_error("unsupported remote machine protocol profile");
-    if (profile.integrity_profile != "toy-fingerprint32-v1")
+    if (profile.integrity_profile !=
+        "toy-fingerprint32-v1+quine-sha3-512-client-v1")
         throw std::runtime_error("unsupported integrity profile");
 
     // The series itself is a client-side morph input, so the evaluator does not
     // need its implementation. Its bounded id/version is retained as public
-    // provenance for future capability negotiation and correlation experiments.
+    // provenance. The private quine additionally commits to exact plugin bytes.
 }
 
 void require_supported_session_profile(const EvaluatorSessionBundle& session) {
     if (session.primitive_id != "openfhe-binfhe")
         throw std::runtime_error("unsupported evaluator-session FHE primitive");
-    if (session.parameter_set != "STD128")
-        throw std::runtime_error("unsupported evaluator-session parameter set");
+    if (session.parameter_set != "STD128Q")
+        throw std::runtime_error("unsupported evaluator-session quantum parameter set");
 }
 
 bool same_shape(const PublicMachineShape& a, const PublicMachineShape& b) {
@@ -163,9 +165,14 @@ bool same_shape(const PublicMachineShape& a, const PublicMachineShape& b) {
 }
 
 EvaluatorSessionId random_evaluator_session_id() {
-    const auto entropy = v0id::polymorph::random_series_seed();
+    // Session ids are public routing/cache state. Deliberately use the public
+    // OpenSSL CSPRNG rather than exposing bytes from the private series-root DRBG.
     EvaluatorSessionId id{};
-    std::copy(entropy.begin(), entropy.end(), id.begin());
+    do {
+        if (RAND_bytes(id.data(), static_cast<int>(id.size())) != 1)
+            throw std::runtime_error("RAND_bytes failed while generating evaluator session id");
+    } while (std::all_of(id.begin(), id.end(),
+                         [](std::uint8_t b) { return b == 0; }));
     return id;
 }
 
@@ -370,7 +377,8 @@ int run_server(const std::string& peer_id,
                 std::cout << "cached evaluator keys: YES\n"
                           << "polymorph Wasm recv  : NO\n"
                           << "private series recv  : NO\n"
-                          << "series seed received : NO\n"
+                          << "series root received : NO\n"
+                          << "quine digest received: NO\n"
                           << "manifest received    : NO\n"
                           << "secret key received  : NO\n";
 
@@ -383,8 +391,8 @@ int run_server(const std::string& peer_id,
                 auto head_bits = deserialize_ciphertexts(bundle.head_bits);
                 auto tape_bits = deserialize_ciphertexts(bundle.tape_bits);
 
-                // Preserve the received initial tape for the job-image fingerprint;
-                // the machine evaluator replaces its own tape vector as it executes.
+                // Preserve the received initial tape for the legacy test-only
+                // FHE fingerprint; the machine replaces its own tape as it runs.
                 const auto fingerprint_input = tape_bits;
                 const auto nonce_bits = deserialize_digest(bundle.nonce_bits);
                 const auto fingerprint_initial_state =
@@ -395,7 +403,7 @@ int run_server(const std::string& peer_id,
                 for (const auto& mask : bundle.integrity_mask_bits)
                     mask_bits.push_back(deserialize_digest(mask));
 
-                std::cout << "computing encrypted self-fingerprint...\n";
+                std::cout << "computing legacy encrypted self-fingerprint...\n";
                 const auto digest = v0id::integrity::toy_fingerprint32_fhe(
                     cc, program_bits, fingerprint_input, nonce_bits,
                     fingerprint_initial_state);
@@ -469,7 +477,14 @@ int run_client(const std::string& peer_id,
     for (const int bit : input)
         series_input.push_back(static_cast<std::uint8_t>(bit & 1));
 
-    auto series_generator = make_series_generator(wasm_path);
+    std::vector<std::uint8_t> wasm_bytes;
+    if (!wasm_path.empty()) {
+        wasm_bytes = read_binary_file(wasm_path);
+        if (wasm_bytes.empty())
+            throw std::runtime_error("local polymorphism Wasm file is empty");
+    }
+
+    auto series_generator = make_series_generator(wasm_bytes);
     const auto series_profile = series_generator->profile();
     const auto series_seed = v0id::polymorph::random_series_seed();
     const auto derived_series =
@@ -486,7 +501,7 @@ int run_client(const std::string& peer_id,
     std::cout << "series generator     : " << series_profile.generator_id
               << "/v" << series_profile.version << '\n'
               << "series source        : "
-              << (wasm_path.empty() ? "built-in KMAC" : "local Wasm") << '\n';
+              << (wasm_path.empty() ? "OpenSSL KMACXOF256" : "local Wasm") << '\n';
     if (!wasm_path.empty())
         std::cout << "local Wasm file      : " << wasm_path << '\n';
     std::cout << "private series bytes : " << derived_series.series.size() << '\n'
@@ -500,18 +515,20 @@ int run_client(const std::string& peer_id,
         morph.program, input, morph.manifest.integrity_nonce);
 
     BinFHEContext cc;
-    cc.GenerateBinFHEContext(STD128);
+    cc.GenerateBinFHEContext(STD128Q);
     auto sk = cc.KeyGen();
-    std::cout << "generating OpenFHE bootstrapping keys...\n" << std::flush;
+    std::cout << "BinFHE parameter set : STD128Q\n"
+              << "generating OpenFHE bootstrapping keys...\n" << std::flush;
     cc.BTKeyGen(sk);
 
-    // V0.4.3 installs the expensive evaluator material once. The session id is
-    // fresh public routing state and is deliberately independent of SeriesSeed.
+    // Evaluator cache routing state is public and independent of the issuer-only
+    // series root. The root therefore does not become predictable merely because
+    // the evaluator participates in this session.
     const auto evaluator_session_id = random_evaluator_session_id();
     EvaluatorSessionBundle setup;
     setup.session_id = evaluator_session_id;
     setup.primitive_id = "openfhe-binfhe";
-    setup.parameter_set = "STD128";
+    setup.parameter_set = "STD128Q";
     setup.context = v0id::fhe::serialize_binary(cc);
     setup.refresh_key = v0id::fhe::serialize_binary(cc.GetRefreshKey());
     setup.switching_key = v0id::fhe::serialize_binary(cc.GetSwitchKey());
@@ -519,7 +536,7 @@ int run_client(const std::string& peer_id,
     Envelope setup_request;
     setup_request.type = MessageType::install_evaluator_session;
     setup_request.peer_id = peer_id;
-    setup_request.job_id = "v0id-v043-evaluator-session";
+    setup_request.job_id = "v0id-v046-pq-evaluator-session";
     setup_request.epoch = DEMO_EPOCH;
     setup_request.payload = v0id::fhe::pack_evaluator_session_bundle(setup);
 
@@ -535,6 +552,38 @@ int run_client(const std::string& peer_id,
     const auto setup_reply = client.round_trip(setup_request);
     require_session_ready_reply(setup_reply, evaluator_session_id);
     std::cout << "evaluator session    : READY / cached remotely\n";
+
+    const std::string request_job_id = wasm_path.empty()
+        ? "v0id-v046-pq-series-first-remote-increment"
+        : "v0id-v046-pq-wasm-morphed-rmj3-remote-increment";
+
+    // Client-private quine commitment. It binds the issuer's semantic program,
+    // exact local generator implementation, selected public crypto profile,
+    // session/job/epoch, private challenge and morphed executable image. It is
+    // intentionally NOT advertised as a proof that the evaluator executed every
+    // round; that requires an FHE/verifiable-computation mechanism still open.
+    auto quine_context = v0id::integrity::QuineHashContext{};
+    quine_context.shape = demo_shape();
+    quine_context.profile = demo_profile(series_profile);
+    quine_context.session_id = evaluator_session_id;
+    quine_context.job_id = request_job_id;
+    quine_context.epoch = DEMO_EPOCH;
+    quine_context.initial_state = morph.initial_state;
+    quine_context.initial_head = 0;
+    quine_context.initial_tape = input;
+    quine_context.semantic_binding = v0id::integrity::semantic_job_hash512(
+        increment, 0, 0, input, FIXED_ROUNDS);
+    quine_context.generator_binding = v0id::integrity::generator_binding512(
+        series_profile, wasm_bytes);
+    const auto audit_challenge = v0id::integrity::derive_audit_challenge256(
+        series_seed, evaluator_session_id, request_job_id, DEMO_EPOCH);
+    const auto quine_digest = v0id::integrity::quine_hash512(
+        morph.program, quine_context, audit_challenge);
+
+    std::cout << "client quine SHA3-512: "
+              << v0id::integrity::hex_digest(quine_digest) << '\n'
+              << "quine commitment sent: NO (issuer-private in current protocol)\n"
+              << "audit challenge sent  : NO\n";
 
     const auto plain_program_bits = v0id::integrity::canonical_program_bits(morph.program);
     const auto encrypted_program_bits =
@@ -582,9 +631,7 @@ int run_client(const std::string& peer_id,
     Envelope request;
     request.type = MessageType::execute_job;
     request.peer_id = peer_id;
-    request.job_id = wasm_path.empty()
-        ? "v0id-v043-cached-series-first-remote-increment"
-        : "v0id-v045-wasm-morphed-rmj3-remote-increment";
+    request.job_id = request_job_id;
     request.epoch = DEMO_EPOCH;
     request.payload = v0id::fhe::pack_remote_machine_bundle(bundle);
 
@@ -592,7 +639,8 @@ int run_client(const std::string& peer_id,
               << "cached setup resent  : NO\n"
               << "sending polymorph Wasm: NO\n"
               << "sending private series: NO\n"
-              << "sending series seed  : NO\n"
+              << "sending series root  : NO\n"
+              << "sending quine digest : NO\n"
               << "sending MorphManifest: NO\n"
               << "sending secret key   : NO\n"
               << "waiting for remote fixed-path evaluation...\n" << std::flush;
@@ -628,23 +676,35 @@ int run_client(const std::string& peer_id,
     const auto recovered_digest =
         masked_digest ^ morph.manifest.integrity_output_masks[slot];
 
-    std::cout << "remote self-check    : 0x" << std::hex << recovered_digest
+    std::cout << "legacy remote check  : 0x" << std::hex << recovered_digest
               << std::dec << " (private client slot " << slot << ")\n";
     if (recovered_digest != expected_digest)
         throw std::runtime_error("remote encrypted self-fingerprint mismatch");
 
-    std::cout << "OK: cached series-derived morphed encrypted machine executed remotely\n"
+    // Recompute the issuer-private commitment after the remote round trip. This
+    // detects accidental local mutation/substitution of any committed job layer;
+    // it is not presented as evidence that the peer evaluated SHA3 under FHE.
+    const auto quine_after = v0id::integrity::quine_hash512(
+        morph.program, quine_context, audit_challenge);
+    if (quine_after != quine_digest)
+        throw std::runtime_error("client quine commitment changed across remote job");
+
+    std::cout << "client quine recheck : MATCH\n"
+              << "OK: PQ-profile series-derived morphed encrypted machine executed remotely\n"
+                 "    + OpenFHE STD128Q selected for the remote BinFHE profile\n"
+                 "    + private series root generated from OpenSSL private DRBG\n"
+                 "    + public evaluator session id generated from public DRBG\n"
+                 "    + KMACXOF/guest series derived before trusted ProgramMorpher\n"
+                 "    + SHA3-512 quine binds semantic job + exact generator + morph + profile\n"
+                 "    + quine/audit challenge remain issuer-private\n"
                  "    + expensive BinFHE evaluator material installed once\n"
                  "    + RMJ3 job references process-local evaluator session\n"
-                 "    + selected local series generator derived before ProgramMorpher\n"
                  "    + public crypto/profile identifiers round-tripped\n"
                  "    + encrypted program/state/head/tape crossed the network\n"
                  "    + fixed public round budget executed by server\n"
-                 "    + all integrity candidates returned\n"
-                 "    + polymorphism Wasm/private series/seed remained client-side\n"
-                 "    + MorphManifest remained client-side\n"
-                 "    + secret key remained client-side\n"
-                 "    + client decrypted 00001110 and verified private self-check\n";
+                 "    + legacy toy FHE self-check still passes as plumbing\n"
+                 "    + NO CLAIM yet that SHA3 quine proves honest execution\n"
+                 "    + client decrypted 00001110\n";
     return 0;
 }
 
@@ -674,7 +734,7 @@ int main(int argc, char** argv) try {
     if (mode == "client") {
         std::string wasm_path;
         if (argc == 4) {
-            // Built-in KMAC remains the default.
+            // Built-in KMACXOF256 remains the default.
         }
         else if (argc == 6 && std::string(argv[4]) == "--series" &&
                  std::string(argv[5]) == "kmac") {

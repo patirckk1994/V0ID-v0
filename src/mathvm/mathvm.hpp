@@ -138,7 +138,14 @@ struct SandboxLimits {
     std::size_t max_module_bytes{1024 * 1024};
     std::uint32_t max_memory_pages{16};            // 16 * 64 KiB = 1 MiB
     std::uint32_t stack_bytes{64 * 1024};
-    std::uint32_t host_managed_heap_bytes{64 * 1024};
+
+    // Keep the WAMR host-managed app heap disabled. WAMR inserts that heap into
+    // the module's linear-memory allocation and can therefore enlarge the actual
+    // addressable memory beyond the module-declared page count. V0ID's MathVM
+    // uses bounded static/linear-memory buffers instead so max_memory_pages is a
+    // meaningful hard ceiling for this profile.
+    std::uint32_t host_managed_heap_bytes{0};
+
     std::size_t runtime_pool_bytes{16 * 1024 * 1024};
     int max_wasm_instructions{1'000'000};
     std::uint64_t max_provider_calls{4096};

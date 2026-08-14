@@ -73,6 +73,17 @@ int main() try {
             received_bundle.bytes == bytes,
             "shared module survives V0IDNET1 MODULE_BLOB transport framing");
 
+    auto second_bytes = bytes;
+    second_bytes.push_back(0x42);
+    const auto second_desc = v0id::net::describe_module(
+        v0id::net::ModuleKind::mathvm_wasm,
+        v0id::net::ModuleVisibility::shared_sync,
+        "v0id.mathvm.shared.example", 3, second_bytes);
+    const auto set_ab = v0id::net::shared_module_set_digest512({desc, second_desc});
+    const auto set_ba = v0id::net::shared_module_set_digest512({second_desc, desc});
+    r.check(set_ab == set_ba,
+            "shared module-set binding is canonical and order-independent");
+
     auto changed_bytes = bytes;
     changed_bytes.back() ^= 1u;
     const auto changed_desc = v0id::net::describe_module(
@@ -81,6 +92,17 @@ int main() try {
         "v0id.stack.strategy.example", 1, changed_bytes);
     r.check(changed_desc.digest != desc.digest,
             "one-byte module substitution changes content identity");
+    r.check(v0id::net::shared_module_set_digest512({changed_desc, second_desc}) != set_ab,
+            "one-byte module substitution changes shared module-set binding");
+
+    bool duplicate_identity_rejected = false;
+    try {
+        (void)v0id::net::shared_module_set_digest512({desc, changed_desc});
+    } catch (const std::runtime_error&) {
+        duplicate_identity_rejected = true;
+    }
+    r.check(duplicate_identity_rejected,
+            "duplicate shared module kind/id/version fails closed");
 
     auto tampered_wire = wire;
     tampered_wire.back() ^= 1u;
@@ -108,6 +130,15 @@ int main() try {
     r.check(private_rejected,
             "private-local polymorphism module cannot be serialized for sync");
 
+    bool private_set_rejected = false;
+    try {
+        (void)v0id::net::shared_module_set_digest512({private_desc});
+    } catch (const std::runtime_error&) {
+        private_set_rejected = true;
+    }
+    r.check(private_set_rejected,
+            "private-local module cannot enter shared module-set binding");
+
     auto wrong_size = bundle;
     ++wrong_size.descriptor.byte_size;
     bool wrong_size_rejected = false;
@@ -133,7 +164,8 @@ int main() try {
     std::cout << "\nV0ID module sync tests: "
               << r.passed << " passed, " << r.failed << " failed\n"
               << "NOTE: synchronization verifies module identity/visibility only; "
-                 "WAMR/MathVM must still sandbox and validate executable modules.\n";
+                 "the expected module-set digest must be bound by the application/session, "
+                 "and WAMR/MathVM must still sandbox executable modules.\n";
     return r.failed == 0 ? 0 : 1;
 } catch (const std::exception& e) {
     std::cerr << "V0ID module sync test fatal error: " << e.what() << '\n';

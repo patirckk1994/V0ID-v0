@@ -1,3 +1,6 @@
+#include "program.hpp"
+#include "program_morpher.hpp"
+
 #include "binfhecontext.h"
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -12,40 +15,9 @@
 #include <vector>
 
 using namespace lbcrypto;
-
-struct Rule {
-    std::size_t state;
-    int read;
-    std::size_t next_state;
-    int write;
-    int move; // -1, 0, +1
-};
-
-struct Program {
-    std::size_t states;
-    std::vector<Rule> rules;
-
-    void validate() const {
-        if (states == 0) throw std::runtime_error("program has no states");
-        std::vector<int> seen(states * 2, 0);
-        for (const auto& r : rules) {
-            if (r.state >= states || r.next_state >= states ||
-                (r.read != 0 && r.read != 1) ||
-                (r.write != 0 && r.write != 1) ||
-                r.move < -1 || r.move > 1)
-                throw std::runtime_error("invalid transition rule");
-            ++seen[r.state * 2 + static_cast<std::size_t>(r.read)];
-        }
-        for (int n : seen)
-            if (n != 1) throw std::runtime_error("need exactly one rule per (state, bit)");
-    }
-
-    const Rule& rule(std::size_t state, int read) const {
-        for (const auto& r : rules)
-            if (r.state == state && r.read == read) return r;
-        throw std::runtime_error("missing transition rule");
-    }
-};
+using v0id::core::Program;
+using v0id::polymorph::MorphedProgram;
+using v0id::polymorph::ProgramMorpher;
 
 // Public shape, encrypted semantics. The evaluator learns the number of states,
 // binary alphabet and fixed work budget, but not next-state/write/move choices.
@@ -194,7 +166,8 @@ public:
     }
 
     // Fixed public evaluator path: there are no C++ branches on encrypted
-    // next-state, write or movement semantics.
+    // next-state, write or movement semantics. Every public padded state is
+    // evaluated every round, including dummy states.
     void step() {
         const std::size_t n = head_.size();
         const std::size_t states = program_.states();
@@ -297,44 +270,81 @@ static void print_msb_first(const std::vector<int>& bits) {
     std::cout << '\n';
 }
 
-static void run_case(BinFHEContext& cc,
-                     const LWEPrivateKey& sk,
-                     const TapeRemapper::Key& remap_key,
-                     const std::string& name,
-                     const Program& plain_program,
-                     const std::vector<int>& input,
-                     const std::vector<int>& expected) {
-    constexpr std::size_t FIXED_STEPS = 4;
+static void print_state_map(const std::string& name, const MorphedProgram& morph) {
+    std::cout << name << " state map    : ";
+    for (std::size_t q = 0; q < morph.base_to_morphed.size(); ++q) {
+        if (q) std::cout << ", ";
+        std::cout << q << "->" << morph.base_to_morphed[q];
+    }
+    std::cout << " | dummy=";
+    for (std::size_t i = 0; i < morph.dummy_states.size(); ++i) {
+        if (i) std::cout << ',';
+        std::cout << morph.dummy_states[i];
+    }
+    std::cout << '\n';
+}
 
-    // Client-side setup: plaintext transition semantics exist only long enough
-    // to build ciphertext selectors. A future network evaluator should receive
-    // only the serialized EncryptedProgram and encrypted machine state.
-    auto encrypted_program = EncryptedProgram::encrypt(cc, sk, plain_program);
+static std::vector<int> run_plaintext(const Program& program,
+                                      std::size_t initial_state,
+                                      const std::vector<int>& input,
+                                      std::size_t steps) {
+    program.validate();
+    if (input.empty() || initial_state >= program.states)
+        throw std::runtime_error("invalid plaintext machine input");
+
+    auto tape = input;
+    std::size_t state = initial_state;
+    std::size_t head = 0;
+
+    for (std::size_t s = 0; s < steps; ++s) {
+        const auto& r = program.rule(state, tape.at(head));
+        tape[head] = r.write;
+        state = r.next_state;
+        if (r.move < 0 && head > 0)
+            --head;
+        else if (r.move > 0 && head + 1 < tape.size())
+            ++head;
+    }
+
+    return tape;
+}
+
+static void require_plain_equivalent(const std::string& name,
+                                     const MorphedProgram& morph,
+                                     const std::vector<int>& input,
+                                     const std::vector<int>& expected,
+                                     std::size_t steps) {
+    const auto output = run_plaintext(morph.program, morph.initial_state, input, steps);
+    if (output != expected)
+        throw std::runtime_error(name + " plaintext morph mismatch");
+}
+
+static void run_fhe_case(BinFHEContext& cc,
+                         const LWEPrivateKey& sk,
+                         const TapeRemapper::Key& remap_key,
+                         const std::string& name,
+                         const MorphedProgram& morph,
+                         const std::vector<int>& input,
+                         const std::vector<int>& expected,
+                         std::size_t fixed_steps) {
+    auto encrypted_program = EncryptedProgram::encrypt(cc, sk, morph.program);
 
     EncryptedMachine machine(cc, sk, std::move(encrypted_program), input,
-                             0, 0, remap_key, 1);
-    machine.run_fixed(FIXED_STEPS, 2);
+                             morph.initial_state, 0, remap_key, 1);
+    machine.run_fixed(fixed_steps, 2);
 
     auto output = machine.decrypt_tape(sk);
-    std::cout << name << " output: ";
+    std::cout << name << " output      : ";
     print_msb_first(output);
 
     if (output != expected)
-        throw std::runtime_error(name + " encrypted-program result mismatch");
+        throw std::runtime_error(name + " encrypted morph result mismatch");
 }
 
 int main() try {
-    BinFHEContext cc;
-    cc.GenerateBinFHEContext(STD128);
-    auto sk = cc.KeyGen();
-    std::cout << "generating OpenFHE bootstrapping keys...\n";
-    cc.BTKeyGen(sk);
+    constexpr std::size_t FIXED_STEPS = 4;
+    constexpr std::size_t PUBLIC_STATES = 4;
 
-    TapeRemapper::Key remap_key{};
-    if (RAND_bytes(remap_key.data(), static_cast<int>(remap_key.size())) != 1)
-        throw std::runtime_error("RAND_bytes failed");
-
-    // Two different runtime programs with the same public shape.
     // State 0 = carry/borrow; state 1 = halted self-loop.
     Program increment{2, {
         {0, 0, 1, 1,  0},
@@ -350,16 +360,72 @@ int main() try {
         {1, 1, 1, 1,  0},
     }};
 
-    std::vector<int> input{1,0,1,1,0,0,0,0}; // 00001101 = 13, LSB first
-    std::cout << "input           : ";
+    const std::vector<int> input{1,0,1,1,0,0,0,0}; // 00001101 = 13, LSB first
+    const std::vector<int> expected_inc{0,1,1,1,0,0,0,0}; // 14
+    const std::vector<int> expected_dec{0,0,1,1,0,0,0,0}; // 12
+
+    if (run_plaintext(increment, 0, input, FIXED_STEPS) != expected_inc ||
+        run_plaintext(decrement, 0, input, FIXED_STEPS) != expected_dec)
+        throw std::runtime_error("base plaintext reference program mismatch");
+
+    auto inc_a = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
+                                       ProgramMorpher::random_seed());
+    auto inc_b = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
+                                       ProgramMorpher::random_seed());
+
+    // Avoid an uninteresting demo collision where two random seeds happen to
+    // place the semantic states at the same public IDs.
+    for (int retry = 0;
+         retry < 32 && inc_b.base_to_morphed == inc_a.base_to_morphed;
+         ++retry) {
+        inc_b = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
+                                      ProgramMorpher::random_seed());
+    }
+    if (inc_b.base_to_morphed == inc_a.base_to_morphed)
+        throw std::runtime_error("failed to generate visibly distinct increment morphs");
+
+    auto dec_a = ProgramMorpher::morph(decrement, 0, PUBLIC_STATES,
+                                       ProgramMorpher::random_seed());
+
+    if (inc_a.program.states != PUBLIC_STATES ||
+        inc_b.program.states != PUBLIC_STATES ||
+        dec_a.program.states != PUBLIC_STATES)
+        throw std::runtime_error("morph leaked variable public state count");
+
+    require_plain_equivalent("increment morph A", inc_a, input, expected_inc, FIXED_STEPS);
+    require_plain_equivalent("increment morph B", inc_b, input, expected_inc, FIXED_STEPS);
+    require_plain_equivalent("decrement morph A", dec_a, input, expected_dec, FIXED_STEPS);
+
+    std::cout << "input               : ";
     print_msb_first(input);
+    std::cout << "public state count  : " << PUBLIC_STATES << '\n'
+              << "fixed round budget  : " << FIXED_STEPS << '\n';
+    print_state_map("increment morph A", inc_a);
+    print_state_map("increment morph B", inc_b);
+    print_state_map("decrement morph A", dec_a);
+    std::cout << "plaintext morph equivalence: OK\n";
 
-    run_case(cc, sk, remap_key, "encrypted inc", increment, input,
-             {0,1,1,1,0,0,0,0}); // 14
-    run_case(cc, sk, remap_key, "encrypted dec", decrement, input,
-             {0,0,1,1,0,0,0,0}); // 12
+    BinFHEContext cc;
+    cc.GenerateBinFHEContext(STD128);
+    auto sk = cc.KeyGen();
+    std::cout << "generating OpenFHE bootstrapping keys...\n";
+    cc.BTKeyGen(sk);
 
-    std::cout << "OK: same fixed evaluator executed two encrypted transition tables\n"
+    TapeRemapper::Key remap_key{};
+    if (RAND_bytes(remap_key.data(), static_cast<int>(remap_key.size())) != 1)
+        throw std::runtime_error("RAND_bytes failed");
+
+    run_fhe_case(cc, sk, remap_key, "encrypted inc morph A", inc_a,
+                 input, expected_inc, FIXED_STEPS);
+    run_fhe_case(cc, sk, remap_key, "encrypted inc morph B", inc_b,
+                 input, expected_inc, FIXED_STEPS);
+    run_fhe_case(cc, sk, remap_key, "encrypted dec morph A", dec_a,
+                 input, expected_dec, FIXED_STEPS);
+
+    std::cout << "OK: precomputed polymorphism preserves semantics\n"
+                 "    + KMAC-derived secret state-label permutation\n"
+                 "    + fixed-size dummy-state padding\n"
+                 "    + identical public evaluator dimensions across morphs\n"
                  "    + exact encrypted state/tape semantics\n"
                  "    + ciphertext-only epoch remap\n";
     return 0;

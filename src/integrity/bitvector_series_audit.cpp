@@ -38,6 +38,7 @@ struct Config {
     std::size_t initial_examples{32};
     std::size_t counterexample_batch{64};
     std::size_t max_cegis_rounds{12};
+    int root_bit{-1}; // -1 = all 8 reduced-root bits
 };
 
 struct ConcreteInstruction {
@@ -61,12 +62,10 @@ struct SymbolicSketch {
     std::vector<z3::expr> imm;
     z3::expr output_reg;
     z3::expr output_bit;
-    z3::expr secret_bit;
 
     SymbolicSketch(z3::context& ctx, std::size_t steps)
         : output_reg(ctx.int_const("output_reg")),
-          output_bit(ctx.int_const("output_bit")),
-          secret_bit(ctx.int_const("secret_bit")) {
+          output_bit(ctx.int_const("output_bit")) {
         op.reserve(steps);
         src_a.reserve(steps);
         src_b.reserve(steps);
@@ -195,16 +194,6 @@ z3::expr select_bit(z3::context& ctx,
     return out;
 }
 
-z3::expr select_secret_bit(z3::context& ctx,
-                           const z3::expr& selector,
-                           std::uint8_t secret) {
-    z3::expr out = ctx.bv_val(secret & 1u, 1);
-    for (unsigned bit = 1; bit < 8; ++bit)
-        out = z3::ite(selector == ctx.int_val(static_cast<int>(bit)),
-                      ctx.bv_val((secret >> bit) & 1u, 1), out);
-    return out;
-}
-
 z3::expr shift_family(z3::context& ctx,
                       const z3::expr& a,
                       const z3::expr& imm,
@@ -223,8 +212,6 @@ z3::expr shift_family(z3::context& ctx,
         }
     };
 
-    // Immediate low bits 0 and 1 both mean shift/rotate by one. This keeps the
-    // search grammar free of undefined shift counts while still allowing 1..7.
     z3::expr out = apply(1);
     for (unsigned k = 2; k <= 7; ++k)
         out = z3::ite(low == ctx.bv_val(k, 3), apply(k), out);
@@ -250,6 +237,10 @@ z3::expr apply_symbolic_op(z3::context& ctx,
     return out;
 }
 
+z3::expr op_is(z3::context& ctx, const z3::expr& op, int value) {
+    return op == ctx.int_val(value);
+}
+
 void constrain_sketch(z3::context& ctx,
                       z3::solver& solver,
                       const SymbolicSketch& sketch,
@@ -259,11 +250,63 @@ void constrain_sketch(z3::context& ctx,
         solver.add(sketch.op[i] >= 0 && sketch.op[i] < OP_COUNT);
         solver.add(sketch.src_a[i] >= 0 && sketch.src_a[i] < available);
         solver.add(sketch.src_b[i] >= 0 && sketch.src_b[i] < available);
+
+        const auto is_xor = op_is(ctx, sketch.op[i], OP_XOR);
+        const auto is_and = op_is(ctx, sketch.op[i], OP_AND);
+        const auto is_add = op_is(ctx, sketch.op[i], OP_ADD);
+        const auto is_not = op_is(ctx, sketch.op[i], OP_NOT);
+        const auto is_shl = op_is(ctx, sketch.op[i], OP_SHL);
+        const auto is_shr = op_is(ctx, sketch.op[i], OP_SHR);
+        const auto is_rotl = op_is(ctx, sketch.op[i], OP_ROTL);
+        const auto is_rotr = op_is(ctx, sketch.op[i], OP_ROTR);
+        const auto is_xori = op_is(ctx, sketch.op[i], OP_XORI);
+        const auto is_addi = op_is(ctx, sketch.op[i], OP_ADDI);
+        const auto is_andi = op_is(ctx, sketch.op[i], OP_ANDI);
+
+        const auto is_commutative = is_xor || is_and || is_add;
+        const auto is_shift = is_shl || is_shr || is_rotl || is_rotr;
+        const auto is_immediate = is_xori || is_addi || is_andi;
+        const auto is_unary = is_not || is_shift || is_immediate;
+        const auto no_immediate = is_commutative || is_not;
+
+        // Symmetry breaking only: these constraints retain one representative
+        // of every distinct <=N-step computation in the DSL.
+        solver.add(!is_commutative || sketch.src_a[i] <= sketch.src_b[i]);
+        solver.add(!is_unary || sketch.src_b[i] == sketch.src_a[i]);
+        solver.add(!no_immediate || sketch.imm[i] == ctx.bv_val(0, 8));
+
+        z3::expr legal_shift = sketch.imm[i] == ctx.bv_val(1, 8);
+        for (unsigned k = 2; k <= 7; ++k)
+            legal_shift = legal_shift || sketch.imm[i] == ctx.bv_val(k, 8);
+        solver.add(!is_shift || legal_shift);
+
+        // Remove exact duplicate spellings while preserving the same functions:
+        // XORI x,0 remains the canonical identity used to pad shorter programs.
+        solver.add(!is_xori || sketch.imm[i] != ctx.bv_val(0xff, 8)); // NOT x
+        solver.add(!is_addi || sketch.imm[i] != ctx.bv_val(0x00, 8)); // identity
+        solver.add(!is_andi || sketch.imm[i] != ctx.bv_val(0xff, 8)); // identity
     }
-    solver.add(sketch.output_reg >= 0 &&
-               sketch.output_reg < static_cast<int>(cfg.input_bytes + cfg.steps));
+
+    // Normalize an "up to N steps" breaker to exactly N symbolic instructions by
+    // requiring the last produced register as the observation source. Any shorter
+    // breaker can be padded with XORI(x,0), which remains in the grammar.
+    const int last_reg = static_cast<int>(cfg.input_bytes + cfg.steps - 1);
+    solver.add(sketch.output_reg == last_reg);
     solver.add(sketch.output_bit >= 0 && sketch.output_bit < 8);
-    solver.add(sketch.secret_bit >= 0 && sketch.secret_bit < 8);
+
+    // Dead-code elimination as symmetry breaking. Every non-final generated
+    // register must feed some later instruction. Any breaker can first have dead
+    // instructions removed and then be identity-padded back to N steps.
+    for (std::size_t i = 0; i + 1 < cfg.steps; ++i) {
+        const int produced_reg = static_cast<int>(cfg.input_bytes + i);
+        z3::expr used = (sketch.src_a[i + 1] == produced_reg) ||
+                        (sketch.src_b[i + 1] == produced_reg);
+        for (std::size_t j = i + 2; j < cfg.steps; ++j) {
+            used = used || (sketch.src_a[j] == produced_reg) ||
+                   (sketch.src_b[j] == produced_reg);
+        }
+        solver.add(used);
+    }
 }
 
 void add_example(z3::context& ctx,
@@ -271,7 +314,8 @@ void add_example(z3::context& ctx,
                  const SymbolicSketch& sketch,
                  const Config& cfg,
                  const std::vector<std::uint8_t>& image,
-                 std::uint8_t secret) {
+                 std::uint8_t secret,
+                 unsigned secret_bit) {
     std::vector<z3::expr> regs;
     regs.reserve(cfg.input_bytes + cfg.steps);
     for (std::size_t i = 0; i < cfg.input_bytes; ++i)
@@ -285,7 +329,7 @@ void add_example(z3::context& ctx,
 
     const auto observed_word = select_reg(ctx, sketch.output_reg, regs);
     const auto observed_bit = select_bit(ctx, sketch.output_bit, observed_word);
-    const auto target_bit = select_secret_bit(ctx, sketch.secret_bit, secret);
+    const auto target_bit = ctx.bv_val((secret >> secret_bit) & 1u, 1);
     solver.add(observed_bit == target_bit);
 }
 
@@ -300,7 +344,8 @@ std::uint64_t bv_uint64(z3::context& ctx, const z3::expr& value) {
 ConcreteProgram decode_program(z3::context& ctx,
                                const z3::model& model,
                                const SymbolicSketch& sketch,
-                               const Config& cfg) {
+                               const Config& cfg,
+                               unsigned secret_bit) {
     ConcreteProgram out;
     out.instructions.reserve(cfg.steps);
     for (std::size_t i = 0; i < cfg.steps; ++i) {
@@ -314,7 +359,7 @@ ConcreteProgram decode_program(z3::context& ctx,
     }
     out.output_reg = model.eval(sketch.output_reg, true).get_numeral_int();
     out.output_bit = model.eval(sketch.output_bit, true).get_numeral_int();
-    out.secret_bit = model.eval(sketch.secret_bit, true).get_numeral_int();
+    out.secret_bit = static_cast<int>(secret_bit);
     return out;
 }
 
@@ -355,7 +400,7 @@ void print_candidate(const ConcreteProgram& program, const Config& cfg) {
                       << static_cast<unsigned>(ins.imm) << std::dec << std::setfill(' ');
         else if (ins.op == OP_SHL || ins.op == OP_SHR ||
                  ins.op == OP_ROTL || ins.op == OP_ROTR)
-            std::cout << ", " << static_cast<unsigned>((ins.imm & 7u) == 0 ? 1u : (ins.imm & 7u));
+            std::cout << ", " << static_cast<unsigned>(ins.imm & 7u);
         std::cout << ")\n";
     }
     std::cout << "  observe bit " << program.output_bit << " of "
@@ -375,9 +420,21 @@ Config parse_args(int argc, char** argv) {
         else if (arg == "--inputs") cfg.input_bytes = std::stoul(require_value());
         else if (arg == "--timeout-ms") cfg.timeout_ms =
             static_cast<unsigned>(std::stoul(require_value()));
-        else if (arg == "--help") {
+        else if (arg == "--root-bit") {
+            const auto value = require_value();
+            if (value == "all") cfg.root_bit = -1;
+            else cfg.root_bit = std::stoi(value);
+        } else if (arg == "--initial-examples") {
+            cfg.initial_examples = std::stoul(require_value());
+        } else if (arg == "--cex-batch") {
+            cfg.counterexample_batch = std::stoul(require_value());
+        } else if (arg == "--max-rounds") {
+            cfg.max_cegis_rounds = std::stoul(require_value());
+        } else if (arg == "--help") {
             std::cout << "usage: " << argv[0]
-                      << " [--steps N] [--inputs N] [--timeout-ms N]\n";
+                      << " [--steps N] [--inputs N] [--timeout-ms N]"
+                         " [--root-bit all|0..7] [--initial-examples N]"
+                         " [--cex-batch N] [--max-rounds N]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + arg);
@@ -389,7 +446,111 @@ Config parse_args(int argc, char** argv) {
         throw std::runtime_error("--inputs must be in 1..16");
     if (cfg.timeout_ms == 0)
         throw std::runtime_error("--timeout-ms must be positive");
+    if (cfg.root_bit < -1 || cfg.root_bit > 7)
+        throw std::runtime_error("--root-bit must be all or 0..7");
+    if (cfg.initial_examples == 0 || cfg.initial_examples > 256)
+        throw std::runtime_error("--initial-examples must be in 1..256");
+    if (cfg.counterexample_batch == 0 || cfg.counterexample_batch > 256)
+        throw std::runtime_error("--cex-batch must be in 1..256");
+    if (cfg.max_cegis_rounds == 0)
+        throw std::runtime_error("--max-rounds must be positive");
     return cfg;
+}
+
+enum class BitStatus {
+    unsat,
+    breaker,
+    inconclusive,
+};
+
+struct BitResult {
+    BitStatus status{BitStatus::inconclusive};
+    std::string reason;
+};
+
+BitResult audit_secret_bit(unsigned secret_bit,
+                           const Config& cfg,
+                           const std::vector<std::vector<std::uint8_t>>& images) {
+    constexpr std::size_t DOMAIN = 256;
+
+    std::array<bool, DOMAIN> included{};
+    std::vector<std::size_t> examples;
+    examples.reserve(DOMAIN);
+    for (std::size_t i = 0; i < cfg.initial_examples && i < DOMAIN; ++i) {
+        const std::size_t x = (i * 73u + 19u) & 0xffu;
+        if (!included[x]) {
+            included[x] = true;
+            examples.push_back(x);
+        }
+    }
+
+    for (std::size_t round = 0; round < cfg.max_cegis_rounds; ++round) {
+        std::cout << "[RUN ] root bit " << secret_bit
+                  << ", CEGIS round " << (round + 1)
+                  << ", " << examples.size() << " constrained roots... "
+                  << std::flush;
+
+        z3::context ctx;
+        z3::solver solver(ctx);
+        z3::params params(ctx);
+        params.set("timeout", cfg.timeout_ms);
+        solver.set(params);
+
+        SymbolicSketch sketch(ctx, cfg.steps);
+        constrain_sketch(ctx, solver, sketch, cfg);
+        for (const auto x : examples)
+            add_example(ctx, solver, sketch, cfg, images[x],
+                        static_cast<std::uint8_t>(x), secret_bit);
+
+        const auto result = solver.check();
+        if (result == z3::unsat) {
+            std::cout << "PASS (UNSAT)\n";
+            return {BitStatus::unsat, {}};
+        }
+        if (result == z3::unknown) {
+            const std::string why = solver.reason_unknown();
+            std::cout << "INCONCLUSIVE (Z3 unknown: " << why << ")\n";
+            return {BitStatus::inconclusive, why};
+        }
+
+        const auto candidate =
+            decode_program(ctx, solver.get_model(), sketch, cfg, secret_bit);
+        std::vector<std::size_t> counterexamples;
+        counterexamples.reserve(cfg.counterexample_batch);
+        for (std::size_t x = 0; x < DOMAIN; ++x) {
+            if (!candidate_recovers(candidate, images[x],
+                                    static_cast<std::uint8_t>(x),
+                                    cfg.input_bytes)) {
+                counterexamples.push_back(x);
+                if (counterexamples.size() >= cfg.counterexample_batch)
+                    break;
+            }
+        }
+
+        if (counterexamples.empty()) {
+            std::cout << "FAIL (generic breaker found)\n";
+            print_candidate(candidate, cfg);
+            return {BitStatus::breaker, {}};
+        }
+
+        std::size_t added = 0;
+        for (const auto x : counterexamples) {
+            if (!included[x]) {
+                included[x] = true;
+                examples.push_back(x);
+                ++added;
+            }
+        }
+        std::cout << "      SAT on sample; rejected by "
+                  << counterexamples.size()
+                  << " full-domain counterexamples, added " << added << '\n';
+
+        if (added == 0)
+            throw std::runtime_error(
+                "CEGIS made no progress despite concrete counterexamples");
+    }
+
+    return {BitStatus::inconclusive, "CEGIS round limit reached"};
 }
 
 } // namespace
@@ -408,101 +569,78 @@ int main(int argc, char** argv) try {
             semantic_input, reduced_root(static_cast<std::uint8_t>(x)), 19).series);
 
     if (cfg.input_bytes > images.front().size())
-        throw std::runtime_error("requested observable bytes exceed generated series");
+        throw std::runtime_error(
+            "requested observable bytes exceed generated series");
 
     std::cout << "V0ID bounded bitvector attacker audit\n"
               << "  reduced roots      : 256 exhaustive values\n"
               << "  observed series    : first " << cfg.input_bytes << " bytes\n"
-              << "  straight-line steps: " << cfg.steps << '\n'
+              << "  step budget        : <= " << cfg.steps
+              << " (normalized to " << cfg.steps << " with XORI(x,0) padding)\n"
               << "  operations         : XOR AND ADD NOT SHL SHR ROTL ROTR XORI ADDI ANDI\n"
-              << "  objective          : recover ANY one root bit from ANY output bit/register\n"
+              << "  target root bits   : "
+              << (cfg.root_bit < 0 ? "all 0..7" : std::to_string(cfg.root_bit)) << '\n'
+              << "  output             : any bit of normalized final register\n"
+              << "  symmetry breaking  : commutative order, canonical unused fields,"
+                 " live instructions\n"
               << "  oracle tables      : forbidden by bounded shared-program sketch\n"
-              << "  solver timeout     : " << cfg.timeout_ms << " ms/check\n\n";
+              << "  solver timeout     : " << cfg.timeout_ms << " ms/root-bit check\n\n";
 
-    std::array<bool, DOMAIN> included{};
-    std::vector<std::size_t> examples;
-    examples.reserve(DOMAIN);
-    for (std::size_t i = 0; i < cfg.initial_examples && i < DOMAIN; ++i) {
-        const std::size_t x = (i * 73u + 19u) & 0xffu;
-        if (!included[x]) {
-            included[x] = true;
-            examples.push_back(x);
-        }
+    std::vector<unsigned> target_bits;
+    if (cfg.root_bit >= 0) {
+        target_bits.push_back(static_cast<unsigned>(cfg.root_bit));
+    } else {
+        for (unsigned bit = 0; bit < 8; ++bit)
+            target_bits.push_back(bit);
     }
 
-    for (std::size_t round = 0; round < cfg.max_cegis_rounds; ++round) {
-        std::cout << "[RUN ] CEGIS round " << (round + 1)
-                  << " with " << examples.size() << " constrained roots... "
-                  << std::flush;
+    bool saw_inconclusive = false;
+    std::vector<unsigned> unsat_bits;
+    std::vector<unsigned> unknown_bits;
 
-        z3::context ctx;
-        z3::solver solver(ctx);
-        z3::params params(ctx);
-        params.set("timeout", cfg.timeout_ms);
-        solver.set(params);
-
-        SymbolicSketch sketch(ctx, cfg.steps);
-        constrain_sketch(ctx, solver, sketch, cfg);
-        for (const auto x : examples)
-            add_example(ctx, solver, sketch, cfg, images[x], static_cast<std::uint8_t>(x));
-
-        const auto result = solver.check();
-        if (result == z3::unsat) {
-            std::cout << "PASS (UNSAT)\n\n"
-                      << "V0ID bitvector series audit: PASS\n"
-                      << "No shared " << cfg.steps << "-step program in this exact DSL can recover\n"
-                      << "any reduced-root bit from any bit/register of the first "
-                      << cfg.input_bytes << " series bytes.\n"
-                      << "UNSAT on a subset is sufficient here: any full-domain breaker would also\n"
-                      << "have to satisfy that subset. This closes only this bounded attacker class.\n";
-            return 0;
-        }
-        if (result == z3::unknown) {
-            std::cout << "INCONCLUSIVE (Z3 unknown: " << solver.reason_unknown() << ")\n\n"
-                      << "V0ID bitvector series audit: INCONCLUSIVE\n"
-                      << "Increase --timeout-ms or reduce --steps/--inputs. UNKNOWN is never PASS.\n";
-            return 2;
-        }
-
-        const auto candidate = decode_program(ctx, solver.get_model(), sketch, cfg);
-        std::vector<std::size_t> counterexamples;
-        counterexamples.reserve(cfg.counterexample_batch);
-        for (std::size_t x = 0; x < DOMAIN; ++x) {
-            if (!candidate_recovers(candidate, images[x], static_cast<std::uint8_t>(x),
-                                    cfg.input_bytes)) {
-                counterexamples.push_back(x);
-                if (counterexamples.size() >= cfg.counterexample_batch)
-                    break;
-            }
-        }
-
-        if (counterexamples.empty()) {
-            std::cout << "FAIL (generic breaker found)\n";
-            print_candidate(candidate, cfg);
+    for (const auto bit : target_bits) {
+        const auto result = audit_secret_bit(bit, cfg, images);
+        if (result.status == BitStatus::breaker) {
             std::cout << "\nV0ID bitvector series audit: FAIL\n"
-                      << "The printed program generalized across all 256 reduced roots.\n"
-                      << "Treat this as a structural cryptanalytic lead, not as a benchmark artifact.\n";
+                      << "The printed shared program replayed successfully across all "
+                         "256 reduced roots.\n"
+                      << "Treat it as a structural cryptanalytic lead, not a benchmark artifact.\n";
             return 1;
         }
-
-        std::size_t added = 0;
-        for (const auto x : counterexamples) {
-            if (!included[x]) {
-                included[x] = true;
-                examples.push_back(x);
-                ++added;
-            }
+        if (result.status == BitStatus::unsat) {
+            unsat_bits.push_back(bit);
+        } else {
+            saw_inconclusive = true;
+            unknown_bits.push_back(bit);
         }
-        std::cout << "SAT on sample; rejected by " << counterexamples.size()
-                  << " full-domain counterexamples, added " << added << "\n";
-
-        if (added == 0)
-            throw std::runtime_error("CEGIS made no progress despite counterexamples");
     }
 
-    std::cout << "\nV0ID bitvector series audit: INCONCLUSIVE\n"
-              << "CEGIS round limit reached without a generic breaker or UNSAT proof.\n";
-    return 2;
+    if (saw_inconclusive) {
+        std::cout << "\nV0ID bitvector series audit: INCONCLUSIVE\n";
+        if (!unsat_bits.empty()) {
+            std::cout << "Exact UNSAT within this normalized <= " << cfg.steps
+                      << "-step DSL for root bits:";
+            for (const auto bit : unsat_bits) std::cout << ' ' << bit;
+            std::cout << '\n';
+        }
+        std::cout << "Unresolved root bits:";
+        for (const auto bit : unknown_bits) std::cout << ' ' << bit;
+        std::cout << "\nUNKNOWN/round-limit is never PASS. Increase --timeout-ms,"
+                     " reduce the bound, or run one bit with --root-bit N.\n";
+        return 2;
+    }
+
+    std::cout << "\nV0ID bitvector series audit: PASS\n"
+              << "UNSAT for every requested root bit in the normalized <= "
+              << cfg.steps << "-step attacker DSL.\n"
+              << "Because commutative ordering, unused-field normalization, dead-code"
+                 " removal and XORI(x,0) padding preserve every <=N-step computation,"
+                 " these symmetry constraints do not weaken the stated attacker class.\n"
+              << "UNSAT on each constrained subset is sufficient: a full-domain breaker"
+                 " would also have to satisfy that subset.\n"
+              << "This closes only this reduced-domain/bounded DSL, not arbitrary programs"
+                 " or future quantum algorithms.\n";
+    return 0;
 } catch (const std::exception& e) {
     std::cerr << "V0ID bitvector series audit fatal error: " << e.what() << '\n';
     return 3;

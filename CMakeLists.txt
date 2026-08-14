@@ -53,8 +53,6 @@ if(V0ID_ENABLE_MATHVM)
         GIT_REPOSITORY https://github.com/wasm-micro-runtime/wasm-micro-runtime.git
         GIT_TAG WAMR-2.4.0
         GIT_SHALLOW TRUE
-        # Populate the source without adding WAMR's product build. V0ID embeds
-        # vmcore using WAMR's documented runtime_lib.cmake integration instead.
         SOURCE_SUBDIR doc
     )
     FetchContent_MakeAvailable(wamr)
@@ -108,23 +106,12 @@ if(V0ID_ENABLE_MATHVM)
     target_include_directories(v0id_mathvm PUBLIC src/mathvm)
     target_link_libraries(v0id_mathvm PUBLIC v0id_wamr OpenSSL::Crypto)
 
-    add_executable(v0id-mathvm
-        src/mathvm/mathvm_demo.cpp
-    )
+    add_executable(v0id-mathvm src/mathvm/mathvm_demo.cpp)
     target_link_libraries(v0id-mathvm PRIVATE v0id_mathvm)
 
-    # Self-contained host-side sandbox tests. The test executable constructs
-    # tiny Wasm modules in memory, so it does not require a wasm32 clang target.
-    # It exercises successful scalar/byte providers plus rejection of loops,
-    # undeclared primitives, provider-budget exhaustion, excessive memory, WASI
-    # imports and non-Wasm/AOT-like input before MathVM is exposed over a network.
-    add_executable(v0id-mathvm-tests
-        src/mathvm/mathvm_tests.cpp
-    )
+    add_executable(v0id-mathvm-tests src/mathvm/mathvm_tests.cpp)
     target_link_libraries(v0id-mathvm-tests PRIVATE v0id_mathvm)
 
-    # Final ABI-v2 byte boundary gate: explicit Wasm pointer/length OOB,
-    # host byte-budget rejection, and successful recovery after both traps.
     add_executable(v0id-mathvm-byte-boundary-tests
         src/mathvm/byte_boundary_tests.cpp
     )
@@ -155,45 +142,63 @@ function(v0id_use_openfhe target)
     target_link_libraries(${target} PRIVATE ${V0ID_OPENFHE_LIBRARIES})
 endfunction()
 
-# Client-side program representation, series-first derivation and precomputed
-# polymorphism compiler. User-defined series patterns are local trusted code;
-# peers exchange identifiers only, never executable crypto plugins.
+# Series-first core: issuer-private KMACXOF schedule, trusted ProgramMorpher, and
+# a transcript-bound post-KEM schedule. The KEM still supplies shared hardness;
+# the issuer-only root remains separate so a peer cannot predict polymorphism.
 add_library(v0id_core
     src/polymorph/program_morpher.cpp
     src/polymorph/series_generator.cpp
+    src/crypto/series_first_schedule.cpp
 )
 target_include_directories(v0id_core PUBLIC
     src/core
     src/polymorph
+    src/crypto
 )
 target_link_libraries(v0id_core PUBLIC OpenSSL::Crypto)
 
-# PQ-facing plaintext quine commitment. This uses OpenSSL SHA3-512/KMAC-256 and
-# binds the morphed executable, issuer semantic job, generator implementation,
-# session/job/epoch and crypto profile. It is intentionally distinct from the
-# legacy toy FHE fingerprint and does not claim to prove remote execution.
-add_library(v0id_quine
-    src/integrity/quine_hash.cpp
-)
+# PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
+# semantic job, exact generator implementation, morphed executable, profile,
+# session/job/epoch and issuer-private challenge. This does not claim to prove
+# remote execution; that remains a separate verifiable-computation problem.
+add_library(v0id_quine src/integrity/quine_hash.cpp)
 target_include_directories(v0id_quine PUBLIC
     src/integrity
     src/fhe
 )
 target_link_libraries(v0id_quine PUBLIC v0id_core OpenSSL::Crypto)
 
-# Composition/falsification gate: known-answer SHA3-512, seam substitution tests,
-# private-root challenge sensitivity, and exhaustive reduced-domain XOR-period
-# screening of the built-in series schedule.
 add_executable(v0id-quine-audit-tests
     src/integrity/quine_audit_tests.cpp
 )
 target_link_libraries(v0id-quine-audit-tests PRIVATE v0id_quine)
 
+# Optional symbolic falsification layer. Z3 is audit-only: production V0ID has
+# no solver dependency. The harness synthesizes one shared affine/quadratic
+# Boolean recovery expression across every reduced-root instance; UNSAT closes
+# only that defined attacker language, not arbitrary future algorithms.
+option(V0ID_ENABLE_Z3_AUDIT "Build the optional Z3 symbolic series audit" ON)
+if(V0ID_ENABLE_Z3_AUDIT)
+    find_path(V0ID_Z3_INCLUDE_DIR z3++.h)
+    find_library(V0ID_Z3_LIBRARY NAMES z3 libz3)
+    if(V0ID_Z3_INCLUDE_DIR AND V0ID_Z3_LIBRARY)
+        add_executable(v0id-symbolic-series-audit
+            src/integrity/symbolic_series_audit.cpp
+        )
+        target_include_directories(v0id-symbolic-series-audit PRIVATE
+            ${V0ID_Z3_INCLUDE_DIR}
+        )
+        target_link_libraries(v0id-symbolic-series-audit PRIVATE
+            v0id_core
+            ${V0ID_Z3_LIBRARY}
+        )
+        message(STATUS "V0ID symbolic audit: Z3 enabled")
+    else()
+        message(STATUS "V0ID symbolic audit: Z3 not found; target disabled")
+    endif()
+endif()
+
 if(V0ID_ENABLE_MATHVM)
-    # Client-only portable polymorphism strategy. Unlike remote MathVM this
-    # sandbox exposes zero host imports: seed/input/epoch enter through bounded
-    # guest linear memory, a canonical private morph-material envelope comes
-    # back, and trusted ProgramMorpher still owns machine rewriting.
     add_library(v0id_wasm_polymorph
         src/polymorph/wasm_series_generator.cpp
     )
@@ -219,30 +224,18 @@ target_include_directories(v0id PRIVATE src/integrity)
 target_link_libraries(v0id PRIVATE v0id_core v0id_quine OpenSSL::Crypto)
 v0id_use_openfhe(v0id)
 
-# Binary-safe transport layer. The envelope payload is deliberately opaque so
-# OpenFHE serialized ciphertext bytes can be placed directly inside it.
-add_library(v0id_net
-    src/net/peer_transport.cpp
-)
+add_library(v0id_net src/net/peer_transport.cpp)
 target_include_directories(v0id_net PUBLIC src/net)
 target_link_libraries(v0id_net PUBLIC cppzmq)
 
-add_executable(v0id-peer
-    src/net/peer_demo.cpp
-)
+add_executable(v0id-peer src/net/peer_demo.cpp)
 target_link_libraries(v0id-peer PRIVATE v0id_net)
 
-add_executable(v0id-fhe-peer
-    src/net/fhe_peer_demo.cpp
-)
+add_executable(v0id-fhe-peer src/net/fhe_peer_demo.cpp)
 target_include_directories(v0id-fhe-peer PRIVATE src/fhe)
 target_link_libraries(v0id-fhe-peer PRIVATE v0id_net)
 v0id_use_openfhe(v0id-fhe-peer)
 
-# V0.4/V0.4.1 full-machine remote execution. The client derives a private series,
-# uses it to seed the morph compiler, encrypts the full machine, and attaches a
-# bounded public crypto/profile identifier. The series, series seed, MorphManifest
-# and LWE secret key remain client-side.
 add_executable(v0id-remote-machine
     src/net/remote_machine_demo.cpp
     src/fhe/remote_machine.cpp
@@ -259,9 +252,6 @@ target_link_libraries(v0id-remote-machine PRIVATE
     OpenSSL::Crypto
 )
 if(V0ID_ENABLE_MATHVM)
-    # The remote executable only uses WAMR on the client side. `--series-wasm`
-    # derives private morph material locally, then the existing RMJ3 path sends
-    # only the resulting encrypted machine. No Wasm module is sent to the peer.
     target_link_libraries(v0id-remote-machine PRIVATE v0id_wasm_polymorph)
     target_compile_definitions(v0id-remote-machine PRIVATE
         V0ID_HAVE_WASM_POLYMORPH=1)

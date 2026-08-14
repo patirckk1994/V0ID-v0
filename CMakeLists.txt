@@ -163,6 +163,14 @@ add_executable(v0id-series-first-stack-tests
 )
 target_link_libraries(v0id-series-first-stack-tests PRIVATE v0id_core)
 
+# Phase-1 polymorphism leakage benchmark. It separates deliberately public fixed
+# evaluator shape from a stronger plaintext diagnostic that the current BinFHE
+# evaluator does not receive. Later phases add encrypted wire-size/timing traces.
+add_executable(v0id-polymorphism-distinguisher
+    src/integrity/polymorphism_distinguisher.cpp
+)
+target_link_libraries(v0id-polymorphism-distinguisher PRIVATE v0id_core)
+
 # Real standardized KEM composition gate. OpenSSL 3.5+ supplies ML-KEM-768;
 # when the provider is unavailable the executable reports SKIP rather than
 # pretending a synthetic shared secret exercised the KEM runtime.

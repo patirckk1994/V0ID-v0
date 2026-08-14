@@ -9,6 +9,7 @@ Current V0.1 + network scaffold:
 - **UTM-lite:** one fixed interpreter executes encrypted transition tables over encrypted one-hot state, encrypted one-hot head and encrypted tape. The demo is bounded to 8 cells, so this is a bounded universal-interpreter prototype rather than a claim of an infinite physical tape.
 - **Fixed work schedule:** the demo executes a public fixed number of interpreter rounds rather than terminating based on secret program semantics.
 - **Remap-lite:** OpenSSL 3 `KMAC-256` derives an epoch-specific exact bijection from logical tape cells to physical slots. The demo changes epochs mid-computation by moving ciphertexts only; it never decrypts the intermediate tape.
+- **Precomputed polymorphism model:** V0ID does not require runtime self-modifying code. The client may precompute semantically equivalent machine variants with randomized state labels, scratch/output placement, equivalent subroutine choices, padded dummy work and different placement/interleaving of integrity logic. All variants are intended to expose the same configured public shape before being encrypted.
 - **P2P scaffold:** `src/net/peer_transport.*` wraps ZeroMQ through the header-only `cppzmq` C++ API. A versioned binary-safe V0ID envelope carries message type, peer id, job id, epoch and opaque payload bytes.
 - **FHE-over-network smoke test:** `v0id-fhe-peer` serializes a key-independent BinFHE context, refresh key, switching key and ciphertext into the opaque payload. A remote evaluator reloads the bootstrapping keys, performs `EvalNOT()` and returns a ciphertext. The LWE secret key never leaves the client.
 
@@ -28,6 +29,69 @@ The current local prototype encrypts:
 The evaluator still learns public shape information such as tape length, number of states, binary alphabet, and fixed round count.
 
 The FHE network smoke test separates client and evaluator roles: the evaluator receives the key-independent BinFHE context plus bootstrapping material and ciphertext, but not the LWE secret key. This is only a transport/evaluation proof-of-concept; it is not yet the distributed Turing-machine protocol.
+
+## Precomputed polymorphism model
+
+"Polymorphism" in V0ID means **client-side precomputed semantic morphing**, not necessarily code that mutates itself while executing.
+
+For a base computation `P`, the client should eventually be able to generate multiple equivalent machine images:
+
+```text
+P -> Morph(P, seed_1) -> P1
+P -> Morph(P, seed_2) -> P2
+P -> Morph(P, seed_3) -> P3
+```
+
+such that:
+
+```text
+result(P1, x) == result(P2, x) == result(P3, x) == result(P, x)
+```
+
+while every variant exposes the same configured public dimensions:
+
+```text
+same tape size
+same state count
+same alphabet
+same fixed round budget
+same wire format
+same evaluator implementation
+```
+
+Candidate morphing operations include:
+
+- random state-label permutations,
+- padded dummy/discardable states,
+- randomized logical scratch/output placement before KMAC physical remapping,
+- multiple equivalent implementations of selected Boolean/TM subroutines,
+- interleaving useful work, integrity work and decoy work into one fixed-shape encrypted program.
+
+FHE is what hides the encrypted program/data semantics. The morphing layer has a different purpose: it should make repeated jobs difficult to correlate structurally and prevent the evaluator from acquiring a stable semantic map such as "these states are always the integrity checker" or "this slot is always the digest output".
+
+The full design note is in `docs/POLYMORPHISM.md`.
+
+## Planned hidden self-fingerprint
+
+A future integrity experiment will embed a fingerprint computation into the encrypted program rather than expose a separate public `hash()` phase.
+
+Conceptually, the client knows an expected value such as:
+
+```text
+digest = H(
+    domain_separator ||
+    canonical_program ||
+    canonical_input ||
+    nonce ||
+    epoch
+)
+```
+
+with the digest field itself excluded from the hash domain.
+
+The remote evaluator should homomorphically execute the hidden fingerprint logic along with the useful computation without receiving metadata that identifies where that logic lives. Different precomputed morphs may place and interleave the integrity work differently while preserving the same public dimensions.
+
+This is intended as a probabilistic/structural cheating-deterrence experiment, not a claim of formal malicious-secure verifiable computation. A later design may combine it with hidden known-answer jobs, replication, peer scoring, or stronger proof machinery.
 
 ## Dependencies
 
@@ -176,11 +240,14 @@ ERROR
 
 Likely next steps:
 
+- factor `Rule` / `Program` out of `main.cpp` into reusable machine headers,
+- implement a deterministic `ProgramMorpher` beginning with state-label permutation and fixed-size dummy-state padding,
+- test many morph seeds against a plaintext reference machine and the FHE evaluator,
+- embed a small hidden self-fingerprint into morphed machine images before attempting full KMAC/Keccak under FHE,
 - serialize an entire encrypted machine/program rather than one test ciphertext,
 - map remapped physical tape slots onto `(peer_id, local_slot)`,
 - implement `STORE_SLOT` / `FETCH_SLOT` for ciphertext-resident remote tape cells,
 - encrypted halted/no-op semantics with a fixed public work budget,
-- canonical encrypted machine-image fingerprint/self-check,
 - probabilistic audit/integrity experiments before heavier verifiable-computation machinery.
 
 If CMake/compiler complains about a missing package, target, include path, or OpenFHE API, report the exact error and installation layout. The network dependencies are fetched automatically, while OpenFHE/OpenSSL remain installed system dependencies.

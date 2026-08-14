@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -65,17 +66,17 @@ Program make_family(std::size_t family) {
             r.read = read;
 
             switch (family) {
-                case 0: // right-moving ring, value preserving
+                case 0:
                     r.next_state = (state + 1) % p.states;
                     r.write = read;
                     r.move = +1;
                     break;
-                case 1: // left-moving ring, value flipping
+                case 1:
                     r.next_state = (state + 1) % p.states;
                     r.write = 1 - read;
                     r.move = -1;
                     break;
-                case 2: // mixed stay/self-loop and right-moving path
+                case 2:
                     if (read == 0) {
                         r.next_state = state;
                         r.write = 0;
@@ -86,7 +87,7 @@ Program make_family(std::size_t family) {
                         r.move = +1;
                     }
                     break;
-                case 3: // different transition/move/write aggregate profile
+                case 3:
                     if (read == 0) {
                         r.next_state = (state + 2) % p.states;
                         r.write = 1;
@@ -166,7 +167,7 @@ Centroids train_centroids(const std::vector<Sample>& samples,
     std::array<std::size_t, FAMILY_COUNT> counts{};
 
     for (const auto& sample : samples) {
-        if (sample.ordinal % 4 == 0) continue; // held-out 25%
+        if (sample.ordinal % 4 == 0) continue;
         const auto& f = evaluator_view ? sample.evaluator_features
                                        : sample.plaintext_features;
         if (sums[sample.family].empty()) sums[sample.family].assign(f.size(), 0.0);

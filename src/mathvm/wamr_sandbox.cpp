@@ -4,6 +4,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -30,9 +31,9 @@ std::mutex g_runtime_mutex;
 bool g_runtime_active = false;
 
 // Small policy parser used before WAMR sees attacker-supplied bytecode. WAMR is
-// still responsible for full Wasm validation; this parser only extracts the two
-// pieces V0ID must fail closed on independently of optional WAMR features:
-// host imports and declared linear-memory bounds.
+// still responsible for full Wasm validation; this parser extracts the pieces
+// V0ID must fail closed on independently of optional WAMR features: host imports
+// and declared linear-memory bounds.
 class WasmCursor {
 public:
     WasmCursor(const std::vector<std::uint8_t>& bytes,
@@ -96,15 +97,16 @@ private:
 
 void validate_import_section(WasmCursor& section) {
     const auto count = section.read_uleb32();
-    std::uint32_t allowed_import_count = 0;
+    bool saw_u64 = false;
+    bool saw_bytes = false;
 
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto module_name = section.read_name();
         const auto import_name = section.read_name();
         const auto kind = section.read_u8();
 
-        // V0ID MathVM v1 exposes exactly one host function and no imported
-        // memory/table/global objects. In particular this rejects WASI imports
+        // MathVM ABI v2 exposes exactly two possible host functions and no
+        // imported memory/table/global objects. In particular this rejects WASI
         // before WAMR's optional WASI/linker code is involved.
         if (kind != 0x00)
             throw std::runtime_error(
@@ -112,14 +114,26 @@ void validate_import_section(WasmCursor& section) {
 
         (void)section.read_uleb32(); // function type index; WAMR validates it.
 
-        if (module_name != "v0id_math" || import_name != "primitive_u64")
+        if (module_name != "v0id_math")
             throw std::runtime_error(
                 "MathVM Wasm import is not on the V0ID host allowlist");
 
-        ++allowed_import_count;
-        if (allowed_import_count > 1)
+        if (import_name == "primitive_u64") {
+            if (saw_u64)
+                throw std::runtime_error(
+                    "MathVM permits only one primitive_u64 host import");
+            saw_u64 = true;
+        }
+        else if (import_name == "primitive_bytes") {
+            if (saw_bytes)
+                throw std::runtime_error(
+                    "MathVM permits only one primitive_bytes host import");
+            saw_bytes = true;
+        }
+        else {
             throw std::runtime_error(
-                "MathVM permits only one primitive_u64 host import");
+                "MathVM Wasm import is not on the V0ID host allowlist");
+        }
     }
 
     if (!section.empty())
@@ -135,7 +149,7 @@ void validate_memory_section(WasmCursor& section,
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto flags = section.read_uleb32();
 
-        // V0.4.2 intentionally accepts only ordinary Wasm32 memory with an
+        // V0ID intentionally accepts only ordinary Wasm32 memory with an
         // explicit min+max. Shared-memory/memory64 flags and unbounded memories
         // are outside the current ABI and are rejected before instantiation.
         if (flags != 0x01)
@@ -202,6 +216,33 @@ void validate_wasm_policy(const std::vector<std::uint8_t>& wasm,
     }
 }
 
+std::uint32_t checked_version(std::uint64_t version64) {
+    if (version64 == 0 ||
+        version64 > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("invalid primitive version");
+    return static_cast<std::uint32_t>(version64);
+}
+
+void require_declared(const ExecutionContext& context,
+                      std::uint64_t tag,
+                      std::uint32_t version) {
+    if (!context.allowed.contains(RequirementKey{tag, version}))
+        throw std::runtime_error("Wasm called undeclared primitive");
+}
+
+void consume_provider_budget(ExecutionContext& context,
+                             const PrimitiveDescriptor& descriptor) {
+    if (context.provider_calls >= context.limits->max_provider_calls)
+        throw std::runtime_error("MathVM provider call budget exhausted");
+    ++context.provider_calls;
+
+    if (descriptor.cost > context.limits->max_provider_cost ||
+        context.provider_cost >
+            context.limits->max_provider_cost - descriptor.cost)
+        throw std::runtime_error("MathVM provider cost budget exhausted");
+    context.provider_cost += descriptor.cost;
+}
+
 std::uint64_t primitive_u64_native(wasm_exec_env_t exec_env,
                                    std::uint64_t tag,
                                    std::uint64_t version64,
@@ -219,27 +260,12 @@ std::uint64_t primitive_u64_native(wasm_exec_env_t exec_env,
     }
 
     try {
-        if (version64 == 0 ||
-            version64 > std::numeric_limits<std::uint32_t>::max())
-            throw std::runtime_error("invalid primitive version");
+        const auto version = checked_version(version64);
+        require_declared(*context, tag, version);
 
-        const auto version = static_cast<std::uint32_t>(version64);
-        if (!context->allowed.contains(RequirementKey{tag, version}))
-            throw std::runtime_error("Wasm called undeclared primitive");
-
-        const auto& provider = context->registry->require(tag, version);
+        const auto& provider = context->registry->require_u64(tag, version);
         const auto descriptor = provider.descriptor();
-
-        if (context->provider_calls >= context->limits->max_provider_calls)
-            throw std::runtime_error("MathVM provider call budget exhausted");
-        ++context->provider_calls;
-
-        if (descriptor.cost > context->limits->max_provider_cost ||
-            context->provider_cost >
-                context->limits->max_provider_cost - descriptor.cost)
-            throw std::runtime_error("MathVM provider cost budget exhausted");
-        context->provider_cost += descriptor.cost;
-
+        consume_provider_budget(*context, descriptor);
         return provider.evaluate_u64(a, b, c, d);
     } catch (const std::exception& e) {
         context->exception = e.what();
@@ -252,11 +278,76 @@ std::uint64_t primitive_u64_native(wasm_exec_env_t exec_env,
     }
 }
 
+std::int32_t primitive_bytes_native(wasm_exec_env_t exec_env,
+                                    std::uint64_t tag,
+                                    std::uint64_t version64,
+                                    const std::uint8_t* input,
+                                    std::uint32_t input_len,
+                                    std::uint8_t* output,
+                                    std::uint32_t output_capacity) {
+    const auto module_inst = wasm_runtime_get_module_inst(exec_env);
+    auto* context = static_cast<ExecutionContext*>(
+        wasm_runtime_get_custom_data(module_inst));
+
+    if (!context || !context->registry || !context->limits) {
+        wasm_runtime_set_exception(module_inst, "V0ID MathVM context missing");
+        return -1;
+    }
+
+    try {
+        const auto version = checked_version(version64);
+        require_declared(*context, tag, version);
+
+        const auto& provider = context->registry->require_bytes(tag, version);
+        const auto descriptor = provider.descriptor();
+
+        if (input_len > descriptor.max_input_bytes ||
+            input_len > context->limits->max_provider_input_bytes)
+            throw std::runtime_error("MathVM byte-provider input exceeds limit");
+        if (output_capacity > context->limits->max_provider_output_bytes)
+            throw std::runtime_error("MathVM byte-provider output capacity exceeds limit");
+
+        std::vector<std::uint8_t> input_copy;
+        if (input_len != 0)
+            input_copy.assign(input, input + input_len);
+
+        consume_provider_budget(*context, descriptor);
+        auto result = provider.evaluate_bytes(input_copy);
+
+        if (result.size() > descriptor.max_output_bytes ||
+            result.size() > context->limits->max_provider_output_bytes)
+            throw std::runtime_error("MathVM byte-provider output exceeds limit");
+        if (result.size() > output_capacity)
+            throw std::runtime_error("MathVM byte-provider output buffer too small");
+        if (result.size() >
+            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
+            throw std::runtime_error("MathVM byte-provider output length exceeds i32");
+
+        if (!result.empty())
+            std::memcpy(output, result.data(), result.size());
+        return static_cast<std::int32_t>(result.size());
+    } catch (const std::exception& e) {
+        context->exception = e.what();
+        wasm_runtime_set_exception(module_inst, context->exception.c_str());
+        return -1;
+    } catch (...) {
+        context->exception = "unknown MathVM byte-provider failure";
+        wasm_runtime_set_exception(module_inst, context->exception.c_str());
+        return -1;
+    }
+}
+
 NativeSymbol g_native_symbols[] = {
     {
         "primitive_u64",
         reinterpret_cast<void*>(primitive_u64_native),
         "(IIIIII)I",
+        nullptr,
+    },
+    {
+        "primitive_bytes",
+        reinterpret_cast<void*>(primitive_bytes_native),
+        "(II*~*~)i",
         nullptr,
     },
 };
@@ -276,6 +367,16 @@ void validate_limits(const SandboxLimits& limits) {
         throw std::runtime_error("MathVM instruction budget must be positive");
     if (limits.max_provider_calls == 0 || limits.max_provider_cost == 0)
         throw std::runtime_error("MathVM provider budgets must be positive");
+    if (limits.max_provider_input_bytes == 0 ||
+        limits.max_provider_output_bytes == 0)
+        throw std::runtime_error("MathVM byte-provider limits must be positive");
+
+    const auto linear_memory_cap =
+        static_cast<std::uint64_t>(limits.max_memory_pages) * 65536ull;
+    if (limits.max_provider_input_bytes > linear_memory_cap ||
+        limits.max_provider_output_bytes > linear_memory_cap)
+        throw std::runtime_error(
+            "MathVM byte-provider limit exceeds linear-memory sandbox cap");
 }
 
 void validate_entrypoint(const std::string& entrypoint) {
@@ -362,7 +463,8 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
     const auto package_type = wasm_runtime_get_file_package_type(
         wasm_bytes.data(), static_cast<std::uint32_t>(wasm_bytes.size()));
     if (package_type != Wasm_Module_Bytecode)
-        throw std::runtime_error("MathVM accepts Wasm bytecode only, not AOT/native images");
+        throw std::runtime_error(
+            "MathVM accepts Wasm bytecode only, not AOT/native images");
 
     char error_buf[512]{};
     wasm_module_t module = nullptr;
@@ -391,13 +493,19 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
         InstantiationArgs instantiate_args{};
         instantiate_args.default_stack_size = limits_.stack_bytes;
         instantiate_args.host_managed_heap_size = limits_.host_managed_heap_bytes;
-        instantiate_args.max_memory_pages = limits_.max_memory_pages;
+
+        // V0ID already rejects modules whose declared min/max exceeds the cap.
+        // Passing a larger runtime override makes WAMR warn when the module chose
+        // a smaller maximum, so leave the override at zero and keep policy in the
+        // fail-closed prevalidator.
+        instantiate_args.max_memory_pages = 0;
 
         module_inst = wasm_runtime_instantiate_ex(
             module, &instantiate_args, error_buf,
             static_cast<std::uint32_t>(sizeof(error_buf)));
         if (!module_inst)
-            throw std::runtime_error(std::string("WAMR instantiate failed: ") + error_buf);
+            throw std::runtime_error(
+                std::string("WAMR instantiate failed: ") + error_buf);
 
         wasm_runtime_set_custom_data(module_inst, &context);
 
@@ -407,18 +515,21 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
             throw std::runtime_error("MathVM entrypoint export not found");
 
         if (wasm_func_get_param_count(function, module_inst) != 0)
-            throw std::runtime_error("MathVM v1 entrypoint must take zero parameters");
+            throw std::runtime_error(
+                "MathVM entrypoint must take zero parameters");
         if (wasm_func_get_result_count(function, module_inst) != 1)
-            throw std::runtime_error("MathVM v1 entrypoint must return one value");
+            throw std::runtime_error(
+                "MathVM entrypoint must return one value");
 
         wasm_valkind_t result_type{};
         wasm_func_get_result_types(function, module_inst, &result_type);
         if (result_type != WASM_I64)
-            throw std::runtime_error("MathVM v1 entrypoint must return i64");
+            throw std::runtime_error("MathVM entrypoint must return i64");
 
         exec_env = wasm_runtime_create_exec_env(module_inst, limits_.stack_bytes);
         if (!exec_env)
-            throw std::runtime_error("failed to create WAMR execution environment");
+            throw std::runtime_error(
+                "failed to create WAMR execution environment");
 
         wasm_runtime_set_instruction_count_limit(
             exec_env, limits_.max_wasm_instructions);

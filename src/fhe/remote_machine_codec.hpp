@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +13,7 @@ namespace v0id::fhe {
 
 using ByteBlob = std::vector<std::uint8_t>;
 using DigestBlob32 = std::array<ByteBlob, 32>;
+using EvaluatorSessionId = std::array<std::uint8_t, 32>;
 
 struct PublicMachineShape {
     std::uint64_t states{};
@@ -35,15 +37,25 @@ struct CryptoProfileId {
     bool operator==(const CryptoProfileId&) const = default;
 };
 
-// Everything in this structure is evaluator-visible. Secret-key material, the
-// private polymorphic series/seed and client MorphManifest are absent.
-struct RemoteMachineBundle {
-    PublicMachineShape shape;
-    CryptoProfileId profile;
-
+// Process-local evaluator setup. This is the expensive material that should be
+// installed once and reused by many jobs. It deliberately contains no client
+// secret key and no private series/morph manifest.
+struct EvaluatorSessionBundle {
+    EvaluatorSessionId session_id{};
+    std::string primitive_id;
+    std::string parameter_set;
     ByteBlob context;
     ByteBlob refresh_key;
     ByteBlob switching_key;
+};
+
+// Everything in this structure is evaluator-visible. V0.4.3/RMJ3 references a
+// previously installed evaluator session rather than embedding the huge BinFHE
+// context/bootstrap material in every job.
+struct RemoteMachineBundle {
+    EvaluatorSessionId session_id{};
+    PublicMachineShape shape;
+    CryptoProfileId profile;
 
     // One independently encrypted zero used only as an accumulator seed.
     ByteBlob encrypted_zero;
@@ -61,6 +73,7 @@ struct RemoteMachineBundle {
 };
 
 struct RemoteMachineResult {
+    EvaluatorSessionId session_id{};
     PublicMachineShape shape;
     CryptoProfileId profile;
     std::vector<ByteBlob> state_bits;
@@ -71,10 +84,12 @@ struct RemoteMachineResult {
 
 namespace remote_detail {
 
+inline constexpr std::array<std::uint8_t, 8> SESSION_MAGIC{
+    'V','0','I','D','R','M','S','3'};
 inline constexpr std::array<std::uint8_t, 8> JOB_MAGIC{
-    'V','0','I','D','R','M','J','2'};
+    'V','0','I','D','R','M','J','3'};
 inline constexpr std::array<std::uint8_t, 8> RESULT_MAGIC{
-    'V','0','I','D','R','M','R','2'};
+    'V','0','I','D','R','M','R','3'};
 
 inline constexpr std::uint64_t MAX_STATES = 128;
 inline constexpr std::uint64_t MAX_TAPE_CELLS = 65536;
@@ -112,6 +127,24 @@ inline void validate_profile(const CryptoProfileId& profile) {
         throw std::runtime_error("series generator version must be positive");
 }
 
+inline void validate_session_id(const EvaluatorSessionId& session_id) {
+    if (std::all_of(session_id.begin(), session_id.end(),
+                    [](std::uint8_t b) { return b == 0; }))
+        throw std::runtime_error("evaluator session id must not be all zero");
+}
+
+inline void validate_session_bundle(const EvaluatorSessionBundle& bundle) {
+    validate_session_id(bundle.session_id);
+    validate_profile_field(bundle.primitive_id, "evaluator primitive id");
+    validate_profile_field(bundle.parameter_set, "evaluator parameter set");
+    if (bundle.context.empty())
+        throw std::runtime_error("evaluator session context must not be empty");
+    if (bundle.refresh_key.empty())
+        throw std::runtime_error("evaluator session refresh key must not be empty");
+    if (bundle.switching_key.empty())
+        throw std::runtime_error("evaluator session switching key must not be empty");
+}
+
 inline std::size_t checked_size(std::uint64_t value, const char* what) {
     if (value > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
         throw std::runtime_error(what);
@@ -137,6 +170,22 @@ inline std::uint64_t get_u64(const std::uint8_t*& p, const std::uint8_t* end) {
         value = (value << 8) | p[i];
     p += 8;
     return value;
+}
+
+inline void put_session_id(ByteBlob& out, const EvaluatorSessionId& session_id) {
+    validate_session_id(session_id);
+    out.insert(out.end(), session_id.begin(), session_id.end());
+}
+
+inline EvaluatorSessionId get_session_id(const std::uint8_t*& p,
+                                         const std::uint8_t* end) {
+    if (end - p < static_cast<std::ptrdiff_t>(EvaluatorSessionId{}.size()))
+        throw std::runtime_error("truncated evaluator session id");
+    EvaluatorSessionId session_id{};
+    std::copy_n(p, session_id.size(), session_id.begin());
+    p += session_id.size();
+    validate_session_id(session_id);
+    return session_id;
 }
 
 inline void put_shape(ByteBlob& out, const PublicMachineShape& shape) {
@@ -254,8 +303,49 @@ inline void require_exact_size(std::size_t actual,
 
 } // namespace remote_detail
 
+inline ByteBlob pack_evaluator_session_bundle(const EvaluatorSessionBundle& bundle) {
+    using namespace remote_detail;
+    validate_session_bundle(bundle);
+
+    ByteBlob out;
+    out.insert(out.end(), SESSION_MAGIC.begin(), SESSION_MAGIC.end());
+    put_session_id(out, bundle.session_id);
+    put_string(out, bundle.primitive_id, "evaluator primitive id");
+    put_string(out, bundle.parameter_set, "evaluator parameter set");
+    append_blob(out, bundle.context);
+    append_blob(out, bundle.refresh_key);
+    append_blob(out, bundle.switching_key);
+    return out;
+}
+
+inline EvaluatorSessionBundle unpack_evaluator_session_bundle(const ByteBlob& wire) {
+    using namespace remote_detail;
+    if (wire.size() > MAX_WIRE_BYTES)
+        throw std::runtime_error("V0ID evaluator session payload exceeds limit");
+    if (wire.size() < SESSION_MAGIC.size() + EvaluatorSessionId{}.size())
+        throw std::runtime_error("V0ID evaluator session bundle too short");
+
+    const auto* p = wire.data();
+    const auto* end = p + wire.size();
+    require_magic(p, end, SESSION_MAGIC);
+
+    EvaluatorSessionBundle bundle;
+    bundle.session_id = get_session_id(p, end);
+    bundle.primitive_id = get_string(p, end, "evaluator primitive id");
+    bundle.parameter_set = get_string(p, end, "evaluator parameter set");
+    bundle.context = read_blob(p, end);
+    bundle.refresh_key = read_blob(p, end);
+    bundle.switching_key = read_blob(p, end);
+    validate_session_bundle(bundle);
+
+    if (p != end)
+        throw std::runtime_error("trailing bytes in V0ID evaluator session bundle");
+    return bundle;
+}
+
 inline ByteBlob pack_remote_machine_bundle(const RemoteMachineBundle& bundle) {
     using namespace remote_detail;
+    validate_session_id(bundle.session_id);
     validate_shape(bundle.shape);
     validate_profile(bundle.profile);
 
@@ -273,12 +363,9 @@ inline ByteBlob pack_remote_machine_bundle(const RemoteMachineBundle& bundle) {
 
     ByteBlob out;
     out.insert(out.end(), JOB_MAGIC.begin(), JOB_MAGIC.end());
+    put_session_id(out, bundle.session_id);
     put_shape(out, bundle.shape);
     put_profile(out, bundle.profile);
-
-    append_blob(out, bundle.context);
-    append_blob(out, bundle.refresh_key);
-    append_blob(out, bundle.switching_key);
     append_blob(out, bundle.encrypted_zero);
 
     for (const auto& blob : bundle.program_bits) append_blob(out, blob);
@@ -297,7 +384,8 @@ inline RemoteMachineBundle unpack_remote_machine_bundle(const ByteBlob& wire) {
     using namespace remote_detail;
     if (wire.size() > MAX_WIRE_BYTES)
         throw std::runtime_error("V0ID remote machine wire payload exceeds limit");
-    if (wire.size() < JOB_MAGIC.size() + 4 * sizeof(std::uint64_t))
+    if (wire.size() < JOB_MAGIC.size() + EvaluatorSessionId{}.size() +
+                          4 * sizeof(std::uint64_t))
         throw std::runtime_error("V0ID remote machine bundle too short");
 
     const auto* p = wire.data();
@@ -305,11 +393,9 @@ inline RemoteMachineBundle unpack_remote_machine_bundle(const ByteBlob& wire) {
     require_magic(p, end, JOB_MAGIC);
 
     RemoteMachineBundle bundle;
+    bundle.session_id = get_session_id(p, end);
     bundle.shape = get_shape(p, end);
     bundle.profile = get_profile(p, end);
-    bundle.context = read_blob(p, end);
-    bundle.refresh_key = read_blob(p, end);
-    bundle.switching_key = read_blob(p, end);
     bundle.encrypted_zero = read_blob(p, end);
 
     bundle.program_bits.resize(program_bit_count(bundle.shape));
@@ -339,6 +425,7 @@ inline RemoteMachineBundle unpack_remote_machine_bundle(const ByteBlob& wire) {
 
 inline ByteBlob pack_remote_machine_result(const RemoteMachineResult& result) {
     using namespace remote_detail;
+    validate_session_id(result.session_id);
     validate_shape(result.shape);
     validate_profile(result.profile);
     require_exact_size(result.state_bits.size(), checked_size(result.shape.states, "state count overflow"),
@@ -353,6 +440,7 @@ inline ByteBlob pack_remote_machine_result(const RemoteMachineResult& result) {
 
     ByteBlob out;
     out.insert(out.end(), RESULT_MAGIC.begin(), RESULT_MAGIC.end());
+    put_session_id(out, result.session_id);
     put_shape(out, result.shape);
     put_profile(out, result.profile);
     for (const auto& blob : result.state_bits) append_blob(out, blob);
@@ -367,7 +455,8 @@ inline RemoteMachineResult unpack_remote_machine_result(const ByteBlob& wire) {
     using namespace remote_detail;
     if (wire.size() > MAX_WIRE_BYTES)
         throw std::runtime_error("V0ID remote machine result exceeds limit");
-    if (wire.size() < RESULT_MAGIC.size() + 4 * sizeof(std::uint64_t))
+    if (wire.size() < RESULT_MAGIC.size() + EvaluatorSessionId{}.size() +
+                          4 * sizeof(std::uint64_t))
         throw std::runtime_error("V0ID remote machine result too short");
 
     const auto* p = wire.data();
@@ -375,6 +464,7 @@ inline RemoteMachineResult unpack_remote_machine_result(const ByteBlob& wire) {
     require_magic(p, end, RESULT_MAGIC);
 
     RemoteMachineResult result;
+    result.session_id = get_session_id(p, end);
     result.shape = get_shape(p, end);
     result.profile = get_profile(p, end);
 

@@ -45,7 +45,7 @@ option(V0ID_ENABLE_MATHVM "Build the WAMR-backed V0ID sandbox components" ON)
 if(V0ID_ENABLE_MATHVM)
     FetchContent_Declare(
         wamr
-        GIT_REPOSITORY https://github.com/wasm-micro-runtime/wasm-micro-runtime.git
+        GIT_REPOSITORY https://github.com/bytecodealliance/wasm-micro-runtime.git
         GIT_TAG WAMR-2.4.0
         GIT_SHALLOW TRUE
         SOURCE_SUBDIR doc
@@ -249,9 +249,18 @@ target_include_directories(v0id PRIVATE src/integrity)
 target_link_libraries(v0id PRIVATE v0id_core v0id_quine OpenSSL::Crypto)
 v0id_use_openfhe(v0id)
 
-add_library(v0id_net src/net/peer_transport.cpp)
+# ZeroMQ remains the transport framing layer. Optional content-addressed Wasm
+# synchronization uses OpenSSL SHA3-512 for exact module identity; executable
+# validation remains the responsibility of WAMR/MathVM after receipt.
+add_library(v0id_net
+    src/net/peer_transport.cpp
+    src/net/module_sync.cpp
+)
 target_include_directories(v0id_net PUBLIC src/net)
-target_link_libraries(v0id_net PUBLIC cppzmq)
+target_link_libraries(v0id_net PUBLIC cppzmq OpenSSL::Crypto)
+
+add_executable(v0id-module-sync-tests src/net/module_sync_tests.cpp)
+target_link_libraries(v0id-module-sync-tests PRIVATE v0id_net)
 
 add_executable(v0id-peer src/net/peer_demo.cpp)
 target_link_libraries(v0id-peer PRIVATE v0id_net)

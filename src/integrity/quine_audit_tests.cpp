@@ -122,10 +122,10 @@ int main() try {
         v0id::integrity::sha3_512_bytes(abc));
     tests.expect(
         abc_digest ==
-            "b751850b1a57168a5693cd924b6b096e080f621827444f70d884f5d0240d2712"
+            "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712"
             "e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0",
         "OpenSSL SHA3-512 matches abc known answer",
-        "unexpected SHA3-512 digest");
+        "unexpected SHA3-512 digest: " + abc_digest);
 
     const Program semantic = increment_program();
     const std::vector<int> tape{1,0,1,1,0,0,0,0};

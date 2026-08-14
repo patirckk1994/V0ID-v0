@@ -137,13 +137,14 @@ function(v0id_use_openfhe target)
     target_link_libraries(${target} PRIVATE ${V0ID_OPENFHE_LIBRARIES})
 endfunction()
 
-# Series-first core: issuer-private KMACXOF schedule, trusted ProgramMorpher, and
-# a transcript-bound post-KEM schedule. The KEM still supplies shared hardness;
-# the issuer-only root remains separate so a peer cannot predict polymorphism.
+# Series-first core: issuer-private KMACXOF schedule, trusted ProgramMorpher,
+# transcript-bound post-KEM scheduling, and a whole-stack purpose schedule where
+# purpose series are derived before concrete algorithm identifiers are chosen.
 add_library(v0id_core
     src/polymorph/program_morpher.cpp
     src/polymorph/series_generator.cpp
     src/crypto/series_first_schedule.cpp
+    src/crypto/series_first_stack.cpp
 )
 target_include_directories(v0id_core PUBLIC
     src/core
@@ -156,6 +157,19 @@ add_executable(v0id-series-first-kex-tests
     src/crypto/series_first_schedule_tests.cpp
 )
 target_link_libraries(v0id-series-first-kex-tests PRIVATE v0id_core)
+
+add_executable(v0id-series-first-stack-tests
+    src/crypto/series_first_stack_tests.cpp
+)
+target_link_libraries(v0id-series-first-stack-tests PRIVATE v0id_core)
+
+# Real standardized KEM composition gate. OpenSSL 3.5+ supplies ML-KEM-768;
+# when the provider is unavailable the executable reports SKIP rather than
+# pretending a synthetic shared secret exercised the KEM runtime.
+add_executable(v0id-series-first-mlkem-tests
+    src/crypto/series_first_mlkem_tests.cpp
+)
+target_link_libraries(v0id-series-first-mlkem-tests PRIVATE v0id_core OpenSSL::Crypto)
 
 # PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
 # semantic job, exact generator implementation, morphed executable, profile,

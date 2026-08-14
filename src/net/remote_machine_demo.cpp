@@ -9,14 +9,18 @@
 
 #include "binfhecontext.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -30,12 +34,15 @@ constexpr std::size_t PUBLIC_STATES = 4;
 constexpr std::size_t TAPE_CELLS = 8;
 constexpr std::size_t FIXED_ROUNDS = 4;
 constexpr std::size_t INTEGRITY_SLOTS = 4;
+constexpr std::size_t MAX_CACHED_EVALUATOR_SESSIONS = 4;
 constexpr std::uint64_t DEMO_EPOCH = 1;
 
 using v0id::core::Program;
 using v0id::fhe::ByteBlob;
 using v0id::fhe::CryptoProfileId;
 using v0id::fhe::DigestBlob32;
+using v0id::fhe::EvaluatorSessionBundle;
+using v0id::fhe::EvaluatorSessionId;
 using v0id::fhe::PublicMachineShape;
 using v0id::fhe::RemoteEncryptedMachine;
 using v0id::fhe::RemoteMachineBundle;
@@ -46,13 +53,21 @@ using v0id::polymorph::MorphedProgram;
 using v0id::polymorph::ProgramMorpher;
 using v0id::polymorph::SeriesProfile;
 
+struct CachedEvaluatorSession {
+    std::string primitive_id;
+    std::string parameter_set;
+    BinFHEContext cc;
+    RingGSWACCKey refresh_key;
+    LWESwitchingKey switching_key;
+};
+
 void usage(const char* argv0) {
     std::cerr
         << "usage:\n"
-        << "  " << argv0 << " server <peer-id> <bind-endpoint> [count]\n"
+        << "  " << argv0 << " server <peer-id> <bind-endpoint> [job-count]\n"
         << "  " << argv0 << " client <peer-id> <connect-endpoint>\n\n"
-        << "client privately derives a polymorphic series, uses it to morph and\n"
-        << "encrypt an 8-cell increment machine, then sends the encrypted machine.\n"
+        << "The client installs expensive BinFHE evaluator material once, then\n"
+        << "sends an RMJ3 encrypted-machine job that references that cached session.\n"
         << "The server executes four fixed BinFHE rounds and returns encrypted\n"
         << "machine state plus four masked integrity candidates. The private series,\n"
         << "series seed, MorphManifest and LWE secret key never leave the client.\n";
@@ -71,7 +86,7 @@ CryptoProfileId demo_profile(const SeriesProfile& series) {
     return CryptoProfileId{
         "openfhe-binfhe",
         "STD128",
-        "v0id-remote-machine-v2",
+        "v0id-remote-machine-v3",
         "toy-fingerprint32-v1",
         series.generator_id,
         series.version,
@@ -83,7 +98,7 @@ void require_supported_execution_profile(const CryptoProfileId& profile) {
         throw std::runtime_error("unsupported FHE primitive profile");
     if (profile.parameter_set != "STD128")
         throw std::runtime_error("unsupported BinFHE parameter profile");
-    if (profile.machine_protocol != "v0id-remote-machine-v2")
+    if (profile.machine_protocol != "v0id-remote-machine-v3")
         throw std::runtime_error("unsupported remote machine protocol profile");
     if (profile.integrity_profile != "toy-fingerprint32-v1")
         throw std::runtime_error("unsupported integrity profile");
@@ -93,11 +108,51 @@ void require_supported_execution_profile(const CryptoProfileId& profile) {
     // provenance for future capability negotiation and correlation experiments.
 }
 
+void require_supported_session_profile(const EvaluatorSessionBundle& session) {
+    if (session.primitive_id != "openfhe-binfhe")
+        throw std::runtime_error("unsupported evaluator-session FHE primitive");
+    if (session.parameter_set != "STD128")
+        throw std::runtime_error("unsupported evaluator-session parameter set");
+}
+
 bool same_shape(const PublicMachineShape& a, const PublicMachineShape& b) {
     return a.states == b.states &&
            a.tape_cells == b.tape_cells &&
            a.rounds == b.rounds &&
            a.integrity_slots == b.integrity_slots;
+}
+
+EvaluatorSessionId random_evaluator_session_id() {
+    const auto entropy = v0id::polymorph::random_series_seed();
+    EvaluatorSessionId id{};
+    std::copy(entropy.begin(), entropy.end(), id.begin());
+    return id;
+}
+
+std::string session_key(const EvaluatorSessionId& id) {
+    return std::string(reinterpret_cast<const char*>(id.data()), id.size());
+}
+
+std::string session_id_hex(const EvaluatorSessionId& id) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (const auto byte : id)
+        out << std::setw(2) << static_cast<unsigned>(byte);
+    return out.str();
+}
+
+ByteBlob session_id_payload(const EvaluatorSessionId& id) {
+    return ByteBlob(id.begin(), id.end());
+}
+
+void require_session_ready_reply(const Envelope& reply,
+                                 const EvaluatorSessionId& expected) {
+    if (reply.type == MessageType::error)
+        throw std::runtime_error("evaluator session install failed: " + text(reply.payload));
+    if (reply.type != MessageType::evaluator_session_ready)
+        throw std::runtime_error("unexpected evaluator-session reply type");
+    if (reply.payload != session_id_payload(expected))
+        throw std::runtime_error("evaluator-session acknowledgement id mismatch");
 }
 
 std::vector<int> run_plaintext(const Program& program,
@@ -191,114 +246,165 @@ int run_server(const std::string& peer_id,
                const std::string& endpoint,
                int count) {
     PeerServer server(endpoint, REMOTE_MACHINE_TIMEOUT_MS);
-    std::cout << "V0ID remote-machine evaluator " << peer_id
-              << " listening on " << endpoint << '\n';
+    std::unordered_map<std::string, std::unique_ptr<CachedEvaluatorSession>> sessions;
 
-    for (int request_index = 0; request_index < count; ++request_index) {
+    std::cout << "V0ID remote-machine evaluator " << peer_id
+              << " listening on " << endpoint << '\n'
+              << "evaluator cache slots : " << MAX_CACHED_EVALUATOR_SESSIONS << '\n';
+
+    int job_requests = 0;
+    while (job_requests < count) {
         const auto request = server.receive();
+        const bool counts_as_job = request.type == MessageType::execute_job;
+
         Envelope reply;
         reply.peer_id = peer_id;
         reply.job_id = request.job_id;
         reply.epoch = request.epoch;
 
         try {
-            if (request.type != MessageType::execute_job)
-                throw std::runtime_error("expected EXECUTE_JOB");
+            if (request.type == MessageType::install_evaluator_session) {
+                const auto setup =
+                    v0id::fhe::unpack_evaluator_session_bundle(request.payload);
+                require_supported_session_profile(setup);
 
-            const auto bundle = v0id::fhe::unpack_remote_machine_bundle(request.payload);
-            require_supported_execution_profile(bundle.profile);
-            const auto& shape = bundle.shape;
+                const auto key = session_key(setup.session_id);
+                if (sessions.contains(key))
+                    throw std::runtime_error("evaluator session id already installed");
+                if (sessions.size() >= MAX_CACHED_EVALUATOR_SESSIONS)
+                    throw std::runtime_error("evaluator session cache is full");
 
-            std::cout << "job=" << request.job_id
-                      << " from=" << request.peer_id
-                      << " states=" << shape.states
-                      << " tape=" << shape.tape_cells
-                      << " rounds=" << shape.rounds
-                      << " integrity-slots=" << shape.integrity_slots << '\n';
-            std::cout << "crypto profile       : "
-                      << bundle.profile.primitive_id << '/'
-                      << bundle.profile.parameter_set << " | "
-                      << bundle.profile.machine_protocol << " | "
-                      << bundle.profile.integrity_profile << '\n';
-            std::cout << "series profile       : "
-                      << bundle.profile.series_generator_id << "/v"
-                      << bundle.profile.series_generator_version << '\n';
-            std::cout << "private series recv  : NO\n"
-                      << "series seed received : NO\n"
-                      << "manifest received    : NO\n"
-                      << "secret key received  : NO\n";
+                auto cached = std::make_unique<CachedEvaluatorSession>();
+                cached->primitive_id = setup.primitive_id;
+                cached->parameter_set = setup.parameter_set;
+                v0id::fhe::deserialize_binary(setup.context, cached->cc);
+                v0id::fhe::deserialize_binary(setup.refresh_key, cached->refresh_key);
+                v0id::fhe::deserialize_binary(setup.switching_key, cached->switching_key);
+                cached->cc.BTKeyLoad({cached->refresh_key, cached->switching_key});
 
-            BinFHEContext cc;
-            RingGSWACCKey refresh_key;
-            LWESwitchingKey switching_key;
-            LWECiphertext encrypted_zero;
+                const auto short_id = session_id_hex(setup.session_id).substr(0, 16);
+                sessions.emplace(key, std::move(cached));
 
-            v0id::fhe::deserialize_binary(bundle.context, cc);
-            v0id::fhe::deserialize_binary(bundle.refresh_key, refresh_key);
-            v0id::fhe::deserialize_binary(bundle.switching_key, switching_key);
-            v0id::fhe::deserialize_binary(bundle.encrypted_zero, encrypted_zero);
-            cc.BTKeyLoad({refresh_key, switching_key});
+                reply.type = MessageType::evaluator_session_ready;
+                reply.payload = session_id_payload(setup.session_id);
 
-            auto program_bits = deserialize_ciphertexts(bundle.program_bits);
-            auto state_bits = deserialize_ciphertexts(bundle.state_bits);
-            auto head_bits = deserialize_ciphertexts(bundle.head_bits);
-            auto tape_bits = deserialize_ciphertexts(bundle.tape_bits);
-
-            // Preserve the received initial tape for the job-image fingerprint;
-            // the machine evaluator replaces its own tape vector as it executes.
-            const auto fingerprint_input = tape_bits;
-            const auto nonce_bits = deserialize_digest(bundle.nonce_bits);
-            const auto fingerprint_initial_state =
-                deserialize_digest(bundle.fingerprint_initial_state_bits);
-
-            std::vector<EncryptedDigest32> mask_bits;
-            mask_bits.reserve(bundle.integrity_mask_bits.size());
-            for (const auto& mask : bundle.integrity_mask_bits)
-                mask_bits.push_back(deserialize_digest(mask));
-
-            std::cout << "computing encrypted self-fingerprint...\n";
-            const auto digest = v0id::integrity::toy_fingerprint32_fhe(
-                cc, program_bits, fingerprint_input, nonce_bits,
-                fingerprint_initial_state);
-
-            std::vector<EncryptedDigest32> candidates;
-            candidates.reserve(mask_bits.size());
-            for (const auto& mask : mask_bits)
-                candidates.push_back(v0id::integrity::mask_digest_fhe(cc, digest, mask));
-
-            RemoteEncryptedMachine machine(
-                cc, shape, std::move(program_bits), std::move(state_bits),
-                std::move(head_bits), std::move(tape_bits),
-                std::move(encrypted_zero));
-
-            for (std::uint64_t round = 0; round < shape.rounds; ++round) {
-                std::cout << "executing public round " << (round + 1)
-                          << '/' << shape.rounds << "...\n" << std::flush;
-                machine.step();
+                std::cout << "installed evaluator session=" << short_id
+                          << " setup-bytes=" << request.payload.size()
+                          << " cached-sessions=" << sessions.size() << '\n'
+                          << "  primitive          : " << setup.primitive_id << '\n'
+                          << "  parameter set      : " << setup.parameter_set << '\n'
+                          << "  secret key received: NO\n";
             }
+            else if (request.type == MessageType::execute_job) {
+                const auto bundle =
+                    v0id::fhe::unpack_remote_machine_bundle(request.payload);
+                require_supported_execution_profile(bundle.profile);
 
-            RemoteMachineResult result;
-            result.shape = shape;
-            result.profile = bundle.profile;
-            result.state_bits = serialize_ciphertexts(machine.state_bits());
-            result.head_bits = serialize_ciphertexts(machine.head_bits());
-            result.tape_bits = serialize_ciphertexts(machine.tape_bits());
-            result.integrity_candidates.reserve(candidates.size());
-            for (const auto& candidate : candidates)
-                result.integrity_candidates.push_back(serialize_digest(candidate));
+                const auto it = sessions.find(session_key(bundle.session_id));
+                if (it == sessions.end())
+                    throw std::runtime_error("RMJ3 references unknown evaluator session");
+                auto& cached = *it->second;
 
-            reply.type = MessageType::job_result;
-            reply.payload = v0id::fhe::pack_remote_machine_result(result);
+                if (bundle.profile.primitive_id != cached.primitive_id ||
+                    bundle.profile.parameter_set != cached.parameter_set)
+                    throw std::runtime_error(
+                        "RMJ3 crypto profile does not match cached evaluator session");
 
-            std::cout << "remote encrypted machine complete; result bytes="
-                      << reply.payload.size() << '\n';
+                const auto& shape = bundle.shape;
+                std::cout << "job=" << request.job_id
+                          << " from=" << request.peer_id
+                          << " session=" << session_id_hex(bundle.session_id).substr(0, 16)
+                          << " job-bytes=" << request.payload.size()
+                          << " states=" << shape.states
+                          << " tape=" << shape.tape_cells
+                          << " rounds=" << shape.rounds
+                          << " integrity-slots=" << shape.integrity_slots << '\n';
+                std::cout << "crypto profile       : "
+                          << bundle.profile.primitive_id << '/'
+                          << bundle.profile.parameter_set << " | "
+                          << bundle.profile.machine_protocol << " | "
+                          << bundle.profile.integrity_profile << '\n';
+                std::cout << "series profile       : "
+                          << bundle.profile.series_generator_id << "/v"
+                          << bundle.profile.series_generator_version << '\n';
+                std::cout << "cached evaluator keys: YES\n"
+                          << "private series recv  : NO\n"
+                          << "series seed received : NO\n"
+                          << "manifest received    : NO\n"
+                          << "secret key received  : NO\n";
+
+                auto& cc = cached.cc;
+                LWECiphertext encrypted_zero;
+                v0id::fhe::deserialize_binary(bundle.encrypted_zero, encrypted_zero);
+
+                auto program_bits = deserialize_ciphertexts(bundle.program_bits);
+                auto state_bits = deserialize_ciphertexts(bundle.state_bits);
+                auto head_bits = deserialize_ciphertexts(bundle.head_bits);
+                auto tape_bits = deserialize_ciphertexts(bundle.tape_bits);
+
+                // Preserve the received initial tape for the job-image fingerprint;
+                // the machine evaluator replaces its own tape vector as it executes.
+                const auto fingerprint_input = tape_bits;
+                const auto nonce_bits = deserialize_digest(bundle.nonce_bits);
+                const auto fingerprint_initial_state =
+                    deserialize_digest(bundle.fingerprint_initial_state_bits);
+
+                std::vector<EncryptedDigest32> mask_bits;
+                mask_bits.reserve(bundle.integrity_mask_bits.size());
+                for (const auto& mask : bundle.integrity_mask_bits)
+                    mask_bits.push_back(deserialize_digest(mask));
+
+                std::cout << "computing encrypted self-fingerprint...\n";
+                const auto digest = v0id::integrity::toy_fingerprint32_fhe(
+                    cc, program_bits, fingerprint_input, nonce_bits,
+                    fingerprint_initial_state);
+
+                std::vector<EncryptedDigest32> candidates;
+                candidates.reserve(mask_bits.size());
+                for (const auto& mask : mask_bits)
+                    candidates.push_back(v0id::integrity::mask_digest_fhe(cc, digest, mask));
+
+                RemoteEncryptedMachine machine(
+                    cc, shape, std::move(program_bits), std::move(state_bits),
+                    std::move(head_bits), std::move(tape_bits),
+                    std::move(encrypted_zero));
+
+                for (std::uint64_t round = 0; round < shape.rounds; ++round) {
+                    std::cout << "executing public round " << (round + 1)
+                              << '/' << shape.rounds << "...\n" << std::flush;
+                    machine.step();
+                }
+
+                RemoteMachineResult result;
+                result.session_id = bundle.session_id;
+                result.shape = shape;
+                result.profile = bundle.profile;
+                result.state_bits = serialize_ciphertexts(machine.state_bits());
+                result.head_bits = serialize_ciphertexts(machine.head_bits());
+                result.tape_bits = serialize_ciphertexts(machine.tape_bits());
+                result.integrity_candidates.reserve(candidates.size());
+                for (const auto& candidate : candidates)
+                    result.integrity_candidates.push_back(serialize_digest(candidate));
+
+                reply.type = MessageType::job_result;
+                reply.payload = v0id::fhe::pack_remote_machine_result(result);
+
+                std::cout << "remote encrypted machine complete; result bytes="
+                          << reply.payload.size() << '\n';
+            }
+            else {
+                throw std::runtime_error(
+                    "expected INSTALL_EVALUATOR_SESSION or EXECUTE_JOB");
+            }
         } catch (const std::exception& e) {
             reply.type = MessageType::error;
             reply.payload = bytes(e.what());
-            std::cerr << "remote evaluator job failed: " << e.what() << '\n';
+            std::cerr << "remote evaluator request failed: " << e.what() << '\n';
         }
 
         server.reply(reply);
+        if (counts_as_job)
+            ++job_requests;
     }
 
     return 0;
@@ -353,6 +459,37 @@ int run_client(const std::string& peer_id,
     std::cout << "generating OpenFHE bootstrapping keys...\n" << std::flush;
     cc.BTKeyGen(sk);
 
+    // V0.4.3 installs the expensive evaluator material once. The session id is
+    // fresh public routing state and is deliberately independent of SeriesSeed.
+    const auto evaluator_session_id = random_evaluator_session_id();
+    EvaluatorSessionBundle setup;
+    setup.session_id = evaluator_session_id;
+    setup.primitive_id = "openfhe-binfhe";
+    setup.parameter_set = "STD128";
+    setup.context = v0id::fhe::serialize_binary(cc);
+    setup.refresh_key = v0id::fhe::serialize_binary(cc.GetRefreshKey());
+    setup.switching_key = v0id::fhe::serialize_binary(cc.GetSwitchKey());
+
+    Envelope setup_request;
+    setup_request.type = MessageType::install_evaluator_session;
+    setup_request.peer_id = peer_id;
+    setup_request.job_id = "v0id-v043-evaluator-session";
+    setup_request.epoch = DEMO_EPOCH;
+    setup_request.payload = v0id::fhe::pack_evaluator_session_bundle(setup);
+
+    std::cout << "evaluator session id : "
+              << session_id_hex(evaluator_session_id).substr(0, 16) << "...\n"
+              << "session setup bytes  : " << setup_request.payload.size() << '\n'
+              << "  context bytes      : " << setup.context.size() << '\n'
+              << "  refresh key bytes  : " << setup.refresh_key.size() << '\n'
+              << "  switching key bytes: " << setup.switching_key.size() << '\n'
+              << "installing evaluator material once...\n" << std::flush;
+
+    PeerClient client(endpoint, REMOTE_MACHINE_TIMEOUT_MS);
+    const auto setup_reply = client.round_trip(setup_request);
+    require_session_ready_reply(setup_reply, evaluator_session_id);
+    std::cout << "evaluator session    : READY / cached remotely\n";
+
     const auto plain_program_bits = v0id::integrity::canonical_program_bits(morph.program);
     const auto encrypted_program_bits =
         v0id::integrity::encrypt_plain_bits(cc, sk, plain_program_bits);
@@ -381,11 +518,9 @@ int run_client(const std::string& peer_id,
         encrypted_masks.push_back(v0id::integrity::encrypt_u32_bits(cc, sk, mask));
 
     RemoteMachineBundle bundle;
+    bundle.session_id = evaluator_session_id;
     bundle.shape = demo_shape();
     bundle.profile = demo_profile(series_profile);
-    bundle.context = v0id::fhe::serialize_binary(cc);
-    bundle.refresh_key = v0id::fhe::serialize_binary(cc.GetRefreshKey());
-    bundle.switching_key = v0id::fhe::serialize_binary(cc.GetSwitchKey());
     bundle.encrypted_zero = v0id::fhe::serialize_binary(cc.Encrypt(sk, 0));
     bundle.program_bits = serialize_ciphertexts(encrypted_program_bits);
     bundle.state_bits = serialize_ciphertexts(encrypted_state);
@@ -401,18 +536,18 @@ int run_client(const std::string& peer_id,
     Envelope request;
     request.type = MessageType::execute_job;
     request.peer_id = peer_id;
-    request.job_id = "v0id-v041-series-first-remote-increment";
+    request.job_id = "v0id-v043-cached-series-first-remote-increment";
     request.epoch = DEMO_EPOCH;
     request.payload = v0id::fhe::pack_remote_machine_bundle(bundle);
 
-    std::cout << "remote job bytes     : " << request.payload.size() << '\n'
+    std::cout << "RMJ3 per-job bytes    : " << request.payload.size() << '\n'
+              << "cached setup resent  : NO\n"
               << "sending private series: NO\n"
               << "sending series seed  : NO\n"
               << "sending MorphManifest: NO\n"
               << "sending secret key   : NO\n"
               << "waiting for remote fixed-path evaluation...\n" << std::flush;
 
-    PeerClient client(endpoint, REMOTE_MACHINE_TIMEOUT_MS);
     const auto reply = client.round_trip(request);
     if (reply.type == MessageType::error)
         throw std::runtime_error("remote evaluator error: " + text(reply.payload));
@@ -420,6 +555,8 @@ int run_client(const std::string& peer_id,
         throw std::runtime_error("unexpected remote-machine reply type");
 
     const auto result = v0id::fhe::unpack_remote_machine_result(reply.payload);
+    if (result.session_id != evaluator_session_id)
+        throw std::runtime_error("remote result evaluator session mismatch");
     if (!same_shape(result.shape, bundle.shape))
         throw std::runtime_error("remote result public shape mismatch");
     if (!(result.profile == bundle.profile))
@@ -447,7 +584,9 @@ int run_client(const std::string& peer_id,
     if (recovered_digest != expected_digest)
         throw std::runtime_error("remote encrypted self-fingerprint mismatch");
 
-    std::cout << "OK: series-derived morphed encrypted machine executed remotely\n"
+    std::cout << "OK: cached series-derived morphed encrypted machine executed remotely\n"
+                 "    + expensive BinFHE evaluator material installed once\n"
+                 "    + RMJ3 job references process-local evaluator session\n"
                  "    + private series derived before ProgramMorpher\n"
                  "    + public crypto/profile identifiers round-tripped\n"
                  "    + encrypted program/state/head/tape crossed the network\n"
@@ -475,7 +614,7 @@ int main(int argc, char** argv) try {
     if (mode == "server") {
         const int count = argc >= 5 ? std::stoi(argv[4]) : 1;
         if (count <= 0)
-            throw std::runtime_error("count must be positive");
+            throw std::runtime_error("job-count must be positive");
         return run_server(peer_id, endpoint, count);
     }
 

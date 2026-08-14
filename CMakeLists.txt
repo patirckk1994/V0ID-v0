@@ -68,7 +68,11 @@ target_include_directories(v0id_core PUBLIC
 )
 target_link_libraries(v0id_core PUBLIC OpenSSL::Crypto)
 
-add_executable(v0id src/main.cpp)
+add_executable(v0id
+    src/main.cpp
+    src/integrity/toy_fingerprint.cpp
+)
+target_include_directories(v0id PRIVATE src/integrity)
 target_link_libraries(v0id PRIVATE v0id_core OpenSSL::Crypto)
 v0id_use_openfhe(v0id)
 

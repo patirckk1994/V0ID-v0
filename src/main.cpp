@@ -7,6 +7,7 @@
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,67 @@ struct Program {
         for (int n : seen)
             if (n != 1) throw std::runtime_error("need exactly one rule per (state, bit)");
     }
+
+    const Rule& rule(std::size_t state, int read) const {
+        for (const auto& r : rules)
+            if (r.state == state && r.read == read) return r;
+        throw std::runtime_error("missing transition rule");
+    }
+};
+
+// Public shape, encrypted semantics. The evaluator learns the number of states,
+// binary alphabet and fixed work budget, but not next-state/write/move choices.
+struct EncryptedTransition {
+    std::vector<LWECiphertext> next_state; // encrypted one-hot selector
+    LWECiphertext write_one;
+    LWECiphertext move_left;
+    LWECiphertext move_stay;
+    LWECiphertext move_right;
+};
+
+class EncryptedProgram {
+public:
+    static EncryptedProgram encrypt(BinFHEContext& cc,
+                                    const LWEPrivateKey& sk,
+                                    const Program& plain) {
+        plain.validate();
+
+        std::vector<EncryptedTransition> table;
+        table.reserve(plain.states * 2);
+
+        for (std::size_t q = 0; q < plain.states; ++q) {
+            for (int read = 0; read <= 1; ++read) {
+                const auto& r = plain.rule(q, read);
+                EncryptedTransition t;
+                t.next_state.reserve(plain.states);
+                for (std::size_t q2 = 0; q2 < plain.states; ++q2)
+                    t.next_state.push_back(cc.Encrypt(sk, q2 == r.next_state ? 1 : 0));
+
+                t.write_one = cc.Encrypt(sk, r.write == 1 ? 1 : 0);
+                t.move_left = cc.Encrypt(sk, r.move < 0 ? 1 : 0);
+                t.move_stay = cc.Encrypt(sk, r.move == 0 ? 1 : 0);
+                t.move_right = cc.Encrypt(sk, r.move > 0 ? 1 : 0);
+                table.push_back(std::move(t));
+            }
+        }
+
+        return EncryptedProgram(plain.states, std::move(table));
+    }
+
+    std::size_t states() const { return states_; }
+
+    const EncryptedTransition& transition(std::size_t state, int read) const {
+        if (state >= states_ || (read != 0 && read != 1))
+            throw std::runtime_error("encrypted transition index out of range");
+        return table_.at(state * 2 + static_cast<std::size_t>(read));
+    }
+
+private:
+    EncryptedProgram(std::size_t states, std::vector<EncryptedTransition> table)
+        : states_(states), table_(std::move(table)) {}
+
+    std::size_t states_{};
+    std::vector<EncryptedTransition> table_;
 };
 
 class TapeRemapper {
@@ -75,7 +137,7 @@ private:
         put_u64(msg, 0, 0x563049442d524d50ULL); // "V0ID-RMP"
         put_u64(msg, 8, epoch_);
         put_u64(msg, 16, counter_++);
-        std::array<unsigned char, 64> out{};      // KMAC-256 default output
+        std::array<unsigned char, 64> out{};
         std::size_t out_len = 0;
 
         const bool ok = EVP_MAC_init(ctx, key_.data(), key_.size(), nullptr) == 1 &&
@@ -106,18 +168,18 @@ private:
 
 class EncryptedMachine {
 public:
-    EncryptedMachine(BinFHEContext& cc, const LWEPrivateKey& sk, Program program,
+    EncryptedMachine(BinFHEContext& cc, const LWEPrivateKey& sk,
+                     EncryptedProgram program,
                      const std::vector<int>& tape, std::size_t initial_state,
                      std::size_t initial_head, TapeRemapper::Key remap_key,
                      std::uint64_t epoch)
         : cc_(cc), program_(std::move(program)), remap_key_(remap_key),
           map_(remap_key_, epoch, tape.size()) {
-        program_.validate();
-        if (tape.empty() || initial_state >= program_.states || initial_head >= tape.size())
+        if (tape.empty() || initial_state >= program_.states() || initial_head >= tape.size())
             throw std::runtime_error("invalid initial machine state");
 
         zero_ = cc_.Encrypt(sk, 0);
-        state_.resize(program_.states);
+        state_.resize(program_.states());
         head_.resize(tape.size());
         physical_tape_.resize(tape.size());
 
@@ -131,29 +193,44 @@ public:
         }
     }
 
+    // Fixed public evaluator path: there are no C++ branches on encrypted
+    // next-state, write or movement semantics.
     void step() {
         const std::size_t n = head_.size();
-        std::vector<LWECiphertext> next_state(program_.states, zero_);
+        const std::size_t states = program_.states();
+
+        std::vector<LWECiphertext> next_state(states, zero_);
         std::vector<LWECiphertext> next_head(n, zero_);
         std::vector<LWECiphertext> write_any(n, zero_);
         std::vector<LWECiphertext> write_one(n, zero_);
         std::vector<LWECiphertext> not_tape(n);
 
-        for (std::size_t i = 0; i < n; ++i) not_tape[i] = cc_.EvalNOT(tape(i));
+        for (std::size_t i = 0; i < n; ++i)
+            not_tape[i] = cc_.EvalNOT(tape(i));
 
         for (std::size_t i = 0; i < n; ++i) {
-            for (const auto& r : program_.rules) {
-                auto active = And(state_[r.state], head_[i]);
-                active = And(active, r.read ? tape(i) : not_tape[i]);
+            for (std::size_t q = 0; q < states; ++q) {
+                for (int read = 0; read <= 1; ++read) {
+                    auto active = And(state_[q], head_[i]);
+                    active = And(active, read ? tape(i) : not_tape[i]);
 
-                next_state[r.next_state] = Or(next_state[r.next_state], active);
-                write_any[i] = Or(write_any[i], active);
-                if (r.write) write_one[i] = Or(write_one[i], active);
+                    const auto& t = program_.transition(q, read);
 
-                std::size_t dst = i;
-                if (r.move < 0 && i > 0) dst = i - 1;
-                if (r.move > 0 && i + 1 < n) dst = i + 1;
-                next_head[dst] = Or(next_head[dst], active);
+                    for (std::size_t q2 = 0; q2 < states; ++q2) {
+                        auto selected = And(active, t.next_state[q2]);
+                        next_state[q2] = Or(next_state[q2], selected);
+                    }
+
+                    write_any[i] = Or(write_any[i], active);
+                    write_one[i] = Or(write_one[i], And(active, t.write_one));
+
+                    const std::size_t left = i > 0 ? i - 1 : i;
+                    const std::size_t right = i + 1 < n ? i + 1 : i;
+
+                    next_head[left] = Or(next_head[left], And(active, t.move_left));
+                    next_head[i] = Or(next_head[i], And(active, t.move_stay));
+                    next_head[right] = Or(next_head[right], And(active, t.move_right));
+                }
             }
         }
 
@@ -167,6 +244,14 @@ public:
         head_ = std::move(next_head);
         for (std::size_t i = 0; i < n; ++i)
             physical_tape_[map_.physical(i)] = std::move(next_tape[i]);
+    }
+
+    void run_fixed(std::size_t steps, std::uint64_t remap_epoch_after_first_step = 0) {
+        for (std::size_t s = 0; s < steps; ++s) {
+            step();
+            if (s == 0 && remap_epoch_after_first_step != 0)
+                remap(remap_epoch_after_first_step);
+        }
     }
 
     void remap(std::uint64_t epoch) {
@@ -190,15 +275,17 @@ public:
 
 private:
     LWECiphertext& tape(std::size_t logical) { return physical_tape_[map_.physical(logical)]; }
+
     LWECiphertext And(const LWECiphertext& a, const LWECiphertext& b) {
         return cc_.EvalBinGate(AND, a, b);
     }
+
     LWECiphertext Or(const LWECiphertext& a, const LWECiphertext& b) {
         return cc_.EvalBinGate(OR, a, b);
     }
 
     BinFHEContext& cc_;
-    Program program_;
+    EncryptedProgram program_;
     TapeRemapper::Key remap_key_{};
     TapeRemapper map_;
     LWECiphertext zero_;
@@ -208,6 +295,32 @@ private:
 static void print_msb_first(const std::vector<int>& bits) {
     for (auto it = bits.rbegin(); it != bits.rend(); ++it) std::cout << *it;
     std::cout << '\n';
+}
+
+static void run_case(BinFHEContext& cc,
+                     const LWEPrivateKey& sk,
+                     const TapeRemapper::Key& remap_key,
+                     const std::string& name,
+                     const Program& plain_program,
+                     const std::vector<int>& input,
+                     const std::vector<int>& expected) {
+    constexpr std::size_t FIXED_STEPS = 4;
+
+    // Client-side setup: plaintext transition semantics exist only long enough
+    // to build ciphertext selectors. A future network evaluator should receive
+    // only the serialized EncryptedProgram and encrypted machine state.
+    auto encrypted_program = EncryptedProgram::encrypt(cc, sk, plain_program);
+
+    EncryptedMachine machine(cc, sk, std::move(encrypted_program), input,
+                             0, 0, remap_key, 1);
+    machine.run_fixed(FIXED_STEPS, 2);
+
+    auto output = machine.decrypt_tape(sk);
+    std::cout << name << " output: ";
+    print_msb_first(output);
+
+    if (output != expected)
+        throw std::runtime_error(name + " encrypted-program result mismatch");
 }
 
 int main() try {
@@ -221,8 +334,8 @@ int main() try {
     if (RAND_bytes(remap_key.data(), static_cast<int>(remap_key.size())) != 1)
         throw std::runtime_error("RAND_bytes failed");
 
-    // Runtime-supplied program: little-endian binary increment with carry.
-    // state 0 = carry; state 1 = halted/self-loop.
+    // Two different runtime programs with the same public shape.
+    // State 0 = carry/borrow; state 1 = halted self-loop.
     Program increment{2, {
         {0, 0, 1, 1,  0},
         {0, 1, 0, 0, +1},
@@ -230,23 +343,25 @@ int main() try {
         {1, 1, 1, 1,  0},
     }};
 
+    Program decrement{2, {
+        {0, 0, 0, 1, +1},
+        {0, 1, 1, 0,  0},
+        {1, 0, 1, 0,  0},
+        {1, 1, 1, 1,  0},
+    }};
+
     std::vector<int> input{1,0,1,1,0,0,0,0}; // 00001101 = 13, LSB first
-    std::cout << "input : ";
+    std::cout << "input           : ";
     print_msb_first(input);
 
-    EncryptedMachine m(cc, sk, increment, input, 0, 0, remap_key, 1);
-    m.step();
-    m.remap(2); // ciphertext movement only
-    m.step();   // no intermediate decryption
+    run_case(cc, sk, remap_key, "encrypted inc", increment, input,
+             {0,1,1,1,0,0,0,0}); // 14
+    run_case(cc, sk, remap_key, "encrypted dec", decrement, input,
+             {0,0,1,1,0,0,0,0}); // 12
 
-    auto output = m.decrypt_tape(sk);
-    std::cout << "output: ";
-    print_msb_first(output);
-
-    if (output != std::vector<int>({0,1,1,1,0,0,0,0}))
-        throw std::runtime_error("wrong encrypted-machine result");
-
-    std::cout << "OK: exact encrypted transition + mid-run remap without intermediate decryption\n";
+    std::cout << "OK: same fixed evaluator executed two encrypted transition tables\n"
+                 "    + exact encrypted state/tape semantics\n"
+                 "    + ciphertext-only epoch remap\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "V0ID error: " << e.what() << '\n';

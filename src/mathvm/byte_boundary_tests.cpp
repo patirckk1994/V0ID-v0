@@ -93,8 +93,9 @@ Bytes make_byte_call_module(std::uint32_t input_offset,
     append_uleb(functions, 1);
     append_section(module, 3, functions);
 
-    // Exactly one 64 KiB page. The OOB test deliberately supplies a range that
-    // crosses this boundary so WAMR's native argument validation must trap it.
+    // Exactly one 64 KiB page. Boundary tests deliberately supply ranges that
+    // cross this boundary. V0ID's native host boundary must reject the complete
+    // pointer+length range before any copy/provider call occurs.
     Bytes memories;
     append_uleb(memories, 1);
     memories.push_back(0x01); // explicit min + max
@@ -217,6 +218,14 @@ int main() try {
         // the 65536-byte boundary and must never reach the native provider.
         auto program = program_from(make_byte_call_module(
             65535, 2, 64, 32, Bytes{}));
+        (void)sandbox.execute(program, registry);
+    });
+
+    tests.expect_throw("OOB Wasm byte-provider output range rejected", [&] {
+        // SHA3 wants to write 32 bytes. Starting at the final byte of memory must
+        // be rejected before provider execution/memcpy.
+        auto program = program_from(make_byte_call_module(
+            0, 3, 65535, 32, Bytes{'a', 'b', 'c'}));
         (void)sandbox.execute(program, registry);
     });
 

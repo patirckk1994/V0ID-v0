@@ -42,37 +42,51 @@ else()
     set(V0ID_OPENFHE_LIBRARIES ${OpenFHE_STATIC_LIBRARIES})
 endif()
 
+function(v0id_use_openfhe target)
+    target_include_directories(${target} PRIVATE
+        ${OPENMP_INCLUDES}
+        ${OpenFHE_INCLUDE}
+        ${OpenFHE_INCLUDE}/third-party/include
+        ${OpenFHE_INCLUDE}/core
+        ${OpenFHE_INCLUDE}/pke
+        ${OpenFHE_INCLUDE}/binfhe
+    )
+    target_link_directories(${target} PRIVATE
+        ${OpenFHE_LIBDIR}
+        ${OPENMP_LIBRARIES}
+    )
+    target_link_libraries(${target} PRIVATE ${V0ID_OPENFHE_LIBRARIES})
+endfunction()
+
 add_executable(v0id src/main.cpp)
-target_include_directories(v0id PRIVATE
-    ${OPENMP_INCLUDES}
-    ${OpenFHE_INCLUDE}
-    ${OpenFHE_INCLUDE}/third-party/include
-    ${OpenFHE_INCLUDE}/core
-    ${OpenFHE_INCLUDE}/pke
-    ${OpenFHE_INCLUDE}/binfhe
-)
-target_link_directories(v0id PRIVATE
-    ${OpenFHE_LIBDIR}
-    ${OPENMP_LIBRARIES}
-)
-target_link_libraries(v0id PRIVATE
-    ${V0ID_OPENFHE_LIBRARIES}
-    OpenSSL::Crypto
-)
+v0id_use_openfhe(v0id)
+target_link_libraries(v0id PRIVATE OpenSSL::Crypto)
 
 # Binary-safe transport layer. The envelope payload is deliberately opaque so
-# the next step can place OpenFHE serialized ciphertext bytes directly inside it.
+# OpenFHE serialized ciphertext bytes can be placed directly inside it.
 add_library(v0id_net
     src/net/peer_transport.cpp
 )
 target_include_directories(v0id_net PUBLIC src/net)
 target_link_libraries(v0id_net PUBLIC cppzmq)
 
+# Plain transport smoke test.
 add_executable(v0id-peer
     src/net/peer_demo.cpp
 )
 target_link_libraries(v0id-peer PRIVATE v0id_net)
 
+# Actual FHE-over-network smoke test. The client sends a key-independent BinFHE
+# context, bootstrapping keys and ciphertext; the server evaluates NOT without
+# receiving the LWE secret key and returns only a result ciphertext.
+add_executable(v0id-fhe-peer
+    src/net/fhe_peer_demo.cpp
+)
+target_include_directories(v0id-fhe-peer PRIVATE src/fhe)
+target_link_libraries(v0id-fhe-peer PRIVATE v0id_net)
+v0id_use_openfhe(v0id-fhe-peer)
+
 if(UNIX AND NOT APPLE)
     target_link_options(v0id PRIVATE -Wl,--no-as-needed)
+    target_link_options(v0id-fhe-peer PRIVATE -Wl,--no-as-needed)
 endif()

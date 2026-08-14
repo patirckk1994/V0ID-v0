@@ -1,6 +1,8 @@
-# V0ID V0.4 remote-machine protocol
+# V0ID V0.4/V0.4.1 remote-machine protocol
 
-V0.4 connects the local polymorphic BinFHE machine to the existing ZeroMQ transport. The goal of this stage is narrow: prove that an entire encrypted morphed machine can cross a process/network boundary, execute under a fixed public schedule without the client secret key, and return a result that only the client can interpret and verify with its private morph manifest.
+V0.4 connected the local polymorphic BinFHE machine to the ZeroMQ transport and proved that an entire encrypted morphed machine can cross a process/network boundary, execute under a fixed public schedule without the client secret key, and return a result that only the client can interpret and verify with its private morph manifest.
+
+V0.4.1 adds a private series-first derivation stage on the client and bounded public crypto/profile identifiers to the wire format.
 
 This is experimental research code, not a production wire protocol or audited verifiable-computation scheme.
 
@@ -11,7 +13,9 @@ This is experimental research code, not a production wire protocol or audited ve
 The client owns:
 
 - semantic plaintext program before outsourcing,
-- 256-bit morph seed,
+- private 256-bit `SeriesSeed`,
+- private derived polymorphic series,
+- derived `MorphSeed`,
 - `MorphManifest`,
 - LWE secret key,
 - expected plaintext result for tests,
@@ -19,14 +23,15 @@ The client owns:
 - selected integrity candidate index,
 - plaintext integrity masks.
 
-The client performs all morph generation and encryption.
+The client performs all series generation, morph generation and encryption.
 
 ### Evaluator
 
-The evaluator receives only evaluator-visible public shape and encrypted/evaluation material. It has no LWE secret key and no `MorphManifest`.
+The evaluator receives only evaluator-visible public shape/profile information and encrypted/evaluation material. It has no LWE secret key, private series, series seed or `MorphManifest`.
 
 It performs:
 
+- public profile validation,
 - BinFHE context/evaluation-key reconstruction,
 - toy self-fingerprint evaluation over encrypted job-image bits,
 - all fixed public interpreter rounds,
@@ -34,8 +39,6 @@ It performs:
 - serialization of encrypted final machine state.
 
 ## Public shape
-
-`PublicMachineShape` currently contains:
 
 ```cpp
 struct PublicMachineShape {
@@ -46,27 +49,47 @@ struct PublicMachineShape {
 };
 ```
 
-The V0.4 demo uses:
+The demo uses four public states, eight tape cells, four rounds and four integrity slots.
 
-```text
-states          4
-tape_cells      8
-rounds          4
-integrity_slots 4
-alphabet        binary, implied by the interpreter
+## Public crypto/profile ID
+
+V0.4.1 carries:
+
+```cpp
+struct CryptoProfileId {
+    std::string primitive_id;
+    std::string parameter_set;
+    std::string machine_protocol;
+    std::string integrity_profile;
+    std::string series_generator_id;
+    uint64_t series_generator_version;
+};
 ```
 
-The wire codec rejects shapes above explicit research limits before allocating the corresponding ciphertext vectors.
+The default demo advertises:
+
+```text
+openfhe-binfhe
+STD128
+v0id-remote-machine-v2
+toy-fingerprint32-v1
+v0id-series-kmac-v1 / 1
+```
+
+The server fails closed on unsupported primitive, parameter-set, machine-protocol or integrity-profile identifiers. The series generator itself executes only on the client; its id/version is public provenance metadata for future correlation tests and capability negotiation.
+
+The server echoes the complete profile in the result and the client requires an exact match.
+
+This is not yet an authenticated negotiation protocol. There is no suite-selection handshake or downgrade protection yet.
 
 ## EXECUTE_JOB payload
 
-The V0.4 payload has magic `V0IDRMJ1` followed by public shape and length-framed binary OpenFHE objects.
-
-Conceptually:
+The V0.4.1 payload magic is `V0IDRMJ2`:
 
 ```text
-V0IDRMJ1
+V0IDRMJ2
 PublicMachineShape
+CryptoProfileId
 
 serialized BinFHEContext
 serialized refresh/bootstrapping key
@@ -83,7 +106,7 @@ independently encrypted toy-fingerprint initial state[32]
 encrypted integrity mask[slot][32]
 ```
 
-Canonical transition rows are laid out as:
+Canonical transition rows remain:
 
 ```text
 for state q
@@ -95,21 +118,16 @@ for state q
     move_right
 ```
 
-Thus the public encrypted program-bit count is:
-
-```text
-states * 2 * (states + 4)
-```
-
-For four public states this is 64 encrypted transition bits.
+The public encrypted program-bit count is `states * 2 * (states + 4)`. For four public states this is 64 encrypted transition bits.
 
 ## What is deliberately absent
 
-The V0.4 job format has no field for:
-
 ```text
 LWE secret key
-morph seed
+private polymorphic series
+SeriesSeed
+series private manifest
+MorphSeed
 MorphManifest
 base semantic state IDs
 base_to_morphed mapping
@@ -120,67 +138,72 @@ plaintext program transitions
 plaintext tape bits
 ```
 
-The evaluator can of course see public dimensions, serialized byte lengths, timing and its own execution schedule.
+The evaluator can still observe public profile strings, public dimensions, serialized byte lengths, timing and its execution schedule.
+
+## Series-first client stage
+
+Before `ProgramMorpher`, the default client now runs:
+
+```text
+input + private SeriesSeed + epoch
+             |
+             v
+    v0id-series-kmac-v1
+             |
+      private 64-byte series
+             |
+      derived MorphSeed
+             |
+             v
+        ProgramMorpher
+```
+
+Neither the private series nor its seed is serialized into `EXECUTE_JOB`. Only the generator id/version is public.
+
+Custom trusted local generators can implement `PolymorphicSeriesGenerator` or use `FunctionalSeriesGenerator`. This is not a peer-supplied executable plugin mechanism.
 
 ## Evaluator execution
 
-The evaluator reconstructs the BinFHE context and loads only the refresh/switching evaluation keys.
-
-It computes the toy fingerprint over:
-
-```text
-encrypted morphed transition bits
-+
-encrypted initial tape
-+
-encrypted nonce
-```
-
-using the client-supplied independently encrypted mixer initialization bits.
-
-It masks the resulting encrypted digest once for every public integrity slot, then runs the machine for exactly `shape.rounds` rounds.
+The evaluator reconstructs the BinFHE context and loads only refresh/switching evaluation keys. It computes the toy fingerprint over encrypted morphed transition bits + encrypted initial tape + encrypted nonce, masks a candidate for every public slot, then runs exactly `shape.rounds` interpreter rounds.
 
 No host-language branch is taken on encrypted next-state, write or movement semantics.
 
-The fixed evaluator loop remains structurally:
-
-```text
-for each public round
-  for each tape cell
-    for each public state
-      for read bit 0,1
-        encrypted active test
-        encrypted next-state selection
-        encrypted write selection
-        encrypted movement selection
-```
-
 ## JOB_RESULT payload
 
-The result has magic `V0IDRMR1` and repeats the public shape, followed by:
+The V0.4.1 result magic is `V0IDRMR2`:
 
 ```text
+V0IDRMR2
+PublicMachineShape
+CryptoProfileId
+
 encrypted final one-hot state[]
 encrypted final one-hot head[]
 encrypted final tape[]
 masked encrypted integrity candidate[slot][32]
 ```
 
-Returning final state and head as well as tape is intentional: it preserves enough encrypted machine state for a future checkpoint/resume protocol.
+Returning state and head as well as tape preserves enough encrypted state for future checkpoint/resume.
 
-The V0.4 demo client decrypts the final tape and expects:
+The client decrypts the final tape and expects:
 
 ```text
 00001101 -> 00001110
 ```
 
-It then uses its private manifest to select exactly one returned integrity candidate, decrypts it, removes the corresponding private mask and compares it to the client-side expected toy fingerprint.
+It then uses its private manifest to select one returned integrity candidate, decrypts it, removes the private mask and compares it with the expected toy fingerprint.
 
-## Current placement boundary
+## Proven V0.4 result and V0.4.1 status
 
-V0.4 transfers the tape in logical order. It does not send the local prototype's KMAC remap key to the evaluator and does not yet model peer-local physical storage.
+The V0.4 RMJ1/RMR1 path was executed successfully across two local processes: the remote evaluator completed all four encrypted rounds, the client recovered `00001110`, and its private self-check verified while the server received neither the LWE secret key nor `MorphManifest`.
 
-The intended V0.5 composition is:
+That run also exposed the first major cloud engineering bottleneck: the request was roughly 551 MB because BinFHE context/bootstrap material was included per job, while the encrypted result was roughly 666 KB.
+
+V0.4.1 keeps the same computation but changes the wire format to RMJ2/RMR2 and derives the morph from a private series first. It still needs compiler/runtime validation against the installed OpenFHE build.
+
+## Placement boundary
+
+The remote machine still transfers tape in logical order. Distributed physical placement remains a later stage:
 
 ```text
 semantic/logical cell
@@ -190,30 +213,17 @@ semantic/logical cell
     -> peer-local slot
 ```
 
-with `STORE_SLOT`, `FETCH_SLOT` and `SLOT_VALUE` carrying opaque ciphertext storage objects.
-
-The existing remap mechanism is not claimed to be ORAM. Once remote storage exists, access order, message sizes and timing become explicit correlation surfaces and should be logged from the evaluator-visible perspective for adversarial testing.
+`STORE_SLOT`, `FETCH_SLOT` and `SLOT_VALUE` will eventually carry opaque ciphertext storage objects. The existing remap is not claimed to be ORAM.
 
 ## Integrity limitation
 
-`ToyFingerprint32` is not a cryptographic hash and the current evaluator executes it as a recognizable dedicated circuit.
-
-It currently proves plumbing for:
-
-- FHE evaluation over the encrypted morphed job image,
-- client-private integrity placement metadata,
-- fixed-size returned candidate banks,
-- remote transport of the entire check path.
-
-It does **not** yet prove that every requested remote execution step was performed honestly. The next integrity stages must bind to evolving/final machine state and eventually hide/interleave integrity work so that a malicious evaluator cannot trivially identify the check circuit from execution behavior.
+`ToyFingerprint32` is not a cryptographic hash and remains a recognizable dedicated circuit. It proves FHE/integrity plumbing, not honest execution of every requested step. Later work must bind integrity to evolving/final state and hide/interleave integrity computation more effectively.
 
 ## Demo
 
-Build:
-
 ```sh
 cmake -S . -B build
-cmake --build build -j
+cmake --build build -j --target v0id-remote-machine
 ```
 
 Evaluator:
@@ -228,4 +238,4 @@ Client:
 ./build/v0id-remote-machine client CLIENT tcp://127.0.0.1:7003
 ```
 
-The server prints public round progress. The client/server socket timeout is one hour because BinFHE evaluation is intentionally expensive at this stage.
+The server prints public profile and round progress. The client/server timeout is one hour because BinFHE evaluation is intentionally expensive at this stage.

@@ -1,26 +1,23 @@
 cmake_minimum_required(VERSION 3.20)
-project(v0id LANGUAGES CXX)
+project(v0id LANGUAGES C CXX)
 
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenFHE CONFIG REQUIRED)
 find_package(OpenSSL 3 REQUIRED)
+find_package(Threads REQUIRED)
 
-# CMake 4 removed compatibility with policy versions older than 3.5. libzmq
-# v4.3.5 still declares a 2.8.12...3.31 compatibility range, so a modern
-# top-level build otherwise dies while configuring the fetched dependency.
-# This is the supported compatibility escape hatch suggested by CMake itself;
-# it avoids patching the upstream libzmq source tree.
+# CMake 4 removed compatibility with policy versions older than 3.5. Some
+# fetched research dependencies still declare older compatibility ranges.
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING
         "Minimum policy compatibility for legacy fetched dependencies" FORCE)
 endif()
 
-# Network prototype dependencies are fetched from their upstream public repos.
-# libzmq provides the transport; cppzmq is the header-only C++ binding included
-# by src/net/peer_transport.hpp as <zmq.hpp>.
 include(FetchContent)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -28,6 +25,7 @@ set(WITH_DOCS OFF CACHE BOOL "" FORCE)
 set(ENABLE_DRAFTS OFF CACHE BOOL "" FORCE)
 set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 
+# Network prototype dependencies.
 FetchContent_Declare(
     libzmq
     GIT_REPOSITORY https://github.com/zeromq/libzmq.git
@@ -43,6 +41,79 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(cppzmq)
+
+# WAMR-backed mathematical sandbox. The transmitted artifact is portable Wasm
+# bytecode; peers do not transmit native shared libraries. The V0ID profile is
+# intentionally restrictive: classic interpreter so instruction metering works,
+# no WASI, no libc shim, no JIT/AOT, no threads/shared memory, no mini-loader and
+# no runtime switch that can disable bounds checks.
+option(V0ID_ENABLE_MATHVM "Build the WAMR-backed V0ID MathVM sandbox" ON)
+if(V0ID_ENABLE_MATHVM)
+    FetchContent_Declare(
+        wamr
+        GIT_REPOSITORY https://github.com/wasm-micro-runtime/wasm-micro-runtime.git
+        GIT_TAG WAMR-2.4.0
+        GIT_SHALLOW TRUE
+        # Populate the source without adding WAMR's product build. V0ID embeds
+        # vmcore using WAMR's documented runtime_lib.cmake integration instead.
+        SOURCE_SUBDIR doc
+    )
+    FetchContent_MakeAvailable(wamr)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(WAMR_BUILD_PLATFORM "linux")
+    elseif(WIN32)
+        set(WAMR_BUILD_PLATFORM "windows")
+    elseif(APPLE)
+        set(WAMR_BUILD_PLATFORM "darwin")
+    else()
+        message(FATAL_ERROR "V0ID MathVM: unsupported WAMR host platform ${CMAKE_SYSTEM_NAME}")
+    endif()
+
+    set(WAMR_ROOT_DIR "${wamr_SOURCE_DIR}")
+    set(WAMR_BUILD_INTERP 1)
+    set(WAMR_BUILD_FAST_INTERP 0)
+    set(WAMR_BUILD_INSTRUCTION_METERING 1)
+    set(WAMR_BUILD_AOT 0)
+    set(WAMR_BUILD_JIT 0)
+    set(WAMR_BUILD_FAST_JIT 0)
+    set(WAMR_BUILD_LAZY_JIT 0)
+    set(WAMR_BUILD_LIBC_BUILTIN 0)
+    set(WAMR_BUILD_LIBC_WASI 0)
+    set(WAMR_BUILD_LIBC_UVWASI 0)
+    set(WAMR_BUILD_LIBC_EMCC 0)
+    set(WAMR_BUILD_MULTI_MODULE 0)
+    set(WAMR_BUILD_SHARED_MEMORY 0)
+    set(WAMR_BUILD_THREAD_MGR 0)
+    set(WAMR_BUILD_LIB_PTHREAD 0)
+    set(WAMR_BUILD_LIB_WASI_THREADS 0)
+    set(WAMR_BUILD_SIMD 0)
+    set(WAMR_BUILD_REF_TYPES 0)
+    set(WAMR_BUILD_MINI_LOADER 0)
+    set(WAMR_CONFIGURABLE_BOUNDS_CHECKS 0)
+
+    include("${WAMR_ROOT_DIR}/build-scripts/runtime_lib.cmake")
+    add_library(v0id_wamr STATIC ${WAMR_RUNTIME_LIB_SOURCE})
+    target_include_directories(v0id_wamr PUBLIC
+        "${WAMR_ROOT_DIR}/core/iwasm/include"
+    )
+    target_link_libraries(v0id_wamr PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+    if(UNIX)
+        target_link_libraries(v0id_wamr PUBLIC m)
+    endif()
+
+    add_library(v0id_mathvm
+        src/mathvm/mathvm.cpp
+        src/mathvm/wamr_sandbox.cpp
+    )
+    target_include_directories(v0id_mathvm PUBLIC src/mathvm)
+    target_link_libraries(v0id_mathvm PUBLIC v0id_wamr)
+
+    add_executable(v0id-mathvm
+        src/mathvm/mathvm_demo.cpp
+    )
+    target_link_libraries(v0id-mathvm PRIVATE v0id_mathvm)
+endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenFHE_CXX_FLAGS}")
 
@@ -97,15 +168,11 @@ add_library(v0id_net
 target_include_directories(v0id_net PUBLIC src/net)
 target_link_libraries(v0id_net PUBLIC cppzmq)
 
-# Plain transport smoke test.
 add_executable(v0id-peer
     src/net/peer_demo.cpp
 )
 target_link_libraries(v0id-peer PRIVATE v0id_net)
 
-# Single-ciphertext FHE-over-network smoke test. The client sends a key-independent
-# BinFHE context, bootstrapping material and ciphertext; the server evaluates NOT
-# without receiving the LWE secret key and returns only a result ciphertext.
 add_executable(v0id-fhe-peer
     src/net/fhe_peer_demo.cpp
 )

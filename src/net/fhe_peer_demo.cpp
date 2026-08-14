@@ -20,7 +20,7 @@ void usage(const char* argv0) {
         << "usage:\n"
         << "  " << argv0 << " server <peer-id> <bind-endpoint> [count]\n"
         << "  " << argv0 << " client <peer-id> <connect-endpoint> <bit>\n\n"
-        << "remote operation: encrypted NOT(bit)\n";
+        << "remote operation: encrypted NOT(bit) under OpenFHE STD128Q\n";
 }
 
 int run_server(const std::string& peer_id,
@@ -78,9 +78,10 @@ int run_client(const std::string& peer_id,
     if (bit != 0 && bit != 1) throw std::runtime_error("bit must be 0 or 1");
 
     BinFHEContext cc;
-    cc.GenerateBinFHEContext(STD128);
+    cc.GenerateBinFHEContext(STD128Q);
     auto sk = cc.KeyGen();
-    std::cout << "generating OpenFHE bootstrapping keys...\n";
+    std::cout << "BinFHE parameter set: STD128Q\n"
+              << "generating OpenFHE bootstrapping keys...\n";
     cc.BTKeyGen(sk);
 
     const auto ciphertext = cc.Encrypt(sk, bit);
@@ -99,7 +100,7 @@ int run_client(const std::string& peer_id,
     Envelope request;
     request.type = MessageType::execute_job;
     request.peer_id = peer_id;
-    request.job_id = "remote-not-smoke-test";
+    request.job_id = "remote-not-std128q-smoke-test";
     request.epoch = 1;
     request.payload = v0id::fhe::pack_remote_eval_bundle(bundle);
 
@@ -119,7 +120,7 @@ int run_client(const std::string& peer_id,
     const int output = static_cast<int>(result & 1);
 
     std::cout << "input plaintext  : " << bit << '\n'
-              << "remote operation : NOT under BinFHE\n"
+              << "remote operation : NOT under BinFHE STD128Q\n"
               << "decrypted result : " << output << '\n'
               << "secret key sent  : NO\n";
 
@@ -127,7 +128,7 @@ int run_client(const std::string& peer_id,
     if (output != expected)
         throw std::runtime_error("wrong remote FHE result");
 
-    std::cout << "OK: remote evaluator transformed ciphertext without secret key\n";
+    std::cout << "OK: remote evaluator transformed STD128Q ciphertext without secret key\n";
     return 0;
 }
 

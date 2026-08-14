@@ -119,8 +119,6 @@ void validate_entrypoint(const std::string& entrypoint) {
 
 WamrMathSandbox::WamrMathSandbox(SandboxLimits limits)
     : limits_(limits) {
-    // Validate attacker/configuration-controlled sizes before allocating the
-    // process-global WAMR memory pool.
     validate_limits(limits_);
     runtime_pool_.resize(limits_.runtime_pool_bytes);
 
@@ -182,9 +180,6 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
             throw std::runtime_error("duplicate MathVM primitive requirement");
     }
 
-    // WAMR may modify the supplied byte buffer while loading, so keep a mutable
-    // private copy alive until wasm_runtime_unload(). Only portable Wasm bytecode
-    // is accepted; native AOT images are intentionally rejected.
     auto wasm_bytes = program.wasm;
     const auto package_type = wasm_runtime_get_file_package_type(
         wasm_bytes.data(), static_cast<std::uint32_t>(wasm_bytes.size()));
@@ -226,8 +221,10 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
         if (!module_inst)
             throw std::runtime_error(std::string("WAMR instantiate failed: ") + error_buf);
 
+#if defined(WASM_ENABLE_LIBC_WASI) && WASM_ENABLE_LIBC_WASI != 0
         if (wasm_runtime_is_wasi_mode(module_inst))
             throw std::runtime_error("WASI modules are forbidden by V0ID MathVM");
+#endif
 
         wasm_runtime_set_custom_data(module_inst, &context);
 
@@ -250,8 +247,6 @@ ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
         if (!exec_env)
             throw std::runtime_error("failed to create WAMR execution environment");
 
-        // WAMR instruction metering is enabled only in classic interpreter mode
-        // by the V0ID CMake profile. Native provider work has a separate budget.
         wasm_runtime_set_instruction_count_limit(
             exec_env, limits_.max_wasm_instructions);
 

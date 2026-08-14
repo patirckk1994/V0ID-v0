@@ -4,6 +4,7 @@
 #include "remote_machine_codec.hpp"
 #include "program.hpp"
 #include "program_morpher.hpp"
+#include "series_generator.hpp"
 #include "toy_fingerprint.hpp"
 
 #include "binfhecontext.h"
@@ -29,27 +30,32 @@ constexpr std::size_t PUBLIC_STATES = 4;
 constexpr std::size_t TAPE_CELLS = 8;
 constexpr std::size_t FIXED_ROUNDS = 4;
 constexpr std::size_t INTEGRITY_SLOTS = 4;
+constexpr std::uint64_t DEMO_EPOCH = 1;
 
 using v0id::core::Program;
 using v0id::fhe::ByteBlob;
+using v0id::fhe::CryptoProfileId;
 using v0id::fhe::DigestBlob32;
 using v0id::fhe::PublicMachineShape;
 using v0id::fhe::RemoteEncryptedMachine;
 using v0id::fhe::RemoteMachineBundle;
 using v0id::fhe::RemoteMachineResult;
 using v0id::integrity::EncryptedDigest32;
+using v0id::polymorph::KmacSeriesGenerator;
 using v0id::polymorph::MorphedProgram;
 using v0id::polymorph::ProgramMorpher;
+using v0id::polymorph::SeriesProfile;
 
 void usage(const char* argv0) {
     std::cerr
         << "usage:\n"
         << "  " << argv0 << " server <peer-id> <bind-endpoint> [count]\n"
         << "  " << argv0 << " client <peer-id> <connect-endpoint>\n\n"
-        << "client morphs/encrypts an 8-cell increment machine; server executes\n"
-        << "four fixed BinFHE rounds and returns encrypted machine state plus\n"
-        << "four masked integrity candidates. The MorphManifest never leaves\n"
-        << "the client.\n";
+        << "client privately derives a polymorphic series, uses it to morph and\n"
+        << "encrypt an 8-cell increment machine, then sends the encrypted machine.\n"
+        << "The server executes four fixed BinFHE rounds and returns encrypted\n"
+        << "machine state plus four masked integrity candidates. The private series,\n"
+        << "series seed, MorphManifest and LWE secret key never leave the client.\n";
 }
 
 PublicMachineShape demo_shape() {
@@ -59,6 +65,32 @@ PublicMachineShape demo_shape() {
         FIXED_ROUNDS,
         INTEGRITY_SLOTS,
     };
+}
+
+CryptoProfileId demo_profile(const SeriesProfile& series) {
+    return CryptoProfileId{
+        "openfhe-binfhe",
+        "STD128",
+        "v0id-remote-machine-v2",
+        "toy-fingerprint32-v1",
+        series.generator_id,
+        series.version,
+    };
+}
+
+void require_supported_execution_profile(const CryptoProfileId& profile) {
+    if (profile.primitive_id != "openfhe-binfhe")
+        throw std::runtime_error("unsupported FHE primitive profile");
+    if (profile.parameter_set != "STD128")
+        throw std::runtime_error("unsupported BinFHE parameter profile");
+    if (profile.machine_protocol != "v0id-remote-machine-v2")
+        throw std::runtime_error("unsupported remote machine protocol profile");
+    if (profile.integrity_profile != "toy-fingerprint32-v1")
+        throw std::runtime_error("unsupported integrity profile");
+
+    // The series itself is a client-side morph input, so the evaluator does not
+    // need its implementation. Its bounded id/version is retained as public
+    // provenance for future capability negotiation and correlation experiments.
 }
 
 bool same_shape(const PublicMachineShape& a, const PublicMachineShape& b) {
@@ -174,6 +206,7 @@ int run_server(const std::string& peer_id,
                 throw std::runtime_error("expected EXECUTE_JOB");
 
             const auto bundle = v0id::fhe::unpack_remote_machine_bundle(request.payload);
+            require_supported_execution_profile(bundle.profile);
             const auto& shape = bundle.shape;
 
             std::cout << "job=" << request.job_id
@@ -182,7 +215,17 @@ int run_server(const std::string& peer_id,
                       << " tape=" << shape.tape_cells
                       << " rounds=" << shape.rounds
                       << " integrity-slots=" << shape.integrity_slots << '\n';
-            std::cout << "manifest received    : NO\n"
+            std::cout << "crypto profile       : "
+                      << bundle.profile.primitive_id << '/'
+                      << bundle.profile.parameter_set << " | "
+                      << bundle.profile.machine_protocol << " | "
+                      << bundle.profile.integrity_profile << '\n';
+            std::cout << "series profile       : "
+                      << bundle.profile.series_generator_id << "/v"
+                      << bundle.profile.series_generator_version << '\n';
+            std::cout << "private series recv  : NO\n"
+                      << "series seed received : NO\n"
+                      << "manifest received    : NO\n"
                       << "secret key received  : NO\n";
 
             BinFHEContext cc;
@@ -236,6 +279,7 @@ int run_server(const std::string& peer_id,
 
             RemoteMachineResult result;
             result.shape = shape;
+            result.profile = bundle.profile;
             result.state_bits = serialize_ciphertexts(machine.state_bits());
             result.head_bits = serialize_ciphertexts(machine.head_bits());
             result.tape_bits = serialize_ciphertexts(machine.tape_bits());
@@ -272,15 +316,29 @@ int run_client(const std::string& peer_id,
     const std::vector<int> input{1,0,1,1,0,0,0,0}; // 13, LSB first
     const std::vector<int> expected{0,1,1,1,0,0,0,0}; // 14
 
+    std::vector<std::uint8_t> series_input;
+    series_input.reserve(input.size());
+    for (const int bit : input)
+        series_input.push_back(static_cast<std::uint8_t>(bit & 1));
+
+    KmacSeriesGenerator series_generator(64);
+    const auto series_profile = series_generator.profile();
+    const auto series_seed = v0id::polymorph::random_series_seed();
+    const auto derived_series =
+        series_generator.derive(series_input, series_seed, DEMO_EPOCH);
+
     auto morph = ProgramMorpher::morph(
-        increment, 0, PUBLIC_STATES, ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
+        increment, 0, PUBLIC_STATES, derived_series.morph_seed, INTEGRITY_SLOTS);
 
     if (run_plaintext(morph.program, morph.initial_state, input, FIXED_ROUNDS) != expected)
         throw std::runtime_error("remote demo plaintext morph mismatch");
 
     std::cout << "input                : ";
     print_msb_first(input);
-    std::cout << "public state count   : " << PUBLIC_STATES << '\n'
+    std::cout << "series generator     : " << series_profile.generator_id
+              << "/v" << series_profile.version << '\n'
+              << "private series bytes : " << derived_series.series.size() << '\n'
+              << "public state count   : " << PUBLIC_STATES << '\n'
               << "public tape cells    : " << TAPE_CELLS << '\n'
               << "public round budget  : " << FIXED_ROUNDS << '\n'
               << "public integrity bank: " << INTEGRITY_SLOTS << '\n';
@@ -324,6 +382,7 @@ int run_client(const std::string& peer_id,
 
     RemoteMachineBundle bundle;
     bundle.shape = demo_shape();
+    bundle.profile = demo_profile(series_profile);
     bundle.context = v0id::fhe::serialize_binary(cc);
     bundle.refresh_key = v0id::fhe::serialize_binary(cc.GetRefreshKey());
     bundle.switching_key = v0id::fhe::serialize_binary(cc.GetSwitchKey());
@@ -342,11 +401,13 @@ int run_client(const std::string& peer_id,
     Envelope request;
     request.type = MessageType::execute_job;
     request.peer_id = peer_id;
-    request.job_id = "v0id-v04-remote-polymorphic-increment";
-    request.epoch = 1;
+    request.job_id = "v0id-v041-series-first-remote-increment";
+    request.epoch = DEMO_EPOCH;
     request.payload = v0id::fhe::pack_remote_machine_bundle(bundle);
 
     std::cout << "remote job bytes     : " << request.payload.size() << '\n'
+              << "sending private series: NO\n"
+              << "sending series seed  : NO\n"
               << "sending MorphManifest: NO\n"
               << "sending secret key   : NO\n"
               << "waiting for remote fixed-path evaluation...\n" << std::flush;
@@ -361,6 +422,8 @@ int run_client(const std::string& peer_id,
     const auto result = v0id::fhe::unpack_remote_machine_result(reply.payload);
     if (!same_shape(result.shape, bundle.shape))
         throw std::runtime_error("remote result public shape mismatch");
+    if (!(result.profile == bundle.profile))
+        throw std::runtime_error("remote result crypto profile mismatch");
 
     const auto final_tape_ct = deserialize_ciphertexts(result.tape_bits);
     const auto final_tape = decrypt_bits(cc, sk, final_tape_ct);
@@ -384,10 +447,13 @@ int run_client(const std::string& peer_id,
     if (recovered_digest != expected_digest)
         throw std::runtime_error("remote encrypted self-fingerprint mismatch");
 
-    std::cout << "OK: full morphed encrypted machine executed remotely\n"
+    std::cout << "OK: series-derived morphed encrypted machine executed remotely\n"
+                 "    + private series derived before ProgramMorpher\n"
+                 "    + public crypto/profile identifiers round-tripped\n"
                  "    + encrypted program/state/head/tape crossed the network\n"
                  "    + fixed public round budget executed by server\n"
                  "    + all integrity candidates returned\n"
+                 "    + private series/seed remained client-side\n"
                  "    + MorphManifest remained client-side\n"
                  "    + secret key remained client-side\n"
                  "    + client decrypted 00001110 and verified private self-check\n";

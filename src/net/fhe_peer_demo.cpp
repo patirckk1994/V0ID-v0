@@ -13,6 +13,8 @@ using namespace v0id::net;
 
 namespace {
 
+constexpr int FHE_NETWORK_TIMEOUT_MS = 300000;
+
 void usage(const char* argv0) {
     std::cerr
         << "usage:\n"
@@ -24,7 +26,7 @@ void usage(const char* argv0) {
 int run_server(const std::string& peer_id,
                const std::string& endpoint,
                int count) {
-    PeerServer server(endpoint, 30000);
+    PeerServer server(endpoint, FHE_NETWORK_TIMEOUT_MS);
     std::cout << "V0ID FHE evaluator " << peer_id << " listening on " << endpoint << '\n';
 
     for (int i = 0; i < count; ++i) {
@@ -89,6 +91,11 @@ int run_client(const std::string& peer_id,
     bundle.switching_key = v0id::fhe::serialize_binary(cc.GetSwitchKey());
     bundle.ciphertext = v0id::fhe::serialize_binary(ciphertext);
 
+    std::cout << "serialized bytes  : context=" << bundle.context.size()
+              << " refresh=" << bundle.refresh_key.size()
+              << " switch=" << bundle.switching_key.size()
+              << " ciphertext=" << bundle.ciphertext.size() << '\n';
+
     Envelope request;
     request.type = MessageType::execute_job;
     request.peer_id = peer_id;
@@ -96,7 +103,7 @@ int run_client(const std::string& peer_id,
     request.epoch = 1;
     request.payload = v0id::fhe::pack_remote_eval_bundle(bundle);
 
-    PeerClient client(endpoint, 30000);
+    PeerClient client(endpoint, FHE_NETWORK_TIMEOUT_MS);
     const auto reply = client.round_trip(request);
 
     if (reply.type == MessageType::error)

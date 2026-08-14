@@ -2,7 +2,6 @@
 
 #include "wasm_export.h"
 
-#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <limits>
@@ -62,9 +61,9 @@ std::uint64_t primitive_u64_native(wasm_exec_env_t exec_env,
             throw std::runtime_error("MathVM provider call budget exhausted");
         ++context->provider_calls;
 
-        if (descriptor.cost > context->limits->max_provider_cost -
-                                  std::min(context->provider_cost,
-                                           context->limits->max_provider_cost))
+        if (descriptor.cost > context->limits->max_provider_cost ||
+            context->provider_cost >
+                context->limits->max_provider_cost - descriptor.cost)
             throw std::runtime_error("MathVM provider cost budget exhausted");
         context->provider_cost += descriptor.cost;
 
@@ -119,8 +118,11 @@ void validate_entrypoint(const std::string& entrypoint) {
 } // namespace
 
 WamrMathSandbox::WamrMathSandbox(SandboxLimits limits)
-    : limits_(limits), runtime_pool_(limits.runtime_pool_bytes) {
+    : limits_(limits) {
+    // Validate attacker/configuration-controlled sizes before allocating the
+    // process-global WAMR memory pool.
     validate_limits(limits_);
+    runtime_pool_.resize(limits_.runtime_pool_bytes);
 
     std::lock_guard<std::mutex> lock(g_runtime_mutex);
     if (g_runtime_active)
@@ -157,6 +159,8 @@ WamrMathSandbox::~WamrMathSandbox() {
 
 ExecutionReport WamrMathSandbox::execute(const WasmMathProgram& program,
                                          const PrimitiveRegistry& registry) {
+    std::lock_guard<std::mutex> execution_lock(execution_mutex_);
+
     if (!initialized_)
         throw std::runtime_error("WAMR MathVM sandbox is not initialized");
     if (program.wasm.empty())

@@ -99,24 +99,19 @@ std::vector<std::uint8_t> kmac256(
         throw std::runtime_error("EVP_MAC_CTX_new failed");
 
     auto* custom_ptr = const_cast<char*>(customization.data());
-    OSSL_PARAM init_params[] = {
+    std::size_t requested = output_bytes;
+    OSSL_PARAM params[] = {
         OSSL_PARAM_construct_octet_string(
             OSSL_MAC_PARAM_CUSTOM, custom_ptr, customization.size()),
+        OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &requested),
         OSSL_PARAM_construct_end(),
     };
 
     std::vector<std::uint8_t> out(output_bytes);
     std::size_t written = 0;
-    std::size_t requested = output_bytes;
-    OSSL_PARAM final_params[] = {
-        OSSL_PARAM_construct_size_t(OSSL_MAC_PARAM_SIZE, &requested),
-        OSSL_PARAM_construct_end(),
-    };
-
     const bool ok =
-        EVP_MAC_init(ctx, key.data(), key.size(), init_params) == 1 &&
+        EVP_MAC_init(ctx, key.data(), key.size(), params) == 1 &&
         EVP_MAC_update(ctx, message.data(), message.size()) == 1 &&
-        EVP_MAC_CTX_set_params(ctx, final_params) == 1 &&
         EVP_MAC_final(ctx, out.data(), &written, out.size()) == 1;
     EVP_MAC_CTX_free(ctx);
 

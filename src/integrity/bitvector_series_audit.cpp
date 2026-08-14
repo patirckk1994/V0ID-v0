@@ -163,13 +163,35 @@ z3::expr select_reg(z3::context& ctx,
     return out;
 }
 
+// Use the stable Z3 C API for bit-vector extraction/shifts and wrap the result
+// back into the C++ expr type. Older distro z3++.h versions do not provide the
+// newer namespace-level extract helper or expr<<expr overload used upstream.
+z3::expr bv_extract(z3::context& ctx,
+                    unsigned high,
+                    unsigned low,
+                    const z3::expr& value) {
+    return z3::to_expr(ctx, Z3_mk_extract(ctx, high, low, value));
+}
+
+z3::expr bv_shl(z3::context& ctx,
+                const z3::expr& value,
+                const z3::expr& amount) {
+    return z3::to_expr(ctx, Z3_mk_bvshl(ctx, value, amount));
+}
+
+z3::expr bv_lshr(z3::context& ctx,
+                 const z3::expr& value,
+                 const z3::expr& amount) {
+    return z3::to_expr(ctx, Z3_mk_bvlshr(ctx, value, amount));
+}
+
 z3::expr select_bit(z3::context& ctx,
                     const z3::expr& selector,
                     const z3::expr& word) {
-    z3::expr out = z3::extract(0, 0, word);
+    z3::expr out = bv_extract(ctx, 0, 0, word);
     for (unsigned bit = 1; bit < 8; ++bit)
         out = z3::ite(selector == ctx.int_val(static_cast<int>(bit)),
-                      z3::extract(bit, bit, word), out);
+                      bv_extract(ctx, bit, bit, word), out);
     return out;
 }
 
@@ -187,16 +209,16 @@ z3::expr shift_family(z3::context& ctx,
                       const z3::expr& a,
                       const z3::expr& imm,
                       int kind) {
-    const z3::expr low = z3::extract(2, 0, imm);
+    const z3::expr low = bv_extract(ctx, 2, 0, imm);
 
     auto apply = [&](unsigned k) -> z3::expr {
         const auto sh = ctx.bv_val(k, 8);
         const auto inv = ctx.bv_val(8u - k, 8);
         switch (kind) {
-            case OP_SHL:  return a << sh;
-            case OP_SHR:  return z3::lshr(a, sh);
-            case OP_ROTL: return (a << sh) | z3::lshr(a, inv);
-            case OP_ROTR: return z3::lshr(a, sh) | (a << inv);
+            case OP_SHL:  return bv_shl(ctx, a, sh);
+            case OP_SHR:  return bv_lshr(ctx, a, sh);
+            case OP_ROTL: return bv_shl(ctx, a, sh) | bv_lshr(ctx, a, inv);
+            case OP_ROTR: return bv_lshr(ctx, a, sh) | bv_shl(ctx, a, inv);
             default: throw std::runtime_error("invalid shift-family opcode");
         }
     };

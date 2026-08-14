@@ -251,11 +251,13 @@ clang --target=wasm32 -O2 -nostdlib \
   -Wl,--no-entry \
   -Wl,--allow-undefined \
   -Wl,--export=v0id_main \
-  -Wl,--initial-memory=65536 \
+  -Wl,--initial-memory=131072 \
   -Wl,--max-memory=1048576 \
   examples/mathvm/series_math.c \
   -o build/series_math.wasm
 ```
+
+`wasm-ld` reserves linear-memory space for the guest stack plus a small data area. A one-page (64 KiB) initial memory is too small for the current toolchain; two pages (128 KiB) is the explicit portable floor used by this example and remains well below V0ID's 16-page sandbox cap.
 
 Run:
 

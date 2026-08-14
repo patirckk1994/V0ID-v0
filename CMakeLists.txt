@@ -42,12 +42,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(cppzmq)
 
-# WAMR-backed mathematical sandbox. The transmitted artifact is portable Wasm
-# bytecode; peers do not transmit native shared libraries. The V0ID profile is
-# intentionally restrictive: classic interpreter so instruction metering works,
-# no WASI, no libc shim, no JIT/AOT, no threads/shared memory, no mini-loader and
-# no runtime switch that can disable bounds checks.
-option(V0ID_ENABLE_MATHVM "Build the WAMR-backed V0ID MathVM sandbox" ON)
+# Shared WAMR runtime profile used by the remote-visible MathVM executable and
+# the separate client-only polymorphism executable. Both use the classic
+# interpreter so instruction metering works; no WASI/libc shims, JIT/AOT,
+# threads/shared memory, mini-loader or configurable bounds bypass are enabled.
+option(V0ID_ENABLE_MATHVM "Build the WAMR-backed V0ID sandbox components" ON)
 if(V0ID_ENABLE_MATHVM)
     FetchContent_Declare(
         wamr
@@ -67,7 +66,7 @@ if(V0ID_ENABLE_MATHVM)
     elseif(APPLE)
         set(WAMR_BUILD_PLATFORM "darwin")
     else()
-        message(FATAL_ERROR "V0ID MathVM: unsupported WAMR host platform ${CMAKE_SYSTEM_NAME}")
+        message(FATAL_ERROR "V0ID WAMR: unsupported host platform ${CMAKE_SYSTEM_NAME}")
     endif()
 
     set(WAMR_ROOT_DIR "${wamr_SOURCE_DIR}")
@@ -168,6 +167,28 @@ target_include_directories(v0id_core PUBLIC
     src/polymorph
 )
 target_link_libraries(v0id_core PUBLIC OpenSSL::Crypto)
+
+if(V0ID_ENABLE_MATHVM)
+    # Client-only portable polymorphism strategy. Unlike remote MathVM this
+    # sandbox exposes zero host imports: seed/input/epoch enter through bounded
+    # guest linear memory, a canonical private morph-material envelope comes
+    # back, and trusted ProgramMorpher still owns machine rewriting.
+    add_library(v0id_wasm_polymorph
+        src/polymorph/wasm_series_generator.cpp
+    )
+    target_include_directories(v0id_wasm_polymorph PUBLIC src/polymorph)
+    target_link_libraries(v0id_wasm_polymorph PUBLIC v0id_core v0id_wamr)
+
+    add_executable(v0id-wasm-polymorph-tests
+        src/polymorph/wasm_series_tests.cpp
+    )
+    target_link_libraries(v0id-wasm-polymorph-tests PRIVATE v0id_wasm_polymorph)
+
+    add_executable(v0id-wasm-polymorph-demo
+        src/polymorph/wasm_series_demo.cpp
+    )
+    target_link_libraries(v0id-wasm-polymorph-demo PRIVATE v0id_wasm_polymorph)
+endif()
 
 add_executable(v0id
     src/main.cpp

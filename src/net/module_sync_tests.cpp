@@ -1,4 +1,5 @@
 #include "module_sync.hpp"
+#include "peer_transport.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -55,6 +56,22 @@ int main() try {
             decoded.descriptor.digest == desc.digest &&
             decoded.bytes == bytes,
             "shared module bundle round-trips exactly");
+
+    v0id::net::Envelope envelope;
+    envelope.type = v0id::net::MessageType::module_blob;
+    envelope.peer_id = "CLIENT";
+    envelope.job_id = "module-sync-test";
+    envelope.epoch = 7;
+    envelope.payload = wire;
+    const auto envelope_wire = envelope.encode();
+    const auto received_envelope = v0id::net::Envelope::decode(
+        envelope_wire.data(), envelope_wire.size());
+    const auto received_bundle = v0id::net::decode_shared_module_bundle(
+        received_envelope.payload.data(), received_envelope.payload.size());
+    r.check(received_envelope.type == v0id::net::MessageType::module_blob &&
+            received_bundle.descriptor.digest == desc.digest &&
+            received_bundle.bytes == bytes,
+            "shared module survives V0IDNET1 MODULE_BLOB transport framing");
 
     auto changed_bytes = bytes;
     changed_bytes.back() ^= 1u;

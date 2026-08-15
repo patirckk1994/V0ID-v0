@@ -154,6 +154,12 @@ int main() try {
 
     std::cout << "V0ID full encrypted SHA3-512 stress test\n"
               << "  BinFHE profile            : OpenFHE STD128Q\n"
+              << "  GPU compile request       : "
+              << (v0id::fhe::kGpuFheCompileRequested ? "ON" : "OFF") << '\n'
+              << "  requested FHE backend     : "
+              << v0id::fhe::kRequestedFheBackendName << '\n'
+              << "  active FHE backend        : "
+              << v0id::fhe::kActiveFheBackendName << '\n'
               << "  message                   : abc\n"
               << "  registers                 : " << mutated.register_count << '\n'
               << "  input words               : " << mutated.input_word_count << '\n'

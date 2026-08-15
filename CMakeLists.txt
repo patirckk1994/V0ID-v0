@@ -208,6 +208,45 @@ target_link_libraries(v0id-sha3-image-tests PRIVATE
     OpenSSL::Crypto
 )
 
+# Direct fixed-path BinFHE evaluator for the compact private program image. A
+# literal single-head TM interpreter can stay below 128 states but would burn the
+# RMJ3 round budget moving between a ~50k-bit image and working registers. This
+# backend instead keeps opcode/register/index data encrypted and evaluates every
+# candidate operation before homomorphically selecting the active one.
+add_library(v0id_encrypted_boolean_program
+    src/fhe/encrypted_boolean_program.cpp
+)
+target_include_directories(v0id_encrypted_boolean_program PUBLIC
+    src/fhe
+    src/integrity
+    ${OPENMP_INCLUDES}
+    ${OpenFHE_INCLUDE}
+    ${OpenFHE_INCLUDE}/third-party/include
+    ${OpenFHE_INCLUDE}/core
+    ${OpenFHE_INCLUDE}/pke
+    ${OpenFHE_INCLUDE}/binfhe
+)
+target_link_libraries(v0id_encrypted_boolean_program PUBLIC
+    v0id_boolean_integrity
+)
+v0id_use_openfhe(v0id_encrypted_boolean_program)
+
+# Deliberately tiny FHE gate: one encrypted instruction verifies the oblivious
+# opcode/register selection mechanism without asking a developer machine to run
+# the full 2k+-instruction SHA3 image yet. The full image remains covered by the
+# plaintext/OpenSSL differential target above.
+add_executable(v0id-encrypted-boolean-program-tests
+    src/integrity/encrypted_boolean_program_tests.cpp
+)
+target_include_directories(v0id-encrypted-boolean-program-tests PRIVATE
+    src/fhe
+    src/integrity
+)
+target_link_libraries(v0id-encrypted-boolean-program-tests PRIVATE
+    v0id_encrypted_boolean_program
+)
+v0id_use_openfhe(v0id-encrypted-boolean-program-tests)
+
 # PQ-facing plaintext quine commitment plus the hash-agnostic canonical subject
 # and private execution-integrity construction boundary. SHA3-512 is the strong
 # default client reference backend; runtime hash Programs remain private hooks.

@@ -40,23 +40,49 @@ bool all_zero(const std::array<std::uint8_t, N>& value) {
                        [](std::uint8_t b) { return b == 0; });
 }
 
+std::vector<bool> excluded_mask(const v0id::core::Program& program,
+                                const std::vector<std::size_t>& excluded) {
+    std::vector<bool> mask(program.states, false);
+    for (const auto state : excluded) {
+        if (state >= program.states)
+            throw std::runtime_error("canonical self-image excluded state out of range");
+        if (mask[state])
+            throw std::runtime_error("canonical self-image duplicate excluded state");
+        mask[state] = true;
+    }
+    return mask;
+}
+
 void append_program(std::vector<std::uint8_t>& out,
-                    const v0id::core::Program& program) {
+                    const v0id::core::Program& program,
+                    const std::vector<std::size_t>& excluded) {
     program.validate();
+    const auto mask = excluded_mask(program, excluded);
+
     append_u64(out, checked_u64(program.states, "canonical self-image state count"));
     append_u64(out, checked_u64(program.states * 2,
                                 "canonical self-image transition count"));
 
-    // Canonical semantic order, independent of vector storage order.
+    // Canonical semantic order, independent of vector storage order. Excluded
+    // integrity rows retain their location in the final public state image but
+    // their transition payload is replaced by one canonical zero representation.
     for (std::size_t state = 0; state < program.states; ++state) {
         for (int read = 0; read <= 1; ++read) {
-            const auto& rule = program.rule(state, read);
             append_u64(out, checked_u64(state, "canonical self-image state id"));
             out.push_back(static_cast<std::uint8_t>(read));
-            append_u64(out, checked_u64(rule.next_state,
-                                        "canonical self-image next-state id"));
-            out.push_back(static_cast<std::uint8_t>(rule.write));
-            out.push_back(static_cast<std::uint8_t>(rule.move + 1)); // -1,0,+1 -> 0,1,2
+            out.push_back(mask[state] ? std::uint8_t{1} : std::uint8_t{0});
+
+            if (mask[state]) {
+                append_u64(out, 0);
+                out.push_back(0); // write
+                out.push_back(1); // canonical move=stay encoding: move+1
+            } else {
+                const auto& rule = program.rule(state, read);
+                append_u64(out, checked_u64(rule.next_state,
+                                            "canonical self-image next-state id"));
+                out.push_back(static_cast<std::uint8_t>(rule.write));
+                out.push_back(static_cast<std::uint8_t>(rule.move + 1));
+            }
         }
     }
 }
@@ -96,17 +122,16 @@ void validate_context(const v0id::core::Program& program,
         throw std::runtime_error("canonical self-image digest slot size invalid");
 }
 
-} // namespace
-
-std::vector<std::uint8_t> canonical_self_image_v1(
-    const v0id::core::Program& non_integrity_program,
+std::vector<std::uint8_t> encode(
+    const v0id::core::Program& program,
+    const std::vector<std::size_t>& excluded_integrity_states,
     const CanonicalSelfImageContext& context) {
 
-    validate_context(non_integrity_program, context);
+    validate_context(program, context);
 
     std::vector<std::uint8_t> out;
     append_string(out, "V0ID-CANONICAL-SELF-IMAGE-v1");
-    append_u64(out, 1); // encoding version
+    append_u64(out, 1);
 
     append_blob(out, context.session_id.data(), context.session_id.size());
     append_string(out, context.job_id);
@@ -136,14 +161,11 @@ std::vector<std::uint8_t> canonical_self_image_v1(
                 context.private_integrity_challenge.data(),
                 context.private_integrity_challenge.size());
 
-    // The caller passes the machine image with the integrity/hash implementation
-    // excluded. This is deliberate: private hash modules can mutate or replace
-    // the implementation without changing what job image is being authenticated.
-    append_string(out, "V0ID-NON-INTEGRITY-PROGRAM-v1");
-    append_program(out, non_integrity_program);
+    append_string(out, "V0ID-FINAL-PROGRAM-MASKED-INTEGRITY-v1");
+    append_program(out, program, excluded_integrity_states);
 
-    // Canonical self-reference/output rule. The result storage exists in the
-    // subject as a fixed-size all-zero field, so no hash fixed point is required.
+    // Canonical self-reference/output rule. Result storage is represented as a
+    // fixed-size all-zero field, so no digest fixed point is required.
     append_string(out, "V0ID-INTEGRITY-DIGEST-SLOT-v1");
     append_u64(out, checked_u64(context.digest_slot_bytes,
                                 "canonical self-image digest slot bytes"));
@@ -152,11 +174,7 @@ std::vector<std::uint8_t> canonical_self_image_v1(
     return out;
 }
 
-std::vector<int> canonical_self_image_bits_v1(
-    const v0id::core::Program& non_integrity_program,
-    const CanonicalSelfImageContext& context) {
-
-    const auto bytes = canonical_self_image_v1(non_integrity_program, context);
+std::vector<int> to_bits(const std::vector<std::uint8_t>& bytes) {
     std::vector<int> bits;
     bits.reserve(bytes.size() * 8);
     for (const auto byte : bytes) {
@@ -164,6 +182,37 @@ std::vector<int> canonical_self_image_bits_v1(
             bits.push_back(static_cast<int>((byte >> shift) & 1u));
     }
     return bits;
+}
+
+} // namespace
+
+std::vector<std::uint8_t> canonical_self_image_v1(
+    const v0id::core::Program& program,
+    const CanonicalSelfImageContext& context) {
+    return encode(program, {}, context);
+}
+
+std::vector<std::uint8_t> canonical_self_image_v1_masked(
+    const v0id::core::Program& final_morphed_program,
+    const std::vector<std::size_t>& excluded_integrity_states,
+    const CanonicalSelfImageContext& context) {
+    if (excluded_integrity_states.empty())
+        throw std::runtime_error("masked canonical self-image requires integrity states");
+    return encode(final_morphed_program, excluded_integrity_states, context);
+}
+
+std::vector<int> canonical_self_image_bits_v1(
+    const v0id::core::Program& program,
+    const CanonicalSelfImageContext& context) {
+    return to_bits(canonical_self_image_v1(program, context));
+}
+
+std::vector<int> canonical_self_image_bits_v1_masked(
+    const v0id::core::Program& final_morphed_program,
+    const std::vector<std::size_t>& excluded_integrity_states,
+    const CanonicalSelfImageContext& context) {
+    return to_bits(canonical_self_image_v1_masked(
+        final_morphed_program, excluded_integrity_states, context));
 }
 
 } // namespace v0id::integrity

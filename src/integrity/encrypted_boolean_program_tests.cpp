@@ -93,9 +93,10 @@ std::vector<std::uint8_t> openssl_sha3_512(
     return out;
 }
 
-std::uint64_t decrypt_word(lbcrypto::BinFHEContext& cc,
-                           lbcrypto::ConstLWEPrivateKey& sk,
-                           const v0id::fhe::EncryptedBooleanWord& word) {
+[[maybe_unused]] std::uint64_t decrypt_word(
+    lbcrypto::BinFHEContext& cc,
+    lbcrypto::ConstLWEPrivateKey& sk,
+    const v0id::fhe::EncryptedBooleanWord& word) {
     std::uint64_t out = 0;
     for (std::size_t bit = 0; bit < word.size(); ++bit) {
         lbcrypto::LWEPlaintext value = 0;

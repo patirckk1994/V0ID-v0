@@ -184,6 +184,18 @@ function(v0id_finish_tfhe_cuda_setup)
     set_target_properties(v0id-small-fhe-smoke-tests PROPERTIES
         BUILD_RPATH "${V0ID_TFHE_CUDA_TARGET_DIR}/release")
 
+    # Cheap network-layer regressions stay independent of FHE execution. CURVE
+    # tests verify that the ZAP User-Id reaching application code is derived from
+    # an allowlisted client public key rather than the untrusted Envelope peer_id.
+    add_executable(v0id-curve-transport-tests
+        "${CMAKE_SOURCE_DIR}/src/net/curve_peer_transport_tests.cpp"
+        "${CMAKE_SOURCE_DIR}/src/net/curve_peer_transport.cpp")
+    target_include_directories(v0id-curve-transport-tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/net")
+    target_link_libraries(v0id-curve-transport-tests PRIVATE
+        v0id_net
+        Threads::Threads)
+
     # Network protocol codec stays independent of the FHE implementation, while
     # this demo binds it to the real streamed TFHE CUDA evaluator boundary.
     add_executable(v0id-tfhe-cloud-codec-tests
@@ -195,14 +207,16 @@ function(v0id_finish_tfhe_cuda_setup)
 
     add_executable(v0id-tfhe-cloud
         "${CMAKE_SOURCE_DIR}/src/net/tfhe_cloud_demo.cpp"
-        "${CMAKE_SOURCE_DIR}/src/net/tfhe_cloud_codec.cpp")
+        "${CMAKE_SOURCE_DIR}/src/net/tfhe_cloud_codec.cpp"
+        "${CMAKE_SOURCE_DIR}/src/net/curve_peer_transport.cpp")
     target_include_directories(v0id-tfhe-cloud PRIVATE
         "${CMAKE_SOURCE_DIR}/src/net"
         "${CMAKE_SOURCE_DIR}/src/fhe"
         "${CMAKE_SOURCE_DIR}/src/integrity")
     target_link_libraries(v0id-tfhe-cloud PRIVATE
         v0id_net
-        v0id_encrypted_boolean_program)
+        v0id_encrypted_boolean_program
+        Threads::Threads)
     target_compile_definitions(v0id-tfhe-cloud PRIVATE
         V0ID_GPU_FHE_ENABLED=1)
     add_dependencies(v0id-tfhe-cloud
@@ -248,6 +262,12 @@ function(v0id_finish_tfhe_cuda_setup)
         USES_TERMINAL
         COMMENT "Running TFHE ZeroMQ cloud framing regression tests")
 
+    add_custom_target(v0id-test-curve-transport
+        COMMAND $<TARGET_FILE:v0id-curve-transport-tests>
+        DEPENDS v0id-curve-transport-tests
+        USES_TERMINAL
+        COMMENT "Running ZeroMQ CURVE/ZAP authenticated transport regression test")
+
     message(STATUS "V0ID TFHE CUDA backend: ENABLED")
     message(STATUS "  cargo       : ${V0ID_CARGO_EXECUTABLE}")
     message(STATUS "  rustc       : ${V0ID_RUSTC_VERSION_TEXT}")
@@ -255,7 +275,7 @@ function(v0id_finish_tfhe_cuda_setup)
     message(STATUS "  CUDA root   : ${V0ID_CUDA_TOOLKIT_ROOT}")
     message(STATUS "  GPU CC      : ${V0ID_GPU_COMPUTE_CAPABILITY}")
     message(STATUS "  Rust sidecar: ${V0ID_TFHE_CUDA_LIBRARY}")
-    message(STATUS "  TFHE cloud  : v0id-tfhe-cloud (ZeroMQ multipart)")
+    message(STATUS "  TFHE cloud  : v0id-tfhe-cloud (ZeroMQ CURVE + ZAP multipart)")
 endfunction()
 
 cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"

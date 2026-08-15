@@ -181,6 +181,9 @@ add_library(v0id_boolean_integrity
     src/integrity/boolean_ir_mutator.cpp
     src/integrity/boolean_ir_lowering_plan.cpp
     src/integrity/boolean_ir_to_program.cpp
+    src/integrity/boolean_program_image.cpp
+    src/integrity/boolean_program_image_mutator.cpp
+    src/integrity/keccak_program_image.cpp
 )
 target_include_directories(v0id_boolean_integrity PUBLIC
     src/integrity
@@ -192,6 +195,15 @@ add_executable(v0id-sha3-program-tests
     src/integrity/sha3_program_tests.cpp
 )
 target_link_libraries(v0id-sha3-program-tests PRIVATE
+    v0id_boolean_integrity
+    OpenSSL::Crypto
+)
+
+add_executable(v0id-sha3-image-tests
+    src/integrity/sha3_image_tests.cpp
+)
+target_include_directories(v0id-sha3-image-tests PRIVATE src/fhe)
+target_link_libraries(v0id-sha3-image-tests PRIVATE
     v0id_boolean_integrity
     OpenSSL::Crypto
 )

@@ -2,6 +2,7 @@
 
 #include "boolean_program_image.hpp"
 #include "curve_peer_transport.hpp"
+#include "tfhe_cloud_codec.hpp"
 
 #include <cstddef>
 #include <cstdint>

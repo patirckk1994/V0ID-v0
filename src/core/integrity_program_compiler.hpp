@@ -32,9 +32,14 @@ namespace v0id::core {
 //
 // The semantic program is time-expanded for exactly semantic_rounds so a
 // non-halting/reference TM can enter the integrity fragment after the requested
-// bounded computation. This compiler does not define a hash primitive itself;
-// the integrity fragment is supplied by the caller. A future SHA3/KMAC TM or
-// equivalent hidden machine fragment plugs into this boundary.
+// bounded computation. The caller must also state how many integrity transitions
+// are part of the accepted execution. This prevents the old off-by-one trap where
+// the last semantic transition merely ENTERS integrity code and a fixed-round
+// evaluator stops before executing any of it.
+//
+// This compiler does not define a hash primitive itself; the integrity fragment
+// is supplied by the caller. A future SHA3/KMAC TM or equivalent hidden machine
+// fragment plugs into this boundary.
 struct BoundedIntegrityProgram {
     Program program;
     std::size_t initial_state{};
@@ -47,7 +52,11 @@ struct BoundedIntegrityProgram {
     // receive it as a semantic label.
     std::size_t integrity_state_offset{};
 
+    // Explicit execution accounting. The public evaluator budget for this
+    // combined program is total_execution_rounds, not semantic_rounds.
     std::size_t semantic_rounds{};
+    std::size_t integrity_rounds{};
+    std::size_t total_execution_rounds{};
 };
 
 inline BoundedIntegrityProgram compose_bounded_with_integrity(
@@ -55,7 +64,8 @@ inline BoundedIntegrityProgram compose_bounded_with_integrity(
     std::size_t semantic_initial_state,
     std::size_t semantic_rounds,
     const Program& integrity,
-    std::size_t integrity_initial_state) {
+    std::size_t integrity_initial_state,
+    std::size_t integrity_rounds) {
 
     semantic.validate();
     integrity.validate();
@@ -66,6 +76,11 @@ inline BoundedIntegrityProgram compose_bounded_with_integrity(
         throw std::runtime_error("integrity initial state out of range");
     if (semantic_rounds == 0)
         throw std::runtime_error("bounded semantic prefix requires at least one round");
+    if (integrity_rounds == 0)
+        throw std::runtime_error("bounded integrity suffix requires at least one round");
+    if (integrity_rounds >
+        std::numeric_limits<std::size_t>::max() - semantic_rounds)
+        throw std::runtime_error("combined execution round count overflows");
 
     if (semantic_rounds >
         std::numeric_limits<std::size_t>::max() / semantic.states)
@@ -80,6 +95,8 @@ inline BoundedIntegrityProgram compose_bounded_with_integrity(
     out.semantic_state_count = semantic_state_count;
     out.integrity_state_offset = semantic_state_count;
     out.semantic_rounds = semantic_rounds;
+    out.integrity_rounds = integrity_rounds;
+    out.total_execution_rounds = semantic_rounds + integrity_rounds;
     out.initial_state = semantic_initial_state; // layer zero
     out.program.states = semantic_state_count + integrity.states;
     out.program.rules.resize(out.program.states * 2);

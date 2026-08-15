@@ -1,4 +1,5 @@
 #include "program_morpher.hpp"
+#include "integrity_program_compiler.hpp"
 
 #include <array>
 #include <cstddef>
@@ -11,6 +12,7 @@
 namespace {
 
 using v0id::core::Program;
+using v0id::core::compose_bounded_with_integrity;
 using v0id::polymorph::MorphSeed;
 using v0id::polymorph::ProgramMorpher;
 using v0id::polymorph::RoundMorphedProgramSchedule;
@@ -43,42 +45,39 @@ RunResult run_schedule(const RoundMorphedProgramSchedule& schedule,
     return out;
 }
 
+RunResult run_program(const Program& program,
+                      std::size_t initial_state,
+                      const std::vector<int>& input,
+                      std::size_t rounds) {
+    program.validate();
+    if (input.empty())
+        throw std::runtime_error("program test tape must not be empty");
+
+    RunResult out{initial_state, 0, input};
+    for (std::size_t round = 0; round < rounds; ++round) {
+        const auto& rule = program.rule(out.state, out.tape.at(out.head));
+        out.tape[out.head] = rule.write;
+        out.state = rule.next_state;
+        if (rule.move < 0 && out.head > 0)
+            --out.head;
+        else if (rule.move > 0 && out.head + 1 < out.tape.size())
+            ++out.head;
+    }
+    return out;
+}
+
 std::size_t run_base_state(const Program& program,
                            std::size_t initial_state,
                            const std::vector<int>& input,
                            std::size_t rounds) {
-    auto tape = input;
-    auto state = initial_state;
-    std::size_t head = 0;
-    for (std::size_t round = 0; round < rounds; ++round) {
-        const auto& rule = program.rule(state, tape.at(head));
-        tape[head] = rule.write;
-        state = rule.next_state;
-        if (rule.move < 0 && head > 0)
-            --head;
-        else if (rule.move > 0 && head + 1 < tape.size())
-            ++head;
-    }
-    return state;
+    return run_program(program, initial_state, input, rounds).state;
 }
 
 std::vector<int> run_base_tape(const Program& program,
                                std::size_t initial_state,
                                const std::vector<int>& input,
                                std::size_t rounds) {
-    auto tape = input;
-    auto state = initial_state;
-    std::size_t head = 0;
-    for (std::size_t round = 0; round < rounds; ++round) {
-        const auto& rule = program.rule(state, tape.at(head));
-        tape[head] = rule.write;
-        state = rule.next_state;
-        if (rule.move < 0 && head > 0)
-            --head;
-        else if (rule.move > 0 && head + 1 < tape.size())
-            ++head;
-    }
-    return tape;
+    return run_program(program, initial_state, input, rounds).tape;
 }
 
 void require(bool condition, const std::string& what) {
@@ -223,7 +222,76 @@ int main() try {
     pass(rejected_small_shape,
          "schedule rejects a public state count that cannot encode all round boundaries distinctly");
 
-    std::cout << "V0ID round-polymorphic execution-binding tests: "
+    // ---------------------------------------------------------------------
+    // Intended embedded-integrity ordering gate.
+    //
+    // This tiny one-state fragment is deliberately NOT a cryptographic hash.
+    // It toggles the current tape bit so the test can prove that an auxiliary
+    // integrity fragment is composed into the same Program *before* the private
+    // ProgramMorpher pass. A real self-hash TM/circuit plugs into the same
+    // compiler boundary; the architectural ordering must not change.
+    // ---------------------------------------------------------------------
+    const Program integrity_marker{1, {
+        {0, 0, 0, 1, 0},
+        {0, 1, 0, 0, 0},
+    }};
+    integrity_marker.validate();
+
+    const auto combined = compose_bounded_with_integrity(
+        increment, 0, rounds, integrity_marker, 0);
+
+    pass(combined.semantic_state_count == rounds * increment.states &&
+             combined.integrity_state_offset == rounds * increment.states &&
+             combined.program.states == rounds * increment.states + integrity_marker.states,
+         "semantic and integrity fragments compile into one bounded program image");
+
+    const auto combined_after_semantic =
+        run_program(combined.program, combined.initial_state, input, rounds);
+    pass(combined_after_semantic.tape == base_full_tape &&
+             combined_after_semantic.state == combined.integrity_state_offset,
+         "combined program enters integrity code only after the requested semantic rounds");
+
+    const auto combined_after_integrity =
+        run_program(combined.program, combined.initial_state, input, rounds + 1);
+    pass(combined_after_integrity.tape != base_full_tape,
+         "embedded integrity fragment executes as part of the same program");
+
+    constexpr std::size_t combined_public_states = 16;
+    const auto combined_morph = ProgramMorpher::morph(
+        combined.program, combined.initial_state,
+        combined_public_states, seed_a(), 4);
+    const auto combined_morph_other = ProgramMorpher::morph(
+        combined.program, combined.initial_state,
+        combined_public_states, seed_b(), 4);
+
+    pass(combined_morph.manifest.base_to_morphed.size() == combined.program.states,
+         "one ProgramMorpher pass covers every semantic AND integrity state");
+
+    const auto hidden_integrity_state =
+        combined_morph.manifest.base_to_morphed.at(combined.integrity_state_offset);
+    const auto& hidden_integrity_zero =
+        combined_morph.program.rule(hidden_integrity_state, 0);
+    const auto& hidden_integrity_one =
+        combined_morph.program.rule(hidden_integrity_state, 1);
+    pass(hidden_integrity_zero.next_state == hidden_integrity_state &&
+             hidden_integrity_zero.write == 1 &&
+             hidden_integrity_one.next_state == hidden_integrity_state &&
+             hidden_integrity_one.write == 0,
+         "integrity logic survives the same secret state permutation as useful logic");
+
+    const auto morphed_after_semantic =
+        run_program(combined_morph.program, combined_morph.initial_state, input, rounds);
+    const auto morphed_after_integrity =
+        run_program(combined_morph.program, combined_morph.initial_state, input, rounds + 1);
+    pass(morphed_after_semantic.tape == base_full_tape &&
+             morphed_after_integrity.tape == combined_after_integrity.tape,
+         "combined useful+integrity semantics survive one shared polymorphic transform");
+
+    pass(combined_morph.manifest.base_to_morphed !=
+             combined_morph_other.manifest.base_to_morphed,
+         "changing the private morph seed remixes the combined useful+integrity machine");
+
+    std::cout << "V0ID round-polymorphic + combine-before-morph tests: "
               << passed << " passed, 0 failed\n";
     return 0;
 } catch (const std::exception& e) {

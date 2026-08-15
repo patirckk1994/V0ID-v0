@@ -408,3 +408,9 @@ Immediate order:
 Parallel later work includes distributed encrypted tape, trace classification, stronger polymorphism, authenticated session/profile binding, encrypted halt/no-op semantics and checkpoint/resume.
 
 V0ID currently favors explicit research boundaries over features that cannot explain why they exist.
+
+## License
+
+V0ID is dual-licensed under the Apache License, Version 2.0 or the MIT License, at your option. See `LICENSE-APACHE`, `LICENSE-MIT`, and the top-level `LICENSE` notice.
+
+Third-party dependencies and bundled third-party components remain subject to their respective licenses.

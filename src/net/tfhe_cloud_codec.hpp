@@ -54,15 +54,18 @@ struct TfheCloudResult {
 bool valid_tfhe_cloud_session_id(const TfheCloudSessionId& id);
 std::string tfhe_cloud_session_id_hex(const TfheCloudSessionId& id);
 
+// Large blob-bearing messages are accepted/returned by value so callers can
+// std::move server keys, encrypted chunks and results through the framing layer
+// without duplicating hundreds of MiB of opaque ciphertext/key material.
 MultipartEnvelope pack_tfhe_cloud_install(
     Envelope envelope,
-    const TfheCloudInstall& install);
-TfheCloudInstall unpack_tfhe_cloud_install(const MultipartEnvelope& message);
+    TfheCloudInstall install);
+TfheCloudInstall unpack_tfhe_cloud_install(MultipartEnvelope message);
 
 MultipartEnvelope pack_tfhe_cloud_chunk(
     Envelope envelope,
-    const TfheCloudChunk& chunk);
-TfheCloudChunk unpack_tfhe_cloud_chunk(const MultipartEnvelope& message);
+    TfheCloudChunk chunk);
+TfheCloudChunk unpack_tfhe_cloud_chunk(MultipartEnvelope message);
 
 MultipartEnvelope pack_tfhe_cloud_ack(
     Envelope envelope,
@@ -79,7 +82,7 @@ TfheCloudFinish unpack_tfhe_cloud_finish(const MultipartEnvelope& message);
 
 MultipartEnvelope pack_tfhe_cloud_result(
     Envelope envelope,
-    const TfheCloudResult& result);
-TfheCloudResult unpack_tfhe_cloud_result(const MultipartEnvelope& message);
+    TfheCloudResult result);
+TfheCloudResult unpack_tfhe_cloud_result(MultipartEnvelope message);
 
 } // namespace v0id::net

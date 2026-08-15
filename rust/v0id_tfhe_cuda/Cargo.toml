@@ -1,0 +1,11 @@
+[package]
+name = "v0id_tfhe_cuda"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tfhe = { version = "=1.6.1", features = ["integer", "gpu"] }

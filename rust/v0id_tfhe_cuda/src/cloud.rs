@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 use std::ptr;
 
 const CLOUD_PROTOCOL_VERSION: u32 = 1;
-const MAX_SERIALIZED_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// Full encrypted SHA3 images are multi-gigabyte objects at the current
+// high-level TFHE-rs integer representation. Keep a hard research ceiling,
+// but make it large enough for the 2105-instruction CUDA stress corpus.
+// This is not a production network-message recommendation; transport will
+// ultimately stream/chunk evaluator material rather than require one blob.
+const MAX_SERIALIZED_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_INPUT_WORDS: usize = 4096;
 const MAX_INSTRUCTIONS: usize = 65536;
 const MAX_OUTPUT_WORDS: usize = 64;

@@ -1,6 +1,7 @@
 #include "boolean_ir_mutator.hpp"
 #include "boolean_program_image_mutator.hpp"
 #include "encrypted_boolean_program.hpp"
+#include "gpu_fhe_backend.hpp"
 #include "keccak_program_image.hpp"
 
 #include "binfhecontext.h"
@@ -125,6 +126,17 @@ std::string hex_prefix(const std::vector<std::uint8_t>& bytes,
     return out.str();
 }
 
+const char* gpu_stage_name(v0id::fhe::GpuFheProgressStage stage) {
+    using Stage = v0id::fhe::GpuFheProgressStage;
+    switch (stage) {
+    case Stage::KeyGeneration: return "GPU key generation";
+    case Stage::InputEncryption: return "GPU input encryption";
+    case Stage::Execution: return "GPU encrypted execution";
+    case Stage::OutputSelection: return "GPU output selection";
+    }
+    return "GPU FHE";
+}
+
 } // namespace
 
 int main() try {
@@ -152,8 +164,14 @@ int main() try {
     const auto logical_bits =
         v0id::fhe::encrypted_boolean_program_logical_bits(mutated);
 
+#ifdef V0ID_GPU_FHE_ENABLED
+    constexpr const char* profile = "TFHE-rs 1.6.1 GPU default parameters";
+#else
+    constexpr const char* profile = "OpenFHE STD128Q";
+#endif
+
     std::cout << "V0ID full encrypted SHA3-512 stress test\n"
-              << "  BinFHE profile            : OpenFHE STD128Q\n"
+              << "  FHE profile               : " << profile << '\n'
               << "  GPU compile request       : "
               << (v0id::fhe::kGpuFheCompileRequested ? "ON" : "OFF") << '\n'
               << "  requested FHE backend     : "
@@ -170,6 +188,54 @@ int main() try {
               << mutation_stats.identity_instructions_inserted << '\n'
               << "  expected digest prefix    : " << hex_prefix(openssl_digest) << "...\n\n";
 
+#ifdef V0ID_GPU_FHE_ENABLED
+    require(v0id::fhe::tfhe_cuda_backend_available(),
+            "GPU build does not have the TFHE CUDA sidecar linked");
+
+    std::cout << "launching full mutated SHA3 on TFHE-rs CUDA...\n";
+    const auto gpu_start = Clock::now();
+    v0id::fhe::GpuFheProgressStage last_stage =
+        v0id::fhe::GpuFheProgressStage::KeyGeneration;
+    std::size_t last_print = static_cast<std::size_t>(-1);
+
+    const auto decrypted_words =
+        v0id::fhe::evaluate_boolean_program_image_tfhe_cuda(
+            mutated, input_words,
+            [&](v0id::fhe::GpuFheProgressStage stage,
+                std::size_t current,
+                std::size_t total) {
+                const bool stage_changed = stage != last_stage;
+                const bool interesting = current == 0 || current == total ||
+                    current < 8 || current % 8 == 0;
+                if (!stage_changed && !interesting && current == last_print)
+                    return;
+                if (!stage_changed && !interesting)
+                    return;
+
+                last_stage = stage;
+                last_print = current;
+                const auto elapsed = std::chrono::duration<double>(
+                    Clock::now() - gpu_start).count();
+                std::cout << "  [CUDA] " << gpu_stage_name(stage)
+                          << ' ' << current << '/' << total
+                          << " elapsed=" << elapsed << " s\n";
+            });
+
+    const auto decrypted_digest = words_to_bytes(decrypted_words);
+    require(decrypted_digest == expected_digest,
+            "TFHE CUDA SHA3 digest differs from mutated plaintext image");
+    require(decrypted_digest == openssl_digest,
+            "TFHE CUDA SHA3 digest differs from OpenSSL SHA3-512");
+
+    std::cout << "[PASS] full mutated compact SHA3 executes through TFHE-rs CUDA\n"
+              << "[PASS] CUDA FHE digest matches mutated plaintext image\n"
+              << "[PASS] CUDA FHE digest matches OpenSSL SHA3-512\n"
+              << "digest prefix: " << hex_prefix(decrypted_digest) << "...\n"
+              << "CUDA wall time: "
+              << std::chrono::duration<double>(Clock::now() - gpu_start).count()
+              << " s\n";
+    return 0;
+#else
     lbcrypto::BinFHEContext cc;
     std::cout << "generating STD128Q BinFHE context...\n";
     cc.GenerateBinFHEContext(lbcrypto::STD128Q);
@@ -260,6 +326,7 @@ int main() try {
               << "encrypted instructions completed: "
               << remote.completed_instructions() << '\n';
     return 0;
+#endif
 } catch (const std::exception& e) {
     std::cerr << "full encrypted SHA3 stress test FAILED: " << e.what() << '\n';
     return 1;

@@ -8,6 +8,11 @@
 namespace v0id::fhe {
 namespace {
 
+[[noreturn]] void throw_unavailable() {
+    throw std::runtime_error(
+        "TFHE CUDA backend was not compiled; configure with V0ID_ENABLE_GPU_FHE=ON");
+}
+
 #ifdef V0ID_GPU_FHE_ENABLED
 
 struct TfheInstructionC {
@@ -145,11 +150,6 @@ TfheProgressFn install_progress(GpuFheProgressCallback& progress) {
 
 void clear_progress() {
     g_progress = nullptr;
-}
-
-[[noreturn]] void throw_unavailable() {
-    throw std::runtime_error(
-        "TFHE CUDA backend was not compiled; configure with V0ID_ENABLE_GPU_FHE=ON");
 }
 
 #endif

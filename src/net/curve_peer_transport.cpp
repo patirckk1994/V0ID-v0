@@ -1,14 +1,17 @@
 #include "curve_peer_transport.hpp"
 
 #include <zmq.h>
+#include <openssl/evp.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <future>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -18,6 +21,7 @@ namespace {
 constexpr std::size_t MAX_MULTIPART_FRAMES = 16;
 constexpr const char* ZAP_ENDPOINT = "inproc://zeromq.zap.01";
 constexpr const char* ZAP_DOMAIN = "v0id.tfhe.cloud.v1";
+constexpr auto IDEMPOTENT_REPLAY_TTL = std::chrono::minutes(30);
 
 struct RawAuthorizedClient {
     std::array<std::uint8_t, 32> public_key{};
@@ -282,6 +286,71 @@ MultipartEnvelope recv_multipart(zmq::socket_t& socket,
     return out;
 }
 
+void digest_update(EVP_MD_CTX* ctx, const void* data, std::size_t size) {
+    if (size != 0 && EVP_DigestUpdate(ctx, data, size) != 1)
+        throw std::runtime_error("SHA3-512 request fingerprint update failed");
+}
+
+void digest_update_u64(EVP_MD_CTX* ctx, std::uint64_t value) {
+    std::array<std::uint8_t, 8> encoded{};
+    for (int i = 7; i >= 0; --i) {
+        encoded[static_cast<std::size_t>(7 - i)] =
+            static_cast<std::uint8_t>((value >> (i * 8)) & 0xffu);
+    }
+    digest_update(ctx, encoded.data(), encoded.size());
+}
+
+void digest_update_blob(EVP_MD_CTX* ctx, const void* data, std::size_t size) {
+    digest_update_u64(ctx, static_cast<std::uint64_t>(size));
+    digest_update(ctx, data, size);
+}
+
+std::array<std::uint8_t, 64> request_digest512(
+    const MultipartEnvelope& request) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx)
+        throw std::runtime_error("EVP_MD_CTX_new failed for CURVE replay fingerprint");
+
+    std::array<std::uint8_t, 64> digest{};
+    unsigned int written = 0;
+    try {
+        if (EVP_DigestInit_ex(ctx, EVP_sha3_512(), nullptr) != 1)
+            throw std::runtime_error("SHA3-512 unavailable for CURVE replay fingerprint");
+
+        constexpr std::string_view domain = "V0ID-CURVE-IDEMPOTENT-REQUEST-v1";
+        digest_update_blob(ctx, domain.data(), domain.size());
+        digest_update_blob(ctx,
+                           request.authenticated_user_id.data(),
+                           request.authenticated_user_id.size());
+
+        const auto envelope_wire = request.envelope.encode();
+        digest_update_blob(ctx, envelope_wire.data(), envelope_wire.size());
+        digest_update_u64(ctx, static_cast<std::uint64_t>(request.frames.size()));
+        for (const auto& frame : request.frames)
+            digest_update_blob(ctx, frame.data(), frame.size());
+
+        if (EVP_DigestFinal_ex(ctx, digest.data(), &written) != 1 ||
+            written != digest.size())
+            throw std::runtime_error("SHA3-512 CURVE replay fingerprint finalization failed");
+    } catch (...) {
+        EVP_MD_CTX_free(ctx);
+        throw;
+    }
+    EVP_MD_CTX_free(ctx);
+    return digest;
+}
+
+bool replay_cacheable_reply(MessageType type) {
+    switch (type) {
+        case MessageType::tfhe_session_ready:
+        case MessageType::tfhe_chunk_ready:
+        case MessageType::tfhe_job_result:
+            return true;
+        default:
+            return false;
+    }
+}
+
 } // namespace
 
 bool curve_transport_supported() {
@@ -331,11 +400,63 @@ CurvePeerServer::~CurvePeerServer() {
 }
 
 MultipartEnvelope CurvePeerServer::receive_multipart() {
-    return recv_multipart(socket_, true);
+    if (pending_request_)
+        throw std::runtime_error(
+            "CURVE server receive called before replying to pending request");
+
+    while (true) {
+        auto request = recv_multipart(socket_, true);
+        const auto digest = request_digest512(request);
+        const auto now = std::chrono::steady_clock::now();
+
+        for (auto it = replay_by_user_.begin(); it != replay_by_user_.end();) {
+            if (now - it->second.stored_at > IDEMPOTENT_REPLAY_TTL)
+                it = replay_by_user_.erase(it);
+            else
+                ++it;
+        }
+
+        const auto user_id = request.authenticated_user_id;
+        const auto replay = replay_by_user_.find(user_id);
+        if (replay != replay_by_user_.end() &&
+            replay->second.request_digest == digest) {
+            // Exact authenticated retry: return the prior success without
+            // exposing the request to application code a second time. This is
+            // what makes lost INSTALL/CHUNK/FINISH replies safe to retry.
+            replay->second.stored_at = now;
+            send_multipart(socket_, replay->second.reply);
+            continue;
+        }
+
+        // A distinct request means this authenticated client has advanced its
+        // protocol state; its prior one-request retry window can be discarded.
+        replay_by_user_.erase(user_id);
+        pending_request_ = true;
+        pending_user_id_ = user_id;
+        pending_request_digest_ = digest;
+        return request;
+    }
 }
 
 void CurvePeerServer::reply_multipart(const MultipartEnvelope& message) {
+    if (!pending_request_)
+        throw std::runtime_error(
+            "CURVE server reply has no pending authenticated request");
+
+    if (replay_cacheable_reply(message.envelope.type)) {
+        ReplayRecord record;
+        record.request_digest = pending_request_digest_;
+        record.reply = message;
+        record.stored_at = std::chrono::steady_clock::now();
+        replay_by_user_.insert_or_assign(pending_user_id_, std::move(record));
+    } else {
+        replay_by_user_.erase(pending_user_id_);
+    }
+
     send_multipart(socket_, message);
+    pending_request_ = false;
+    pending_user_id_.clear();
+    pending_request_digest_ = {};
 }
 
 std::string CurvePeerServer::last_endpoint() const {

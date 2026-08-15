@@ -11,6 +11,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tfhe = { version = "=1.6.1", features = ["integer", "gpu"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3.3"
 
 # TFHE-rs 1.6.1 was released against these exact workspace crate versions.
 # Its crates.io manifest expresses some of them as semver ranges; in particular

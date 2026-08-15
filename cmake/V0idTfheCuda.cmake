@@ -45,8 +45,18 @@ function(v0id_finish_tfhe_cuda_setup)
             "  rustup toolchain install 1.91.1 --profile minimal")
     endif()
 
+    # Resolve the actual nvcc binary rather than just the PATH entry. This is
+    # important on systems that use /usr/bin alternatives or a /usr/local/cuda
+    # symlink to select among multiple installed CUDA toolkits.
+    get_filename_component(V0ID_NVCC_REALPATH
+        "${V0ID_NVCC_EXECUTABLE}" REALPATH)
+    get_filename_component(V0ID_CUDA_BIN_DIR
+        "${V0ID_NVCC_REALPATH}" DIRECTORY)
+    get_filename_component(V0ID_CUDA_TOOLKIT_ROOT
+        "${V0ID_CUDA_BIN_DIR}" DIRECTORY)
+
     execute_process(
-        COMMAND "${V0ID_NVCC_EXECUTABLE}" --version
+        COMMAND "${V0ID_NVCC_REALPATH}" --version
         RESULT_VARIABLE V0ID_NVCC_RESULT
         OUTPUT_VARIABLE V0ID_NVCC_VERSION_TEXT
         ERROR_VARIABLE V0ID_NVCC_VERSION_ERROR
@@ -104,10 +114,20 @@ function(v0id_finish_tfhe_cuda_setup)
     set(V0ID_TFHE_CUDA_LIBRARY
         "${V0ID_TFHE_CUDA_TARGET_DIR}/release/libv0id_tfhe_cuda.so")
 
+    # tfhe-cuda-backend configures CUDA in a nested CMake process launched by
+    # Cargo's cmake crate. The outer V0ID configure finding nvcc is not enough:
+    # explicitly export the CUDA compiler and toolkit to that child process.
+    # Upstream also invokes bare `nvcc` while probing the GPU architecture, so
+    # prepend the selected toolkit's bin directory to PATH as well.
     add_custom_command(
         OUTPUT "${V0ID_TFHE_CUDA_LIBRARY}"
         COMMAND ${CMAKE_COMMAND} -E env
             CARGO_TARGET_DIR=${V0ID_TFHE_CUDA_TARGET_DIR}
+            CUDACXX=${V0ID_NVCC_REALPATH}
+            CUDAHOSTCXX=${CMAKE_CXX_COMPILER}
+            CUDA_HOME=${V0ID_CUDA_TOOLKIT_ROOT}
+            CUDAToolkit_ROOT=${V0ID_CUDA_TOOLKIT_ROOT}
+            "PATH=${V0ID_CUDA_BIN_DIR}:$ENV{PATH}"
             ${V0ID_CARGO_EXECUTABLE} build
                 --manifest-path ${V0ID_TFHE_CUDA_MANIFEST}
                 --release
@@ -154,7 +174,8 @@ function(v0id_finish_tfhe_cuda_setup)
     message(STATUS "V0ID TFHE CUDA backend: ENABLED")
     message(STATUS "  cargo       : ${V0ID_CARGO_EXECUTABLE}")
     message(STATUS "  rustc       : ${V0ID_RUSTC_VERSION_TEXT}")
-    message(STATUS "  nvcc        : ${V0ID_NVCC_EXECUTABLE} (CUDA ${V0ID_CUDA_TOOLKIT_VERSION})")
+    message(STATUS "  nvcc        : ${V0ID_NVCC_REALPATH} (CUDA ${V0ID_CUDA_TOOLKIT_VERSION})")
+    message(STATUS "  CUDA root   : ${V0ID_CUDA_TOOLKIT_ROOT}")
     message(STATUS "  GPU CC      : ${V0ID_GPU_COMPUTE_CAPABILITY}")
     message(STATUS "  Rust sidecar: ${V0ID_TFHE_CUDA_LIBRARY}")
 endfunction()

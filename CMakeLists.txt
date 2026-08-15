@@ -163,6 +163,14 @@ add_executable(v0id-series-first-stack-tests
 )
 target_link_libraries(v0id-series-first-stack-tests PRIVATE v0id_core)
 
+# Fast plaintext gate for the execution-bound polymorphism experiment. It uses
+# one secret state-label encoding per round boundary, so a semantic fixed point
+# does not also become a stable encrypted-machine representation.
+add_executable(v0id-round-morph-schedule-tests
+    src/polymorph/round_morph_schedule_tests.cpp
+)
+target_link_libraries(v0id-round-morph-schedule-tests PRIVATE v0id_core)
+
 # PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
 # semantic job, exact generator implementation, morphed executable, profile,
 # session/job/epoch and issuer-private challenge. This does not claim to prove

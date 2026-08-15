@@ -230,6 +230,26 @@ target_link_libraries(v0id-malicious-evaluator-harness PRIVATE
 )
 v0id_use_openfhe(v0id-malicious-evaluator-harness)
 
+# Intended execution-binding experiment: the client derives a different hidden
+# state-label encoding for every round boundary, fingerprints the complete
+# ordered encrypted schedule, then checks the final hidden state as well as the
+# semantic tape. The 2/4 fixed-point cheat is expected to retain the right tape
+# but fail the boundary-4 state check.
+add_executable(v0id-round-morph-fhe-harness
+    src/integrity/round_morph_fhe_harness.cpp
+    src/integrity/toy_fingerprint.cpp
+    src/fhe/remote_machine.cpp
+)
+target_include_directories(v0id-round-morph-fhe-harness PRIVATE
+    src/fhe
+    src/integrity
+)
+target_link_libraries(v0id-round-morph-fhe-harness PRIVATE
+    v0id_core
+    OpenSSL::Crypto
+)
+v0id_use_openfhe(v0id-round-morph-fhe-harness)
+
 # Real standardized KEM composition gate. OpenSSL 3.5+ supplies ML-KEM-768;
 # when the provider is unavailable the executable reports SKIP rather than
 # pretending a synthetic shared secret exercised the KEM runtime.
@@ -381,4 +401,5 @@ if(UNIX AND NOT APPLE)
     target_link_options(v0id-fhe-peer PRIVATE -Wl,--no-as-needed)
     target_link_options(v0id-remote-machine PRIVATE -Wl,--no-as-needed)
     target_link_options(v0id-malicious-evaluator-harness PRIVATE -Wl,--no-as-needed)
+    target_link_options(v0id-round-morph-fhe-harness PRIVATE -Wl,--no-as-needed)
 endif()

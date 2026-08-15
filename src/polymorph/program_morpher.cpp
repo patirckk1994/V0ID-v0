@@ -29,10 +29,6 @@ public:
         }
     }
 
-    std::uint32_t word32() {
-        return static_cast<std::uint32_t>(next64() & 0xffffffffu);
-    }
-
 private:
     static void put_u64(std::array<unsigned char, 24>& msg,
                         std::size_t offset,
@@ -112,15 +108,14 @@ MorphedProgram ProgramMorpher::morph(const v0id::core::Program& base,
                                      std::size_t base_initial_state,
                                      std::size_t public_state_count,
                                      const MorphSeed& seed,
-                                     std::size_t integrity_candidate_count) {
+                                     std::size_t legacy_integrity_candidate_count) {
     base.validate();
+    (void)legacy_integrity_candidate_count;
 
     if (base_initial_state >= base.states)
         throw std::runtime_error("base initial state out of range");
     if (public_state_count < base.states)
         throw std::runtime_error("public state count smaller than base program");
-    if (integrity_candidate_count == 0)
-        throw std::runtime_error("integrity candidate count must be positive");
 
     KmacMorphRng rng(seed);
     const auto slots = shuffled_slots(public_state_count, rng);
@@ -156,16 +151,8 @@ MorphedProgram ProgramMorpher::morph(const v0id::core::Program& base,
 
     out.initial_state = out.manifest.base_to_morphed[base_initial_state];
 
-    // Client-only integrity metadata. None of these plaintext values belongs in
-    // the evaluator protocol. The client will encrypt the nonce/masks before
-    // outsourcing the integrity computation and keep the selected slot private.
-    out.manifest.integrity_nonce = rng.word32();
-    out.manifest.integrity_output_slot =
-        static_cast<std::size_t>(rng.uniform(integrity_candidate_count));
-    out.manifest.integrity_output_masks.reserve(integrity_candidate_count);
-    for (std::size_t i = 0; i < integrity_candidate_count; ++i)
-        out.manifest.integrity_output_masks.push_back(rng.word32());
-
+    // ToyFingerprint metadata is intentionally not derived anymore. The legacy
+    // compatibility fields in MorphManifest therefore remain zero/empty.
     out.program.validate();
     return out;
 }
@@ -176,9 +163,10 @@ RoundMorphedProgramSchedule ProgramMorpher::morph_round_schedule(
     std::size_t public_state_count,
     std::size_t rounds,
     const MorphSeed& seed,
-    std::size_t integrity_candidate_count) {
+    std::size_t legacy_integrity_candidate_count) {
 
     base.validate();
+    (void)legacy_integrity_candidate_count;
     if (base_initial_state >= base.states)
         throw std::runtime_error("base initial state out of range");
     if (rounds == 0)
@@ -188,8 +176,6 @@ RoundMorphedProgramSchedule ProgramMorpher::morph_round_schedule(
     if (public_state_count < rounds + 1)
         throw std::runtime_error(
             "round-polymorphic morph needs public_state_count >= rounds + 1");
-    if (integrity_candidate_count == 0)
-        throw std::runtime_error("integrity candidate count must be positive");
 
     KmacMorphRng rng(seed);
 
@@ -222,10 +208,6 @@ RoundMorphedProgramSchedule ProgramMorpher::morph_round_schedule(
         const auto& current_map = out.manifest.logical_to_morphed[round];
         const auto& next_map = out.manifest.logical_to_morphed[round + 1];
 
-        // Every logical public state participates in the same round-to-round
-        // representation change. Real states execute the base semantics;
-        // padding states remain harmless no-ops while changing their hidden
-        // public label too, so dummy positions do not stay stable across rounds.
         for (std::size_t logical = 0; logical < public_state_count; ++logical) {
             const auto state = current_map[logical];
             for (int read = 0; read <= 1; ++read) {
@@ -256,13 +238,7 @@ RoundMorphedProgramSchedule ProgramMorpher::morph_round_schedule(
 
     out.initial_state = out.manifest.logical_to_morphed.front()[base_initial_state];
 
-    out.manifest.integrity_nonce = rng.word32();
-    out.manifest.integrity_output_slot =
-        static_cast<std::size_t>(rng.uniform(integrity_candidate_count));
-    out.manifest.integrity_output_masks.reserve(integrity_candidate_count);
-    for (std::size_t i = 0; i < integrity_candidate_count; ++i)
-        out.manifest.integrity_output_masks.push_back(rng.word32());
-
+    // No retired fingerprint nonce/slot/mask material is generated here either.
     return out;
 }
 

@@ -147,6 +147,13 @@ function(v0id_finish_tfhe_cuda_setup)
     add_library(v0id_tfhe_cuda SHARED IMPORTED GLOBAL)
     set_target_properties(v0id_tfhe_cuda PROPERTIES
         IMPORTED_LOCATION "${V0ID_TFHE_CUDA_LIBRARY}"
+        # Rust cdylibs do not necessarily carry an ELF SONAME. Without this,
+        # CMake can pass a path-containing library name to the linker, which
+        # becomes a DT_NEEDED entry such as
+        # "tfhe-cuda-target/release/libv0id_tfhe_cuda.so". The dynamic loader
+        # then treats it as a pathname and does not use RPATH. Tell CMake to
+        # link it by -lv0id_tfhe_cuda instead.
+        IMPORTED_NO_SONAME TRUE
     )
 
     if(NOT TARGET v0id_encrypted_boolean_program)

@@ -5,11 +5,15 @@
 
 #include "binfhecontext.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -25,6 +29,52 @@ constexpr std::size_t PUBLIC_STATES = 5;
 constexpr std::size_t TAPE_CELLS = 8;
 constexpr std::size_t REQUESTED_ROUNDS = 4;
 constexpr std::size_t INTEGRITY_SLOTS = 4;
+
+// BinFHE bootstrapping can leave this harness silent for minutes at a time.
+// Keep stdout visibly alive during every expensive phase so "slow" is never
+// confused with "hung". The worker sleeps on a condition variable so teardown
+// does not add a full heartbeat interval after a stage finishes.
+class Heartbeat {
+public:
+    explicit Heartbeat(std::string label,
+                       std::chrono::seconds interval = std::chrono::seconds(10))
+        : label_(std::move(label)),
+          interval_(interval),
+          start_(std::chrono::steady_clock::now()),
+          thread_([this] { run(); }) {}
+
+    ~Heartbeat() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable())
+            thread_.join();
+    }
+
+    Heartbeat(const Heartbeat&) = delete;
+    Heartbeat& operator=(const Heartbeat&) = delete;
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!cv_.wait_for(lock, interval_, [this] { return stop_; })) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_);
+            std::cout << "  ... " << label_ << " still running ("
+                      << elapsed.count() << " s elapsed)\n";
+        }
+    }
+
+    std::string label_;
+    std::chrono::seconds interval_;
+    std::chrono::steady_clock::time_point start_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_{false};
+    std::thread thread_;
+};
 
 struct PlainRun {
     std::size_t state{};
@@ -129,12 +179,28 @@ int main() try {
     BinFHEContext cc;
     cc.GenerateBinFHEContext(STD128Q);
     const auto sk = cc.KeyGen();
+
     std::cout << "generating bootstrapping keys...\n";
-    cc.BTKeyGen(sk);
+    const auto bt_start = std::chrono::steady_clock::now();
+    {
+        Heartbeat heartbeat("BTKeyGen");
+        cc.BTKeyGen(sk);
+    }
+    const std::chrono::duration<double> bt_elapsed =
+        std::chrono::steady_clock::now() - bt_start;
+    std::cout << "bootstrapping keys complete (" << bt_elapsed.count() << " s)\n";
 
     std::cout << "encrypting full round-polymorphic schedule...\n";
-    const auto encrypted_program_bits = v0id::integrity::encrypt_plain_bits(
-        cc, sk, plain_schedule_bits);
+    std::vector<LWECiphertext> encrypted_program_bits;
+    const auto enc_start = std::chrono::steady_clock::now();
+    {
+        Heartbeat heartbeat("schedule encryption");
+        encrypted_program_bits = v0id::integrity::encrypt_plain_bits(
+            cc, sk, plain_schedule_bits);
+    }
+    const std::chrono::duration<double> enc_elapsed =
+        std::chrono::steady_clock::now() - enc_start;
+    std::cout << "schedule encryption complete (" << enc_elapsed.count() << " s)\n";
 
     std::vector<int> initial_state(PUBLIC_STATES, 0);
     initial_state.at(schedule.initial_state) = 1;
@@ -157,9 +223,19 @@ int main() try {
     // not one stable program table. This is still the deliberately toy mixer;
     // it exists to exercise the architecture before a real Keccak/KMAC circuit.
     std::cout << "homomorphically fingerprinting the complete encrypted schedule...\n";
-    const auto encrypted_fingerprint = v0id::integrity::toy_fingerprint32_fhe(
-        cc, encrypted_program_bits, encrypted_tape,
-        encrypted_nonce, encrypted_fp_state);
+    v0id::integrity::EncryptedDigest32 encrypted_fingerprint{};
+    const auto fp_start = std::chrono::steady_clock::now();
+    {
+        Heartbeat heartbeat("encrypted schedule fingerprint");
+        encrypted_fingerprint = v0id::integrity::toy_fingerprint32_fhe(
+            cc, encrypted_program_bits, encrypted_tape,
+            encrypted_nonce, encrypted_fp_state);
+    }
+    const std::chrono::duration<double> fp_elapsed =
+        std::chrono::steady_clock::now() - fp_start;
+    std::cout << "encrypted schedule fingerprint complete ("
+              << fp_elapsed.count() << " s)\n";
+
     const auto recovered_fingerprint = v0id::integrity::decrypt_u32_bits(
         cc, sk, encrypted_fingerprint);
     require(recovered_fingerprint == expected_fingerprint,
@@ -179,7 +255,22 @@ int main() try {
         encrypted_head, encrypted_tape, cc.Encrypt(sk, 0));
     require(honest.uses_round_schedule(),
             "remote machine failed to recognize concatenated round schedule");
-    honest.run_fixed();
+
+    for (std::size_t round = 0; round < REQUESTED_ROUNDS; ++round) {
+        const auto label = "honest round " + std::to_string(round + 1) + "/" +
+                           std::to_string(REQUESTED_ROUNDS);
+        std::cout << "  [honest] round " << (round + 1) << '/' << REQUESTED_ROUNDS
+                  << " starting...\n";
+        const auto round_start = std::chrono::steady_clock::now();
+        {
+            Heartbeat heartbeat(label);
+            honest.step();
+        }
+        const std::chrono::duration<double> round_elapsed =
+            std::chrono::steady_clock::now() - round_start;
+        std::cout << "  [honest] round " << (round + 1) << '/' << REQUESTED_ROUNDS
+                  << " done (" << round_elapsed.count() << " s)\n";
+    }
 
     const auto honest_tape = decrypt_bits(cc, sk, honest.tape_bits());
     const auto honest_state = decode_one_hot(
@@ -194,8 +285,20 @@ int main() try {
     RemoteEncryptedMachine early(
         cc, shape, encrypted_program_bits, encrypted_state,
         encrypted_head, encrypted_tape, cc.Encrypt(sk, 0));
-    early.step();
-    early.step();
+
+    for (std::size_t round = 0; round < 2; ++round) {
+        const auto label = "2/4 evaluator round " + std::to_string(round + 1) + "/2";
+        std::cout << "  [2/4] round " << (round + 1) << "/2 starting...\n";
+        const auto round_start = std::chrono::steady_clock::now();
+        {
+            Heartbeat heartbeat(label);
+            early.step();
+        }
+        const std::chrono::duration<double> round_elapsed =
+            std::chrono::steady_clock::now() - round_start;
+        std::cout << "  [2/4] round " << (round + 1) << "/2 done ("
+                  << round_elapsed.count() << " s)\n";
+    }
 
     const auto early_tape = decrypt_bits(cc, sk, early.tape_bits());
     const auto early_state = decode_one_hot(

@@ -163,6 +163,34 @@ add_executable(v0id-series-first-stack-tests
 )
 target_link_libraries(v0id-series-first-stack-tests PRIVATE v0id_core)
 
+# PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
+# semantic job, exact generator implementation, morphed executable, profile,
+# session/job/epoch and issuer-private challenge. This does not claim to prove
+# remote execution; that remains a separate verifiable-computation problem.
+add_library(v0id_quine
+    src/integrity/quine_hash.cpp
+    src/integrity/round_receipt.cpp
+)
+target_include_directories(v0id_quine PUBLIC
+    src/integrity
+    src/fhe
+)
+target_link_libraries(v0id_quine PUBLIC v0id_core OpenSSL::Crypto)
+
+add_executable(v0id-quine-audit-tests
+    src/integrity/quine_audit_tests.cpp
+)
+target_link_libraries(v0id-quine-audit-tests PRIVATE v0id_quine)
+
+# Round-receipt execution-bound audit: a cheap SHA3-512 hash chain over
+# evaluator-visible per-round ciphertext digests, bound to session/job/epoch/
+# profile/round-count. Pure logic, no OpenFHE required, so it runs fast and
+# independently of the slow BinFHE-backed malicious evaluator harness below.
+add_executable(v0id-round-receipt-tests
+    src/integrity/round_receipt_tests.cpp
+)
+target_link_libraries(v0id-round-receipt-tests PRIVATE v0id_quine)
+
 # Phase-1 polymorphism leakage benchmark. It separates deliberately public fixed
 # evaluator shape from a stronger plaintext diagnostic that the current BinFHE
 # evaluator does not receive. Later wire/timing work is deferred behind execution
@@ -175,8 +203,8 @@ target_link_libraries(v0id-polymorphism-distinguisher PRIVATE v0id_core)
 # Defensive malicious-evaluator harness. It uses the real ProgramMorpher,
 # RemoteEncryptedMachine and legacy FHE fingerprint plumbing to demonstrate that
 # an evaluator can skip requested rounds while preserving an accepted final
-# output for a fixed-point job. Exit 1 means the expected architectural break was
-# reproduced; this target exists to define the execution-proof requirement.
+# output for a fixed-point job -- and that the round-receipt audit above
+# rejects that same cheat while staying far cheaper than recomputation.
 add_executable(v0id-malicious-evaluator-harness
     src/integrity/malicious_evaluator_harness.cpp
     src/integrity/toy_fingerprint.cpp
@@ -188,7 +216,9 @@ target_include_directories(v0id-malicious-evaluator-harness PRIVATE
 )
 target_link_libraries(v0id-malicious-evaluator-harness PRIVATE
     v0id_core
+    v0id_quine
     OpenSSL::Crypto
+    Threads::Threads
 )
 v0id_use_openfhe(v0id-malicious-evaluator-harness)
 
@@ -209,22 +239,6 @@ target_link_libraries(v0id_coin PUBLIC OpenSSL::Crypto)
 
 add_executable(v0id-work-token-tests src/coin/work_token_tests.cpp)
 target_link_libraries(v0id-work-token-tests PRIVATE v0id_coin)
-
-# PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
-# semantic job, exact generator implementation, morphed executable, profile,
-# session/job/epoch and issuer-private challenge. This does not claim to prove
-# remote execution; that remains a separate verifiable-computation problem.
-add_library(v0id_quine src/integrity/quine_hash.cpp)
-target_include_directories(v0id_quine PUBLIC
-    src/integrity
-    src/fhe
-)
-target_link_libraries(v0id_quine PUBLIC v0id_core OpenSSL::Crypto)
-
-add_executable(v0id-quine-audit-tests
-    src/integrity/quine_audit_tests.cpp
-)
-target_link_libraries(v0id-quine-audit-tests PRIVATE v0id_quine)
 
 # Exact reduced-domain symbolic falsification gate. Affine and degree<=2 ANF
 # recovery are linear in the unknown attacker coefficients, so a bit-packed

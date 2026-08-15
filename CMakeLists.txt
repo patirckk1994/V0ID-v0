@@ -171,13 +171,13 @@ add_executable(v0id-round-morph-schedule-tests
 )
 target_link_libraries(v0id-round-morph-schedule-tests PRIVATE v0id_core)
 
-# PQ-facing plaintext quine commitment. Standard SHA3-512/KMAC-256 bind the
-# semantic job, exact generator implementation, morphed executable, profile,
-# session/job/epoch and issuer-private challenge. This does not claim to prove
-# remote execution; that remains a separate verifiable-computation problem.
+# PQ-facing plaintext quine commitment plus the hash-agnostic canonical subject
+# for the future embedded self-hash. CanonicalSelfImageV1 deliberately names no
+# hash algorithm so private series can exist before algorithm-later selection.
 add_library(v0id_quine
     src/integrity/quine_hash.cpp
     src/integrity/round_receipt.cpp
+    src/integrity/canonical_self_image.cpp
 )
 target_include_directories(v0id_quine PUBLIC
     src/integrity
@@ -189,6 +189,11 @@ add_executable(v0id-quine-audit-tests
     src/integrity/quine_audit_tests.cpp
 )
 target_link_libraries(v0id-quine-audit-tests PRIVATE v0id_quine)
+
+add_executable(v0id-canonical-self-image-tests
+    src/integrity/canonical_self_image_tests.cpp
+)
+target_link_libraries(v0id-canonical-self-image-tests PRIVATE v0id_quine)
 
 # Round-receipt execution-bound audit: a cheap SHA3-512 hash chain over
 # evaluator-visible per-round ciphertext digests, bound to session/job/epoch/

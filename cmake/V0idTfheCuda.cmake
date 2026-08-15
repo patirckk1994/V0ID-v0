@@ -45,9 +45,6 @@ function(v0id_finish_tfhe_cuda_setup)
             "  rustup toolchain install 1.91.1 --profile minimal")
     endif()
 
-    # Resolve the actual nvcc binary rather than just the PATH entry. This is
-    # important on systems that use /usr/bin alternatives or a /usr/local/cuda
-    # symlink to select among multiple installed CUDA toolkits.
     get_filename_component(V0ID_NVCC_REALPATH
         "${V0ID_NVCC_EXECUTABLE}" REALPATH)
     get_filename_component(V0ID_CUDA_BIN_DIR
@@ -92,9 +89,6 @@ function(v0id_finish_tfhe_cuda_setup)
         endif()
     endif()
 
-    # Blackwell (compute capability 10.x / 12.x) first has native CUDA Toolkit
-    # support in 12.8. A newer driver reported by nvidia-smi does not upgrade the
-    # nvcc compiler installed on disk, so fail with a useful diagnostic here.
     if(NOT V0ID_GPU_COMPUTE_CAPABILITY STREQUAL "unknown"
        AND V0ID_GPU_COMPUTE_CAPABILITY VERSION_GREATER_EQUAL "10.0"
        AND V0ID_CUDA_TOOLKIT_VERSION
@@ -114,11 +108,6 @@ function(v0id_finish_tfhe_cuda_setup)
     set(V0ID_TFHE_CUDA_LIBRARY
         "${V0ID_TFHE_CUDA_TARGET_DIR}/release/libv0id_tfhe_cuda.so")
 
-    # tfhe-cuda-backend configures CUDA in a nested CMake process launched by
-    # Cargo's cmake crate. The outer V0ID configure finding nvcc is not enough:
-    # explicitly export the CUDA compiler and toolkit to that child process.
-    # Upstream also invokes bare `nvcc` while probing the GPU architecture, so
-    # prepend the selected toolkit's bin directory to PATH as well.
     add_custom_command(
         OUTPUT "${V0ID_TFHE_CUDA_LIBRARY}"
         COMMAND ${CMAKE_COMMAND} -E env
@@ -148,17 +137,14 @@ function(v0id_finish_tfhe_cuda_setup)
     add_library(v0id_tfhe_cuda SHARED IMPORTED GLOBAL)
     set_target_properties(v0id_tfhe_cuda PROPERTIES
         IMPORTED_LOCATION "${V0ID_TFHE_CUDA_LIBRARY}"
-        # Rust cdylibs do not necessarily carry an ELF SONAME. Without this,
-        # CMake can pass a path-containing library name to the linker, which
-        # becomes a DT_NEEDED entry such as
-        # "tfhe-cuda-target/release/libv0id_tfhe_cuda.so". The dynamic loader
-        # then treats it as a pathname and does not use RPATH. Tell CMake to
-        # link it by -lv0id_tfhe_cuda instead.
         IMPORTED_NO_SONAME TRUE
     )
 
     if(NOT TARGET v0id_encrypted_boolean_program)
         message(FATAL_ERROR "V0ID TFHE CUDA hook ran before encrypted evaluator target existed")
+    endif()
+    if(NOT TARGET v0id_net)
+        message(FATAL_ERROR "V0ID TFHE CUDA hook ran before network transport target existed")
     endif()
 
     target_sources(v0id_encrypted_boolean_program PRIVATE
@@ -198,6 +184,32 @@ function(v0id_finish_tfhe_cuda_setup)
     set_target_properties(v0id-small-fhe-smoke-tests PROPERTIES
         BUILD_RPATH "${V0ID_TFHE_CUDA_TARGET_DIR}/release")
 
+    # Network protocol codec stays independent of the FHE implementation, while
+    # this demo binds it to the real streamed TFHE CUDA evaluator boundary.
+    add_executable(v0id-tfhe-cloud-codec-tests
+        "${CMAKE_SOURCE_DIR}/src/net/tfhe_cloud_codec_tests.cpp"
+        "${CMAKE_SOURCE_DIR}/src/net/tfhe_cloud_codec.cpp")
+    target_include_directories(v0id-tfhe-cloud-codec-tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/net")
+    target_link_libraries(v0id-tfhe-cloud-codec-tests PRIVATE v0id_net)
+
+    add_executable(v0id-tfhe-cloud
+        "${CMAKE_SOURCE_DIR}/src/net/tfhe_cloud_demo.cpp"
+        "${CMAKE_SOURCE_DIR}/src/net/tfhe_cloud_codec.cpp")
+    target_include_directories(v0id-tfhe-cloud PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/net"
+        "${CMAKE_SOURCE_DIR}/src/fhe"
+        "${CMAKE_SOURCE_DIR}/src/integrity")
+    target_link_libraries(v0id-tfhe-cloud PRIVATE
+        v0id_net
+        v0id_encrypted_boolean_program)
+    target_compile_definitions(v0id-tfhe-cloud PRIVATE
+        V0ID_GPU_FHE_ENABLED=1)
+    add_dependencies(v0id-tfhe-cloud
+        v0id-tfhe-cuda-sidecar)
+    set_target_properties(v0id-tfhe-cloud PROPERTIES
+        BUILD_RPATH "${V0ID_TFHE_CUDA_TARGET_DIR}/release")
+
     add_custom_target(v0id-test-large-client
         COMMAND $<TARGET_FILE:v0id-sha3-image-tests>
         COMMAND $<TARGET_FILE:v0id-round-morph-schedule-tests>
@@ -230,6 +242,12 @@ function(v0id_finish_tfhe_cuda_setup)
         USES_TERMINAL
         COMMENT "Running full mutated SHA3 through streamed TFHE CUDA (slow stress route)")
 
+    add_custom_target(v0id-test-tfhe-cloud-codec
+        COMMAND $<TARGET_FILE:v0id-tfhe-cloud-codec-tests>
+        DEPENDS v0id-tfhe-cloud-codec-tests
+        USES_TERMINAL
+        COMMENT "Running TFHE ZeroMQ cloud framing regression tests")
+
     message(STATUS "V0ID TFHE CUDA backend: ENABLED")
     message(STATUS "  cargo       : ${V0ID_CARGO_EXECUTABLE}")
     message(STATUS "  rustc       : ${V0ID_RUSTC_VERSION_TEXT}")
@@ -237,11 +255,8 @@ function(v0id_finish_tfhe_cuda_setup)
     message(STATUS "  CUDA root   : ${V0ID_CUDA_TOOLKIT_ROOT}")
     message(STATUS "  GPU CC      : ${V0ID_GPU_COMPUTE_CAPABILITY}")
     message(STATUS "  Rust sidecar: ${V0ID_TFHE_CUDA_LIBRARY}")
+    message(STATUS "  TFHE cloud  : v0id-tfhe-cloud (ZeroMQ multipart)")
 endfunction()
 
-# The GPU preset loads this only for the first/top-level project() call. The
-# explicit DIRECTORY also makes the hook robust against a stale build tree that
-# still knows about the old injection mechanism: target wiring always runs at
-# the end of V0ID's top-level CMakeLists, after the evaluator targets exist.
 cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
     CALL v0id_finish_tfhe_cuda_setup)

@@ -96,12 +96,16 @@ For a forward layer `N -> M`:
 BACKPROP
     gradient_in       [B,M]   GRADIENT input
     activation_in     [B,N]   ACTIVATION input
+    preactivation     [B,M]   ACTIVATION input
+    activation_out    [B,M]   ACTIVATION input
     weight            [N,M]   WEIGHT input
 
     gradient_out      [B,N]   GRADIENT output
     weight_gradient   [N,M]   GRADIENT output
     bias_gradient     [M]     GRADIENT output
 ```
+
+The precompiler deliberately feeds both the dense preactivation and the post-activation value into the reverse-pass node. That keeps enough forward state available for a later numerical backend to implement activation derivatives without having to reconstruct hidden intermediate values from unrelated graph state.
 
 The reverse gradient chain is generated automatically:
 

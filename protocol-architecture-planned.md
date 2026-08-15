@@ -487,3 +487,215 @@ The architecture does not automatically need:
 - a permanent mining-to-FHE conversion ratio.
 
 If any of those are introduced, they must solve a specific requirement and survive a separate threat/cost analysis.
+
+## 15. Homomorphic modular neural execution profile
+
+The planned neural profile treats a neural network as a modular composition/dataflow object that can run either clear or homomorphically encrypted without changing the model identity.
+
+### 15.1 End-to-end neural input path
+
+```text
+TOKEN STREAM / NUMERIC INPUT
+             |
+             v
+    Token <-> Neuron Codec
+             |
+             v
+ Resolution / Nearest Mapper
+             |
+             +------------------------------+
+             |                              |
+      plaintext context              encrypted context
+             |                              |
+             +--------------+---------------+
+                            |
+                            v
+                    Modular NeuralGraph
+                     /      |       \
+                built-in  Wasm   stateful modules
+                     \      |       /
+                            v
+                  selected execution backend
+                     |                |
+                 PLAIN_CPU        TFHE_CUDA
+                                      |
+                                      v
+                         distributed encrypted workers
+                                      |
+                         feedforward / backprop /
+                              weight update
+                                      |
+                                      v
+                           encrypted output/state
+```
+
+### 15.2 Token <-> firing-neuron representation
+
+A versioned `TokenNeuronCodec` must translate symbolic tokens into a canonical firing-neuron representation and translate valid output firing patterns back into tokens or token candidates.
+
+Possible codec strategies include one-hot firing, sparse patterns or bounded activation codes, but the graph/backend must depend on the codec interface rather than one fixed encoding.
+
+Remote execution must bind the exact codec/vocabulary identity so the same numeric firing pattern cannot be interpreted under a silently substituted token scheme.
+
+### 15.3 Numerical resolution and nearest-neighbor mapping
+
+A separate resolution layer maps a broad numerical input range to a finite set of representative values.
+
+For range `[L,H]` and resolution `R`:
+
+```text
+[L,H]
+  |
+  +--> q[0] q[1] ... q[R-1]
+                 |
+input x ---------+
+                 |
+         nearest representative
+                 |
+                 v
+          canonical neural value
+```
+
+The first implementation may use uniform intervals. The architecture also permits a committed non-uniform resolution table later.
+
+If the source number is secret, nearest-representative selection may be executed homomorphically. If the selected trust policy permits client-side preprocessing, the client may quantize before encryption.
+
+### 15.4 Context has both location and protection policy
+
+Context must not be represented by one ambiguous flag.
+
+Location:
+
+```text
+LOCAL_CLIENT
+CLOUD_CONTENT_ADDRESSED
+```
+
+Protection:
+
+```text
+PLAINTEXT_CONTEXT
+ENCRYPTED_CONTEXT
+```
+
+These combine independently, e.g. local encrypted context means the client selects context locally and encrypts it before the cloud sees it; cloud encrypted context means the evaluator resolves a content-addressed ciphertext object and feeds it into the encrypted graph without plaintext recovery.
+
+The invocation commitment must bind context checksum, location and protection policy.
+
+### 15.5 Modular feedforward/training graph
+
+The module tree describes ownership while typed ports describe actual flow.
+
+```text
+model
+├── input-pipeline
+│   ├── token-neuron-codec
+│   ├── resolution-map
+│   └── context-select
+├── network
+│   ├── layer-0
+│   ├── layer-1
+│   └── custom-neural.wasm
+└── trainer
+    ├── loss
+    ├── backprop
+    └── weight-update
+```
+
+Typed ports may carry:
+
+```text
+ACTIVATION
+GRADIENT
+WEIGHT
+BIAS
+CONTEXT
+LOSS
+CONTROL
+```
+
+The dataflow graph remains free to express residual connections, shared state, gradient routing and distributed partitioning.
+
+### 15.6 Bounded non-halting policy
+
+The neural/runtime architecture does **not** solve the halting problem. Instead, every potentially unbounded component receives a finite execution budget.
+
+This applies particularly to:
+
+- custom Wasm;
+- recurrent/adaptive loops;
+- iterative context processing;
+- training loops;
+- future programmable neural modules.
+
+Possible outcomes:
+
+```text
+HALTED
+INTERMEDIATE
+DEFAULT_OUTPUT
+NULL
+ERROR
+```
+
+Policy:
+
+```text
+normal halt
+   -> HALTED + normal output
+
+budget exhaustion
+   -> if a valid checkpointable intermediate exists and profile permits it:
+          INTERMEDIATE
+      else:
+          invoke server-side HALTING_DEFAULT_MODULE
+              -> valid bounded result: DEFAULT_OUTPUT
+              -> no valid result:     NULL
+```
+
+The server-side halting default module is part of the advertised execution class/profile. Its module id, version, digest, ABI and own execution budget must be bound into the job before the client accepts execution.
+
+The fallback module is itself strictly bounded. It may not recursively become another unbounded computation. Trap/timeout/schema failure produces `NULL` or `ERROR` according to the profile.
+
+For encrypted neural execution, intermediate/default outputs must remain within the declared encrypted tensor/output representation. The evaluator must not decrypt client-private state merely to produce the fallback.
+
+This converts non-termination from an infinite wait into a deterministic bounded service outcome without making a false computability claim.
+
+### 15.7 Invocation identity for neural jobs
+
+A future neural invocation commitment should bind at minimum:
+
+```text
+NeuralGraph digest
+execution mode: PLAIN_CPU | TFHE_CUDA
+token/neuron codec id + version + digest
+resolution-map id + parameters/digest
+context checksum(s)
+context location(s)
+context protection mode(s)
+model/weight-state checksum
+halting budget/profile
+server halting-default module id/version/digest
+job id
+epoch
+```
+
+Changing any of those makes a different requested execution.
+
+### 15.8 Testing order
+
+Build the semantics in the cheapest layer first:
+
+```text
+1. token <-> firing pattern round-trip tests
+2. deterministic nearest-resolution mapping tests
+3. plain fixed-point NeuralGraph executor
+4. feedforward / loss / backprop / weight-update differential tests
+5. context clear/encrypted policy tests
+6. bounded-halting/default-module tests
+7. tiny TFHE neural lowering tests
+8. distributed encrypted neural worker tests
+9. heavyweight encrypted training stress tests
+```
+
+The plain executor is the semantic oracle for the encrypted implementation; full encrypted training should not be the first debugging environment.

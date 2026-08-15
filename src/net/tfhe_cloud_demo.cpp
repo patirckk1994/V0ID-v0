@@ -87,6 +87,47 @@ void require(bool condition, const std::string& what) {
         throw std::runtime_error(what);
 }
 
+const char* message_type_name(MessageType type) {
+    switch (type) {
+        case MessageType::install_tfhe_session:
+            return "INSTALL_TFHE_SESSION";
+        case MessageType::tfhe_session_ready:
+            return "TFHE_SESSION_READY";
+        case MessageType::tfhe_instruction_chunk:
+            return "TFHE_INSTRUCTION_CHUNK";
+        case MessageType::tfhe_chunk_ready:
+            return "TFHE_CHUNK_READY";
+        case MessageType::tfhe_job_finish:
+            return "TFHE_JOB_FINISH";
+        case MessageType::tfhe_job_result:
+            return "TFHE_JOB_RESULT";
+        case MessageType::error:
+            return "ERROR";
+        default:
+            return "OTHER";
+    }
+}
+
+const char* progress_stage_name(v0id::fhe::GpuFheProgressStage stage) {
+    switch (stage) {
+        case v0id::fhe::GpuFheProgressStage::KeyGeneration:
+            return "key-generation";
+        case v0id::fhe::GpuFheProgressStage::ClientEncryption:
+            return "client-encryption";
+        case v0id::fhe::GpuFheProgressStage::Execution:
+            return "execution";
+        case v0id::fhe::GpuFheProgressStage::OutputSelection:
+            return "output-selection";
+    }
+    return "unknown";
+}
+
+long long elapsed_ms(std::chrono::steady_clock::time_point started) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - started)
+        .count();
+}
+
 void write_all(int fd, const char* data, std::size_t size) {
     while (size != 0) {
         const auto n = ::write(fd, data, size);
@@ -222,7 +263,7 @@ void expire_sessions(
     const auto now = std::chrono::steady_clock::now();
     for (auto it = sessions.begin(); it != sessions.end();) {
         if (now - it->second->last_activity > TFHE_SESSION_TTL) {
-            std::cout << "expiring stale TFHE session\n";
+            std::cout << "[cloud] expiring stale TFHE session\n" << std::flush;
             it = sessions.erase(it);
         } else {
             ++it;
@@ -265,7 +306,9 @@ int run_server(const std::string& peer_id,
               << "session TTL            : 30 minutes\n"
               << "transport              : ZeroMQ CURVE + ZAP / multipart\n"
               << "authorized client      : " << allowed_client_peer_id << '\n'
-              << "client secret key recv : NO\n";
+              << "client secret key recv : NO\n"
+              << "status                 : waiting for authenticated request...\n"
+              << std::flush;
 
     int finish_requests = 0;
     while (finish_requests < finished_job_limit) {
@@ -278,6 +321,16 @@ int run_server(const std::string& peer_id,
         const auto request_job_id = request.envelope.job_id;
         const auto request_epoch = request.envelope.epoch;
         const bool counts_as_finish = request_type == MessageType::tfhe_job_finish;
+
+        std::cout << "[cloud] request type=" << message_type_name(request_type)
+                  << " auth-user="
+                  << (request_authenticated_user_id.empty()
+                          ? std::string("<missing>")
+                          : request_authenticated_user_id)
+                  << " claimed-peer=" << request_peer_id
+                  << " job=" << request_job_id
+                  << " epoch=" << request_epoch << '\n'
+                  << std::flush;
 
         MultipartEnvelope reply;
         try {
@@ -296,6 +349,19 @@ int run_server(const std::string& peer_id,
                 if (sessions.size() >= MAX_CACHED_TFHE_SESSIONS)
                     throw std::runtime_error("TFHE cloud evaluator session cache is full");
 
+                const auto short_id =
+                    v0id::net::tfhe_cloud_session_id_hex(install.session_id).substr(0, 16);
+                const auto session_id = install.session_id;
+                const auto install_started = std::chrono::steady_clock::now();
+
+                std::cout << "[cloud] session=" << short_id
+                          << " installing GPU evaluator"
+                          << " server-key-bytes=" << install.server_key_blob.size()
+                          << " encrypted-init-bytes=" << install.encrypted_init_blob.size()
+                          << " instructions=" << install.total_instruction_count
+                          << " outputs=" << install.output_word_count << '\n'
+                          << std::flush;
+
                 auto cached = std::make_unique<CachedTfheSession>();
                 cached->authenticated_user_id = request_authenticated_user_id;
                 cached->job_id = request_job_id;
@@ -307,9 +373,11 @@ int run_server(const std::string& peer_id,
                 cached->evaluator = std::make_unique<TfheCudaServerSession>(
                     install.server_key_blob, install.encrypted_init_blob);
 
-                const auto short_id =
-                    v0id::net::tfhe_cloud_session_id_hex(install.session_id).substr(0, 16);
-                const auto session_id = install.session_id;
+                std::cout << "[cloud] session=" << short_id
+                          << " GPU evaluator ready elapsed-ms="
+                          << elapsed_ms(install_started) << '\n'
+                          << std::flush;
+
                 sessions.emplace(key, std::move(cached));
 
                 reply = v0id::net::pack_tfhe_cloud_ack(
@@ -327,7 +395,8 @@ int run_server(const std::string& peer_id,
                           << "  encrypted init recv  : YES\n"
                           << "  plaintext program    : NO\n"
                           << "  plaintext inputs     : NO\n"
-                          << "  ClientKey received   : NO\n";
+                          << "  ClientKey received   : NO\n"
+                          << std::flush;
             } else if (request_type == MessageType::tfhe_instruction_chunk) {
                 auto chunk = v0id::net::unpack_tfhe_cloud_chunk(std::move(request));
                 const auto it = sessions.find(session_key(chunk.session_id));
@@ -345,7 +414,35 @@ int run_server(const std::string& peer_id,
                     cached.expected_instruction_count - cached.completed_instruction_count)
                     throw std::runtime_error("TFHE chunk exceeds remaining instruction budget");
 
-                cached.evaluator->evaluate_chunk(chunk.encrypted_chunk_blob);
+                const auto short_id =
+                    v0id::net::tfhe_cloud_session_id_hex(chunk.session_id).substr(0, 16);
+                const auto chunk_started = std::chrono::steady_clock::now();
+                std::cout << "[cloud] session=" << short_id
+                          << " executing encrypted chunk start=" << chunk.start_instruction
+                          << " count=" << chunk.instruction_count
+                          << " bytes=" << chunk.encrypted_chunk_blob.size() << '\n'
+                          << std::flush;
+
+                v0id::fhe::GpuFheProgressStage last_stage =
+                    static_cast<v0id::fhe::GpuFheProgressStage>(0);
+                std::size_t last_current = static_cast<std::size_t>(-1);
+                std::size_t last_total = static_cast<std::size_t>(-1);
+                auto server_progress = [&](v0id::fhe::GpuFheProgressStage stage,
+                                           std::size_t current,
+                                           std::size_t total) {
+                    if (stage == last_stage && current == last_current && total == last_total)
+                        return;
+                    last_stage = stage;
+                    last_current = current;
+                    last_total = total;
+                    std::cout << "[CUDA/server] session=" << short_id << ' '
+                              << progress_stage_name(stage) << ' '
+                              << current << '/' << total << '\n'
+                              << std::flush;
+                };
+
+                cached.evaluator->evaluate_chunk(
+                    chunk.encrypted_chunk_blob, server_progress);
                 cached.completed_instruction_count += chunk.instruction_count;
                 cached.last_activity = std::chrono::steady_clock::now();
 
@@ -354,13 +451,11 @@ int run_server(const std::string& peer_id,
                     TfheCloudAck{chunk.session_id, cached.completed_instruction_count},
                     MessageType::tfhe_chunk_ready);
 
-                std::cout << "session="
-                          << v0id::net::tfhe_cloud_session_id_hex(chunk.session_id).substr(0, 16)
-                          << " auth-user=" << request_authenticated_user_id
-                          << " executed chunk start=" << chunk.start_instruction
-                          << " count=" << chunk.instruction_count
+                std::cout << "[cloud] session=" << short_id
+                          << " chunk complete elapsed-ms=" << elapsed_ms(chunk_started)
                           << " completed=" << cached.completed_instruction_count
-                          << '/' << cached.expected_instruction_count << '\n';
+                          << '/' << cached.expected_instruction_count << '\n'
+                          << std::flush;
             } else if (request_type == MessageType::tfhe_job_finish) {
                 const auto finish = v0id::net::unpack_tfhe_cloud_finish(request);
                 const auto key = session_key(finish.session_id);
@@ -378,7 +473,32 @@ int run_server(const std::string& peer_id,
                 if (cached.completed_instruction_count != cached.expected_instruction_count)
                     throw std::runtime_error("TFHE finish rejected before all instructions completed");
 
-                auto encrypted_result = cached.evaluator->finish();
+                const auto short_id =
+                    v0id::net::tfhe_cloud_session_id_hex(finish.session_id).substr(0, 16);
+                const auto finish_started = std::chrono::steady_clock::now();
+                std::cout << "[cloud] session=" << short_id
+                          << " selecting encrypted outputs...\n"
+                          << std::flush;
+
+                v0id::fhe::GpuFheProgressStage last_stage =
+                    static_cast<v0id::fhe::GpuFheProgressStage>(0);
+                std::size_t last_current = static_cast<std::size_t>(-1);
+                std::size_t last_total = static_cast<std::size_t>(-1);
+                auto server_progress = [&](v0id::fhe::GpuFheProgressStage stage,
+                                           std::size_t current,
+                                           std::size_t total) {
+                    if (stage == last_stage && current == last_current && total == last_total)
+                        return;
+                    last_stage = stage;
+                    last_current = current;
+                    last_total = total;
+                    std::cout << "[CUDA/server] session=" << short_id << ' '
+                              << progress_stage_name(stage) << ' '
+                              << current << '/' << total << '\n'
+                              << std::flush;
+                };
+
+                auto encrypted_result = cached.evaluator->finish(server_progress);
                 const auto completed = cached.completed_instruction_count;
                 const auto session_id = finish.session_id;
                 sessions.erase(it);
@@ -391,22 +511,26 @@ int run_server(const std::string& peer_id,
                     base_envelope(peer_id, request_job_id, request_epoch),
                     std::move(result));
 
-                std::cout << "finished TFHE session="
-                          << v0id::net::tfhe_cloud_session_id_hex(session_id).substr(0, 16)
+                std::cout << "finished TFHE session=" << short_id
                           << " auth-user=" << request_authenticated_user_id
                           << " completed=" << completed
-                          << " session released=YES\n";
+                          << " result-build-ms=" << elapsed_ms(finish_started)
+                          << " session released=YES\n"
+                          << std::flush;
             } else {
                 throw std::runtime_error("expected TFHE session install/chunk/finish message");
             }
         } catch (const std::exception& e) {
             reply = error_reply(peer_id, request_job_id, request_epoch, e.what());
-            std::cerr << "TFHE cloud request failed: " << e.what() << '\n';
+            std::cerr << "TFHE cloud request failed: " << e.what() << '\n' << std::flush;
         }
 
         server.reply_multipart(reply);
         if (counts_as_finish)
             ++finish_requests;
+        if (finish_requests < finished_job_limit)
+            std::cout << "[cloud] waiting for next authenticated request...\n"
+                      << std::flush;
     }
     return 0;
 }
@@ -423,15 +547,21 @@ int run_client(const std::string& peer_id,
     require(plain.output_words == inputs,
             "TFHE cloud smoke plaintext oracle did not preserve input word");
 
-    std::size_t last_execution = static_cast<std::size_t>(-1);
+    v0id::fhe::GpuFheProgressStage last_stage =
+        static_cast<v0id::fhe::GpuFheProgressStage>(0);
+    std::size_t last_current = static_cast<std::size_t>(-1);
+    std::size_t last_total = static_cast<std::size_t>(-1);
     auto progress = [&](v0id::fhe::GpuFheProgressStage stage,
                         std::size_t current,
                         std::size_t total) {
-        if (stage == v0id::fhe::GpuFheProgressStage::Execution &&
-            current != last_execution) {
-            last_execution = current;
-            std::cout << "[CUDA] encrypted execution " << current << '/' << total << '\n';
-        }
+        if (stage == last_stage && current == last_current && total == last_total)
+            return;
+        last_stage = stage;
+        last_current = current;
+        last_total = total;
+        std::cout << "[CUDA/client] " << progress_stage_name(stage)
+                  << ' ' << current << '/' << total << '\n'
+                  << std::flush;
     };
 
     std::cout << "preparing TFHE client session...\n" << std::flush;

@@ -13,6 +13,12 @@ namespace v0id::fhe {
 // remote client. It owns no secret key and never branches on encrypted program
 // semantics. Tape is kept in logical order in V0.4; distributed/remapped
 // physical placement is the next layer.
+//
+// program_bits may contain either one transition table (legacy/stable morph) or
+// exactly shape.rounds concatenated tables (round-polymorphic execution-bound
+// schedule). In schedule mode step() consumes the next encrypted table on every
+// call. The evaluator still learns only the public dimensions/table count; the
+// state-label meaning of each table remains encrypted.
 class RemoteEncryptedMachine {
 public:
     RemoteEncryptedMachine(lbcrypto::BinFHEContext& cc,
@@ -30,6 +36,8 @@ public:
     const std::vector<lbcrypto::LWECiphertext>& head_bits() const { return head_; }
     const std::vector<lbcrypto::LWECiphertext>& tape_bits() const { return tape_; }
     const std::vector<lbcrypto::LWECiphertext>& program_bits() const { return program_bits_; }
+    std::size_t completed_rounds() const { return round_index_; }
+    bool uses_round_schedule() const { return program_table_count_ > 1; }
 
 private:
     std::size_t row_offset(std::size_t state, int read) const;
@@ -51,6 +59,9 @@ private:
     PublicMachineShape shape_;
     std::size_t states_{};
     std::size_t tape_cells_{};
+    std::size_t program_table_bits_{};
+    std::size_t program_table_count_{1};
+    std::size_t round_index_{};
     std::vector<lbcrypto::LWECiphertext> program_bits_;
     std::vector<lbcrypto::LWECiphertext> state_;
     std::vector<lbcrypto::LWECiphertext> head_;

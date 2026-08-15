@@ -17,6 +17,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -193,7 +194,7 @@ int main() try {
     require(v0id::fhe::tfhe_cuda_backend_available(),
             "GPU build does not have the TFHE CUDA sidecar linked");
 
-    std::cout << "preparing serialized TFHE client/evaluator boundary...\n";
+    std::cout << "preparing streamed TFHE client/evaluator session...\n";
     const auto gpu_start = Clock::now();
     v0id::fhe::GpuFheProgressStage last_stage =
         v0id::fhe::GpuFheProgressStage::KeyGeneration;
@@ -225,26 +226,61 @@ int main() try {
             "TFHE CUDA client prepare returned empty client key blob");
     require(!prepared.server_key_blob.empty(),
             "TFHE CUDA client prepare returned empty server key blob");
-    require(!prepared.encrypted_job_blob.empty(),
-            "TFHE CUDA client prepare returned empty encrypted job blob");
+    require(!prepared.encrypted_init_blob.empty(),
+            "TFHE CUDA client prepare returned empty encrypted init blob");
 
     std::cout << "  client key bytes          : " << prepared.client_key_blob.size() << '\n'
-              << "  server key bytes          : " << prepared.server_key_blob.size() << '\n'
-              << "  encrypted job bytes       : " << prepared.encrypted_job_blob.size() << '\n'
+              << "  server key bytes (once)   : " << prepared.server_key_blob.size() << '\n'
+              << "  encrypted init bytes      : " << prepared.encrypted_init_blob.size() << '\n'
+              << "  instruction chunk size    : " << v0id::fhe::kTfheCudaInstructionChunkSize << '\n'
               << "  evaluator receives SK     : NO\n"
-              << "launching evaluator-only TFHE-rs CUDA boundary...\n";
+              << "installing evaluator GPU session...\n";
 
-    const auto encrypted_result =
-        v0id::fhe::evaluate_boolean_program_image_tfhe_cuda_server(
-            prepared.server_key_blob, prepared.encrypted_job_blob, progress);
+    v0id::fhe::TfheCudaServerSession server(
+        prepared.server_key_blob, prepared.encrypted_init_blob);
+
+    std::size_t max_chunk_bytes = 0;
+    std::size_t chunk_count = 0;
+    for (std::size_t offset = 0; offset < mutated.instructions.size();
+         offset += v0id::fhe::kTfheCudaInstructionChunkSize) {
+        const auto count = std::min(
+            v0id::fhe::kTfheCudaInstructionChunkSize,
+            mutated.instructions.size() - offset);
+        const std::span<const v0id::integrity::BooleanProgramInstruction> clear_chunk(
+            mutated.instructions.data() + offset, count);
+        const auto encrypted_chunk =
+            v0id::fhe::encrypt_boolean_program_chunk_tfhe_cuda_client(
+                prepared.client_key_blob, clear_chunk, offset,
+                mutated.instructions.size(), progress);
+        require(!encrypted_chunk.empty(),
+                "TFHE CUDA client returned empty encrypted instruction chunk");
+
+        ++chunk_count;
+        max_chunk_bytes = std::max(max_chunk_bytes, encrypted_chunk.size());
+        if (chunk_count == 1) {
+            std::cout << "  first encrypted chunk     : " << encrypted_chunk.size() << " bytes\n"
+                      << "  planned chunk count       : "
+                      << ((mutated.instructions.size() +
+                           v0id::fhe::kTfheCudaInstructionChunkSize - 1) /
+                          v0id::fhe::kTfheCudaInstructionChunkSize)
+                      << '\n'
+                      << "launching evaluator-only streamed TFHE-rs CUDA boundary...\n";
+        }
+
+        server.evaluate_chunk(encrypted_chunk, progress);
+    }
+
+    const auto encrypted_result = server.finish(progress);
     require(!encrypted_result.empty(),
             "TFHE CUDA evaluator returned empty encrypted result blob");
-    std::cout << "  encrypted result bytes    : " << encrypted_result.size() << '\n';
+    std::cout << "  chunks executed           : " << chunk_count << '\n'
+              << "  max encrypted chunk bytes : " << max_chunk_bytes << '\n'
+              << "  encrypted result bytes    : " << encrypted_result.size() << '\n';
 
     const auto decrypted_words =
         v0id::fhe::decrypt_boolean_program_image_tfhe_cuda_client(
             prepared.client_key_blob, encrypted_result,
-            prepared.output_word_count);
+            prepared.instruction_count, prepared.output_word_count);
 
     const auto decrypted_digest = words_to_bytes(decrypted_words);
     require(decrypted_digest == expected_digest,
@@ -253,7 +289,8 @@ int main() try {
             "TFHE CUDA SHA3 digest differs from OpenSSL SHA3-512");
 
     std::cout << "[PASS] client key remains outside evaluator API\n"
-              << "[PASS] encrypted job/result survive serialized cloud boundary\n"
+              << "[PASS] server key is installed once and encrypted state survives chunks\n"
+              << "[PASS] instruction chunks enforce contiguous execution order\n"
               << "[PASS] full mutated compact SHA3 executes through TFHE-rs CUDA\n"
               << "[PASS] CUDA FHE digest matches mutated plaintext image\n"
               << "[PASS] CUDA FHE digest matches OpenSSL SHA3-512\n"

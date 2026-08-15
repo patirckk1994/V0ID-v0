@@ -158,6 +158,28 @@ int main() try {
             "encrypted execution mode string mismatch");
     ++passed;
 
+    require(plain.digest512(graph) != encrypted.digest512(graph),
+            "plain and TFHE invocations must have different commitments");
+    ++passed;
+
+    auto multi_context = encrypted;
+    multi_context.contexts.push_back(NeuralContextRef{
+        "retrieval-cache",
+        NeuralContextLocation::cloud_content_addressed,
+        v0id::net::module_digest512(std::vector<std::uint8_t>{'c','a','c','h','e'})});
+    const auto invocation_digest = multi_context.digest512(graph);
+    std::reverse(multi_context.contexts.begin(), multi_context.contexts.end());
+    require(multi_context.digest512(graph) == invocation_digest,
+            "neural invocation digest changed under context vector reordering");
+    ++passed;
+
+    auto changed_context = multi_context;
+    changed_context.contexts[0].digest =
+        v0id::net::module_digest512(std::vector<std::uint8_t>{'o','t','h','e','r'});
+    require(changed_context.digest512(graph) != invocation_digest,
+            "changing selected context checksum did not change invocation commitment");
+    ++passed;
+
     auto bad_shape = graph;
     for (auto& node : bad_shape.nodes) {
         if (node.id == "custom-activation") {
@@ -212,13 +234,14 @@ int main() try {
     ++passed;
 
     std::cout << "V0ID neural graph tests PASS: " << passed << "/" << passed << '\n';
-    std::cout << "module tree        : YES\n"
-              << "typed dataflow     : YES\n"
-              << "local context hash : YES\n"
-              << "cloud context hash : YES\n"
-              << "plain mode         : YES\n"
-              << "TFHE mode          : ABI/selection scaffold\n"
-              << "neural Wasm kind   : YES\n";
+    std::cout << "module tree          : YES\n"
+              << "typed dataflow       : YES\n"
+              << "local context hash   : YES\n"
+              << "cloud context hash   : YES\n"
+              << "plain mode           : YES\n"
+              << "TFHE mode            : ABI/selection scaffold\n"
+              << "invocation commitment: YES\n"
+              << "neural Wasm kind     : YES\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "V0ID neural graph tests FAILED: " << e.what() << '\n';

@@ -18,9 +18,10 @@ struct MorphManifest {
     std::vector<std::size_t> base_to_morphed;
     std::vector<std::size_t> dummy_states;
 
-    // Toy integrity plumbing. The encrypted evaluator will produce a fixed bank
-    // of masked candidate digests. Only the client manifest says which returned
-    // slot it intends to check and how to unmask it.
+    // Legacy source-compatibility placeholders from the retired ToyFingerprint
+    // experiment. ProgramMorpher no longer derives or consumes these values;
+    // they stay zero/empty so older callers can be migrated without silently
+    // reintroducing the obsolete integrity scheme. New code must not use them.
     std::uint32_t integrity_nonce{};
     std::size_t integrity_output_slot{};
     std::vector<std::uint32_t> integrity_output_masks;
@@ -48,10 +49,8 @@ struct RoundMorphManifest {
     // [0, base_state_count) are semantic states; the rest are dummy identities.
     std::vector<std::vector<std::size_t>> logical_to_morphed;
 
-    // Same private integrity placement material as MorphManifest. Keeping it in
-    // the schedule manifest lets the existing encrypted self-fingerprint bind
-    // the complete round-polymorphic schedule without revealing which returned
-    // candidate the client checks.
+    // Legacy zero/empty placeholders matching MorphManifest. They are not part
+    // of the active execution-binding construction and never enter RMJ4/RMR4.
     std::uint32_t integrity_nonce{};
     std::size_t integrity_output_slot{};
     std::vector<std::uint32_t> integrity_output_masks;
@@ -72,14 +71,14 @@ public:
 
     // Builds an equivalent program with a fixed public state count. Base states
     // are placed at secret pseudorandom state IDs; remaining states are harmless
-    // identity/no-op states. The same seed also derives client-only integrity
-    // placement metadata. integrity_candidate_count is public and fixed across
-    // jobs; the selected slot and masks remain client-only.
+    // identity/no-op states. `legacy_integrity_candidate_count` is retained only
+    // to avoid an abrupt source break for older experimental callers and is
+    // ignored by the current implementation.
     static MorphedProgram morph(const v0id::core::Program& base,
                                 std::size_t base_initial_state,
                                 std::size_t public_state_count,
                                 const MorphSeed& seed,
-                                std::size_t integrity_candidate_count = 4);
+                                std::size_t legacy_integrity_candidate_count = 4);
 
     // Builds a round-polymorphic schedule for exactly `rounds` fixed-path
     // evaluator steps. The public state count must be at least max(base.states,
@@ -98,7 +97,7 @@ public:
         std::size_t public_state_count,
         std::size_t rounds,
         const MorphSeed& seed,
-        std::size_t integrity_candidate_count = 4);
+        std::size_t legacy_integrity_candidate_count = 4);
 };
 
 } // namespace v0id::polymorph

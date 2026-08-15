@@ -179,6 +179,57 @@ function(v0id_finish_tfhe_cuda_setup)
             BUILD_RPATH "${V0ID_TFHE_CUDA_TARGET_DIR}/release")
     endif()
 
+    # Two-tier validation split:
+    #   A) tiny real TFHE program exercises the cryptographic/cloud path;
+    #   B) full SHA3 + polymorphism execute client-side for fast semantic checks.
+    # The old full homomorphic SHA3 executable remains available as an explicit
+    # milestone/stress route rather than being the normal regression loop.
+    add_executable(v0id-small-fhe-smoke-tests
+        "${CMAKE_SOURCE_DIR}/src/integrity/small_fhe_smoke_tests.cpp")
+    target_include_directories(v0id-small-fhe-smoke-tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/fhe"
+        "${CMAKE_SOURCE_DIR}/src/integrity")
+    target_link_libraries(v0id-small-fhe-smoke-tests PRIVATE
+        v0id_encrypted_boolean_program)
+    target_compile_definitions(v0id-small-fhe-smoke-tests PRIVATE
+        V0ID_GPU_FHE_ENABLED=1)
+    add_dependencies(v0id-small-fhe-smoke-tests
+        v0id-tfhe-cuda-sidecar)
+    set_target_properties(v0id-small-fhe-smoke-tests PROPERTIES
+        BUILD_RPATH "${V0ID_TFHE_CUDA_TARGET_DIR}/release")
+
+    add_custom_target(v0id-test-large-client
+        COMMAND $<TARGET_FILE:v0id-sha3-image-tests>
+        COMMAND $<TARGET_FILE:v0id-round-morph-schedule-tests>
+        DEPENDS
+            v0id-sha3-image-tests
+            v0id-round-morph-schedule-tests
+        USES_TERMINAL
+        COMMENT "Running fast large client-side SHA3 + polymorphism validation")
+
+    add_custom_target(v0id-test-small-fhe
+        COMMAND $<TARGET_FILE:v0id-small-fhe-smoke-tests>
+        DEPENDS v0id-small-fhe-smoke-tests
+        USES_TERMINAL
+        COMMENT "Running tiny real TFHE CUDA validation")
+
+    add_custom_target(v0id-test-milkshake
+        COMMAND $<TARGET_FILE:v0id-sha3-image-tests>
+        COMMAND $<TARGET_FILE:v0id-round-morph-schedule-tests>
+        COMMAND $<TARGET_FILE:v0id-small-fhe-smoke-tests>
+        DEPENDS
+            v0id-sha3-image-tests
+            v0id-round-morph-schedule-tests
+            v0id-small-fhe-smoke-tests
+        USES_TERMINAL
+        COMMENT "Running V0ID fast-large + small-homomorphic validation split")
+
+    add_custom_target(v0id-test-large-fhe-stress
+        COMMAND $<TARGET_FILE:v0id-encrypted-boolean-program-tests>
+        DEPENDS v0id-encrypted-boolean-program-tests
+        USES_TERMINAL
+        COMMENT "Running full mutated SHA3 through streamed TFHE CUDA (slow stress route)")
+
     message(STATUS "V0ID TFHE CUDA backend: ENABLED")
     message(STATUS "  cargo       : ${V0ID_CARGO_EXECUTABLE}")
     message(STATUS "  rustc       : ${V0ID_RUSTC_VERSION_TEXT}")

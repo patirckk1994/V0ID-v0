@@ -171,6 +171,31 @@ add_executable(v0id-round-morph-schedule-tests
 )
 target_link_libraries(v0id-round-morph-schedule-tests PRIVATE v0id_core)
 
+# Boolean construction layer for the private integrity machine. Keccak remains
+# an auditable XOR/AND/NOT DAG through mutation and only lowers into the binary
+# single-tape Program ABI at the final plaintext compiler boundary.
+add_library(v0id_boolean_integrity
+    src/integrity/boolean_ir.cpp
+    src/integrity/keccak_ir.cpp
+    src/integrity/sha3_512_ir.cpp
+    src/integrity/boolean_ir_mutator.cpp
+    src/integrity/boolean_ir_lowering_plan.cpp
+    src/integrity/boolean_ir_to_program.cpp
+)
+target_include_directories(v0id_boolean_integrity PUBLIC
+    src/integrity
+    src/core
+)
+target_link_libraries(v0id_boolean_integrity PUBLIC v0id_core)
+
+add_executable(v0id-sha3-program-tests
+    src/integrity/sha3_program_tests.cpp
+)
+target_link_libraries(v0id-sha3-program-tests PRIVATE
+    v0id_boolean_integrity
+    OpenSSL::Crypto
+)
+
 # PQ-facing plaintext quine commitment plus the hash-agnostic canonical subject
 # and private execution-integrity construction boundary. SHA3-512 is the strong
 # default client reference backend; runtime hash Programs remain private hooks.

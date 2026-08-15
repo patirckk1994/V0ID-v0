@@ -1,6 +1,7 @@
 #pragma once
 
 #include "boolean_program_image.hpp"
+#include "gpu_fhe_backend.hpp"
 
 #include "binfhecontext.h"
 
@@ -91,6 +92,11 @@ std::vector<EncryptedBooleanWord> encrypt_boolean_program_input_words(
 // instruction evaluates every supported operation and selects the active result
 // homomorphically, then updates the encrypted destination register through an
 // encrypted register-id selector.
+//
+// When V0ID_GPU_FHE_ENABLED is defined this class intentionally remains the CPU
+// reference implementation until the TFHE-CUDA adapter is linked. The compile-
+// time hook lives in gpu_fhe_backend.hpp so GPU-specific code can be introduced
+// behind the same public Boolean-program image boundary without changing callers.
 class RemoteEncryptedBooleanProgram {
 public:
     RemoteEncryptedBooleanProgram(

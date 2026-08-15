@@ -149,6 +149,13 @@ inline std::size_t run_neural_integrity_regression_tests() {
             "neural integrity receipt binding mismatch");
     ++passed;
 
+    auto forged_receipt = receipt;
+    forged_receipt.observed[0].entry_commitment[0] ^= 0x01u;
+    expect_throw([&] {
+        forged_receipt.validate(compiled.graph, invocation, trace, plan);
+    }, "receipt observation detached from actual trace value");
+    ++passed;
+
     NeuralIntegrityExpectation expectation;
     expectation.graph_digest = compiled.graph.digest512();
     expectation.invocation_digest = invocation.digest512(compiled.graph);

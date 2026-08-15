@@ -130,8 +130,8 @@ std::string hex_prefix(const std::vector<std::uint8_t>& bytes,
 const char* gpu_stage_name(v0id::fhe::GpuFheProgressStage stage) {
     using Stage = v0id::fhe::GpuFheProgressStage;
     switch (stage) {
-    case Stage::KeyGeneration: return "GPU key generation";
-    case Stage::InputEncryption: return "GPU input encryption";
+    case Stage::KeyGeneration: return "client key generation";
+    case Stage::ClientEncryption: return "client job encryption";
     case Stage::Execution: return "GPU encrypted execution";
     case Stage::OutputSelection: return "GPU output selection";
     }
@@ -193,34 +193,58 @@ int main() try {
     require(v0id::fhe::tfhe_cuda_backend_available(),
             "GPU build does not have the TFHE CUDA sidecar linked");
 
-    std::cout << "launching full mutated SHA3 on TFHE-rs CUDA...\n";
+    std::cout << "preparing serialized TFHE client/evaluator boundary...\n";
     const auto gpu_start = Clock::now();
     v0id::fhe::GpuFheProgressStage last_stage =
         v0id::fhe::GpuFheProgressStage::KeyGeneration;
     std::size_t last_print = static_cast<std::size_t>(-1);
 
-    const auto decrypted_words =
-        v0id::fhe::evaluate_boolean_program_image_tfhe_cuda(
-            mutated, input_words,
-            [&](v0id::fhe::GpuFheProgressStage stage,
-                std::size_t current,
-                std::size_t total) {
-                const bool stage_changed = stage != last_stage;
-                const bool interesting = current == 0 || current == total ||
-                    current < 8 || current % 8 == 0;
-                if (!stage_changed && !interesting && current == last_print)
-                    return;
-                if (!stage_changed && !interesting)
-                    return;
+    auto progress = [&](v0id::fhe::GpuFheProgressStage stage,
+                        std::size_t current,
+                        std::size_t total) {
+        const bool stage_changed = stage != last_stage;
+        const bool interesting = current == 0 || current == total ||
+            current < 8 || current % 8 == 0;
+        if (!stage_changed && !interesting && current == last_print)
+            return;
+        if (!stage_changed && !interesting)
+            return;
 
-                last_stage = stage;
-                last_print = current;
-                const auto elapsed = std::chrono::duration<double>(
-                    Clock::now() - gpu_start).count();
-                std::cout << "  [CUDA] " << gpu_stage_name(stage)
-                          << ' ' << current << '/' << total
-                          << " elapsed=" << elapsed << " s\n";
-            });
+        last_stage = stage;
+        last_print = current;
+        const auto elapsed = std::chrono::duration<double>(
+            Clock::now() - gpu_start).count();
+        std::cout << "  [CUDA] " << gpu_stage_name(stage)
+                  << ' ' << current << '/' << total
+                  << " elapsed=" << elapsed << " s\n";
+    };
+
+    auto prepared = v0id::fhe::prepare_boolean_program_image_tfhe_cuda_client(
+        mutated, input_words, progress);
+    require(!prepared.client_key_blob.empty(),
+            "TFHE CUDA client prepare returned empty client key blob");
+    require(!prepared.server_key_blob.empty(),
+            "TFHE CUDA client prepare returned empty server key blob");
+    require(!prepared.encrypted_job_blob.empty(),
+            "TFHE CUDA client prepare returned empty encrypted job blob");
+
+    std::cout << "  client key bytes          : " << prepared.client_key_blob.size() << '\n'
+              << "  server key bytes          : " << prepared.server_key_blob.size() << '\n'
+              << "  encrypted job bytes       : " << prepared.encrypted_job_blob.size() << '\n'
+              << "  evaluator receives SK     : NO\n"
+              << "launching evaluator-only TFHE-rs CUDA boundary...\n";
+
+    const auto encrypted_result =
+        v0id::fhe::evaluate_boolean_program_image_tfhe_cuda_server(
+            prepared.server_key_blob, prepared.encrypted_job_blob, progress);
+    require(!encrypted_result.empty(),
+            "TFHE CUDA evaluator returned empty encrypted result blob");
+    std::cout << "  encrypted result bytes    : " << encrypted_result.size() << '\n';
+
+    const auto decrypted_words =
+        v0id::fhe::decrypt_boolean_program_image_tfhe_cuda_client(
+            prepared.client_key_blob, encrypted_result,
+            prepared.output_word_count);
 
     const auto decrypted_digest = words_to_bytes(decrypted_words);
     require(decrypted_digest == expected_digest,
@@ -228,7 +252,9 @@ int main() try {
     require(decrypted_digest == openssl_digest,
             "TFHE CUDA SHA3 digest differs from OpenSSL SHA3-512");
 
-    std::cout << "[PASS] full mutated compact SHA3 executes through TFHE-rs CUDA\n"
+    std::cout << "[PASS] client key remains outside evaluator API\n"
+              << "[PASS] encrypted job/result survive serialized cloud boundary\n"
+              << "[PASS] full mutated compact SHA3 executes through TFHE-rs CUDA\n"
               << "[PASS] CUDA FHE digest matches mutated plaintext image\n"
               << "[PASS] CUDA FHE digest matches OpenSSL SHA3-512\n"
               << "digest prefix: " << hex_prefix(decrypted_digest) << "...\n"

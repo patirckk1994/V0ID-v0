@@ -1,5 +1,7 @@
 #include "program_morpher.hpp"
 #include "integrity_program_compiler.hpp"
+#include "series_generator.hpp"
+#include "stack_polymorph_bridge.hpp"
 
 #include <array>
 #include <cstddef>
@@ -13,9 +15,12 @@ namespace {
 
 using v0id::core::Program;
 using v0id::core::compose_bounded_with_integrity;
+using v0id::crypto::SeriesFirstStackContext;
+using v0id::polymorph::KmacSeriesGenerator;
 using v0id::polymorph::MorphSeed;
 using v0id::polymorph::ProgramMorpher;
 using v0id::polymorph::RoundMorphedProgramSchedule;
+using v0id::polymorph::SeriesSeed;
 
 struct RunResult {
     std::size_t state{};
@@ -96,6 +101,34 @@ MorphSeed seed_b() {
     auto seed = seed_a();
     seed[7] ^= 0x5au;
     return seed;
+}
+
+SeriesSeed private_root_a() {
+    SeriesSeed root{};
+    for (std::size_t i = 0; i < root.size(); ++i)
+        root[i] = static_cast<unsigned char>(0x31u + i);
+    return root;
+}
+
+SeriesSeed private_root_b() {
+    auto root = private_root_a();
+    root[11] ^= 0xa7u;
+    return root;
+}
+
+SeriesFirstStackContext combined_stack_context() {
+    SeriesFirstStackContext c;
+    for (std::size_t i = 0; i < c.session_id.size(); ++i)
+        c.session_id[i] = static_cast<std::uint8_t>(i + 1);
+    c.job_id = "combined-integrity-morph-test";
+    c.epoch = 73;
+    c.machine_protocol = "v0id-remote-machine-v3";
+    c.fhe_parameter_set = "STD128Q";
+    for (std::size_t i = 0; i < c.semantic_binding.size(); ++i) {
+        c.semantic_binding[i] = static_cast<std::uint8_t>((i * 5 + 1) & 0xffu);
+        c.generator_binding[i] = static_cast<std::uint8_t>((i * 9 + 7) & 0xffu);
+    }
+    return c;
 }
 
 } // namespace
@@ -256,13 +289,37 @@ int main() try {
     pass(combined_after_integrity.tape != base_full_tape,
          "embedded integrity fragment executes as part of the same program");
 
+    std::vector<std::uint8_t> series_input;
+    series_input.reserve(input.size());
+    for (const int bit : input)
+        series_input.push_back(static_cast<std::uint8_t>(bit & 1));
+
+    KmacSeriesGenerator generator(64);
+    const auto root_a = private_root_a();
+    const auto root_b = private_root_b();
+    const auto derived_a = generator.derive(series_input, root_a, combined_stack_context().epoch);
+    const auto derived_a_again = generator.derive(series_input, root_a, combined_stack_context().epoch);
+    const auto derived_b = generator.derive(series_input, root_b, combined_stack_context().epoch);
+
+    const auto stack_seed_a = v0id::crypto::derive_program_morph_seed_from_stack(
+        root_a, combined_stack_context(), derived_a.series);
+    const auto stack_seed_a_again = v0id::crypto::derive_program_morph_seed_from_stack(
+        root_a, combined_stack_context(), derived_a_again.series);
+    const auto stack_seed_b = v0id::crypto::derive_program_morph_seed_from_stack(
+        root_b, combined_stack_context(), derived_b.series);
+
+    pass(stack_seed_a == stack_seed_a_again,
+         "private PQR/stack polymorphism series deterministically derives the morph seed");
+    pass(stack_seed_a != stack_seed_b,
+         "changing the issuer-private root changes the combined-machine morph seed");
+
     constexpr std::size_t combined_public_states = 16;
     const auto combined_morph = ProgramMorpher::morph(
         combined.program, combined.initial_state,
-        combined_public_states, seed_a(), 4);
+        combined_public_states, stack_seed_a, 4);
     const auto combined_morph_other = ProgramMorpher::morph(
         combined.program, combined.initial_state,
-        combined_public_states, seed_b(), 4);
+        combined_public_states, stack_seed_b, 4);
 
     pass(combined_morph.manifest.base_to_morphed.size() == combined.program.states,
          "one ProgramMorpher pass covers every semantic AND integrity state");
@@ -289,7 +346,7 @@ int main() try {
 
     pass(combined_morph.manifest.base_to_morphed !=
              combined_morph_other.manifest.base_to_morphed,
-         "changing the private morph seed remixes the combined useful+integrity machine");
+         "private PQR/stack series remixes the whole useful+integrity machine together");
 
     std::cout << "V0ID round-polymorphic + combine-before-morph tests: "
               << passed << " passed, 0 failed\n";

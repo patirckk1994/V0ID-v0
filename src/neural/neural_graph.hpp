@@ -128,6 +128,11 @@ struct NeuralInvocation {
     std::optional<NeuralDigest512> model_state_digest;
 
     void validate(const NeuralGraph& graph) const;
+
+    // Binds one requested run to the exact graph plus clear/encrypted execution
+    // policy, context identities/locations and optional model/weight state.
+    // Context vector ordering is canonicalized by name.
+    NeuralDigest512 digest512(const NeuralGraph& graph) const;
 };
 
 // Backend boundary. A graph does not become a different model just because the

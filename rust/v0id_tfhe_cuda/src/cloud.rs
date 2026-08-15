@@ -5,21 +5,18 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::ptr;
 
-const CLOUD_PROTOCOL_VERSION: u32 = 1;
-// Full encrypted SHA3 images are multi-gigabyte objects at the current
-// high-level TFHE-rs integer representation. Keep a hard research ceiling,
-// but make it large enough for the 2105-instruction CUDA stress corpus.
-// This is not a production network-message recommendation; transport will
-// ultimately stream/chunk evaluator material rather than require one blob.
-const MAX_SERIALIZED_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const CLOUD_PROTOCOL_VERSION: u32 = 2;
+const MAX_SERIALIZED_BLOB_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_INPUT_WORDS: usize = 4096;
 const MAX_INSTRUCTIONS: usize = 65536;
+const MAX_CHUNK_INSTRUCTIONS: usize = 64;
 const MAX_OUTPUT_WORDS: usize = 64;
 
-const CLIENT_KEY_MAGIC: [u8; 8] = *b"V0IDCK01";
-const SERVER_KEY_MAGIC: [u8; 8] = *b"V0IDSK01";
-const JOB_MAGIC: [u8; 8] = *b"V0IDCJ01";
-const RESULT_MAGIC: [u8; 8] = *b"V0IDCR01";
+const CLIENT_KEY_MAGIC: [u8; 8] = *b"V0IDCK02";
+const SERVER_KEY_MAGIC: [u8; 8] = *b"V0IDSK02";
+const INIT_MAGIC: [u8; 8] = *b"V0IDCI02";
+const CHUNK_MAGIC: [u8; 8] = *b"V0IDCC02";
+const RESULT_MAGIC: [u8; 8] = *b"V0IDCR02";
 
 #[repr(C)]
 pub struct V0idTfheBlob {
@@ -42,21 +39,40 @@ struct ServerKeyEnvelope {
 }
 
 #[derive(Serialize, Deserialize)]
-struct EncryptedCloudJob {
+struct EncryptedCloudInit {
     magic: [u8; 8],
     protocol_version: u32,
     register_count: u32,
+    expected_instruction_count: u64,
     encrypted_zero: FheUint64,
     inputs: Vec<FheUint64>,
-    instructions: Vec<EncInstruction>,
     output_registers: Vec<FheUint8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedInstructionChunk {
+    magic: [u8; 8],
+    protocol_version: u32,
+    start_instruction: u64,
+    total_instruction_count: u64,
+    instructions: Vec<EncInstruction>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct EncryptedCloudResult {
     magic: [u8; 8],
     protocol_version: u32,
+    completed_instruction_count: u64,
     outputs: Vec<FheUint64>,
+}
+
+pub struct V0idTfheServerSession {
+    gpu_key: tfhe::CudaServerKey,
+    registers: Vec<FheUint64>,
+    inputs: Vec<FheUint64>,
+    output_registers: Vec<FheUint8>,
+    expected_instruction_count: usize,
+    completed_instruction_count: usize,
 }
 
 fn codec() -> impl Options {
@@ -126,6 +142,17 @@ fn require_version_and_magic(
     Ok(())
 }
 
+fn decode_client_key(bytes: &[u8]) -> Result<ClientKey, String> {
+    let envelope: ClientKeyEnvelope = decode(bytes, "TFHE client key envelope")?;
+    require_version_and_magic(
+        envelope.magic,
+        CLIENT_KEY_MAGIC,
+        envelope.protocol_version,
+        "client key",
+    )?;
+    Ok(envelope.key)
+}
+
 fn ffi_status(result: std::thread::Result<Result<(), String>>) -> i32 {
     match result {
         Ok(Ok(())) => {
@@ -159,33 +186,32 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_blob_free(blob: *mut V0idTfheBlob) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
-    instructions: *const V0idTfheInstruction,
-    instruction_count: usize,
+pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare_session(
     register_count: usize,
+    expected_instruction_count: usize,
     input_words: *const u64,
     input_word_count: usize,
     output_registers: *const u32,
     output_register_count: usize,
     client_key_out: *mut V0idTfheBlob,
     server_key_out: *mut V0idTfheBlob,
-    encrypted_job_out: *mut V0idTfheBlob,
+    encrypted_init_out: *mut V0idTfheBlob,
     progress_cb: ProgressFn,
 ) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        if instructions.is_null() || output_registers.is_null() {
-            return Err("TFHE CUDA client prepare received a null required pointer".into());
+        if output_registers.is_null() {
+            return Err("TFHE CUDA client prepare received null output selectors".into());
         }
         if input_word_count != 0 && input_words.is_null() {
             return Err("TFHE CUDA client prepare received null input words".into());
         }
-        if client_key_out.is_null() || server_key_out.is_null() || encrypted_job_out.is_null() {
+        if client_key_out.is_null() || server_key_out.is_null() || encrypted_init_out.is_null() {
             return Err("TFHE CUDA client prepare received null blob output".into());
         }
         if register_count == 0 || register_count > 64 {
             return Err("TFHE CUDA register count must be in [1,64]".into());
         }
-        if instruction_count == 0 || instruction_count > MAX_INSTRUCTIONS {
+        if expected_instruction_count == 0 || expected_instruction_count > MAX_INSTRUCTIONS {
             return Err("TFHE CUDA instruction count outside cloud limit".into());
         }
         if input_word_count > MAX_INPUT_WORDS {
@@ -195,7 +221,6 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
             return Err("TFHE CUDA output count outside cloud limit".into());
         }
 
-        let instructions = slice::from_raw_parts(instructions, instruction_count);
         let inputs = if input_word_count == 0 {
             &[][..]
         } else {
@@ -212,7 +237,7 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
         let compressed_server_key = CompressedServerKey::new(&client_key);
         progress(progress_cb, STAGE_KEYGEN, 1, 1);
 
-        let encryption_total = inputs.len() + instructions.len() + outputs.len() + 1;
+        let encryption_total = inputs.len() + outputs.len() + 1;
         let mut encrypted_count = 0usize;
         progress(progress_cb, STAGE_ENCRYPT_INPUTS, 0, encryption_total);
 
@@ -226,13 +251,6 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
         let encrypted_zero = FheUint64::encrypt(0u64, &client_key);
         encrypted_count += 1;
         progress(progress_cb, STAGE_ENCRYPT_INPUTS, encrypted_count, encryption_total);
-
-        let mut encrypted_instructions = Vec::with_capacity(instructions.len());
-        for clear in instructions {
-            encrypted_instructions.push(encrypt_instruction(clear, &client_key));
-            encrypted_count += 1;
-            progress(progress_cb, STAGE_ENCRYPT_INPUTS, encrypted_count, encryption_total);
-        }
 
         let mut encrypted_outputs = Vec::with_capacity(outputs.len());
         for &reg in outputs {
@@ -251,23 +269,19 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
             protocol_version: CLOUD_PROTOCOL_VERSION,
             key: compressed_server_key,
         };
-        let job = EncryptedCloudJob {
-            magic: JOB_MAGIC,
+        let init = EncryptedCloudInit {
+            magic: INIT_MAGIC,
             protocol_version: CLOUD_PROTOCOL_VERSION,
             register_count: register_count as u32,
+            expected_instruction_count: expected_instruction_count as u64,
             encrypted_zero,
             inputs: encrypted_inputs,
-            instructions: encrypted_instructions,
             output_registers: encrypted_outputs,
         };
 
-        let client_key_bytes = encode(&client_key_envelope, "TFHE client key envelope")?;
-        let server_key_bytes = encode(&server_key_envelope, "TFHE server key envelope")?;
-        let encrypted_job_bytes = encode(&job, "TFHE encrypted cloud job")?;
-
-        *client_key_out = owned_blob(client_key_bytes);
-        *server_key_out = owned_blob(server_key_bytes);
-        *encrypted_job_out = owned_blob(encrypted_job_bytes);
+        *client_key_out = owned_blob(encode(&client_key_envelope, "TFHE client key envelope")?);
+        *server_key_out = owned_blob(encode(&server_key_envelope, "TFHE server key envelope")?);
+        *encrypted_init_out = owned_blob(encode(&init, "TFHE encrypted cloud init")?);
         Ok(())
     }));
 
@@ -275,22 +289,77 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn v0id_tfhe_cuda_server_evaluate(
-    server_key_data: *const u8,
-    server_key_len: usize,
-    encrypted_job_data: *const u8,
-    encrypted_job_len: usize,
-    encrypted_result_out: *mut V0idTfheBlob,
+pub unsafe extern "C" fn v0id_tfhe_cuda_client_encrypt_chunk(
+    client_key_data: *const u8,
+    client_key_len: usize,
+    instructions: *const V0idTfheInstruction,
+    instruction_count: usize,
+    start_instruction: usize,
+    total_instruction_count: usize,
+    encrypted_chunk_out: *mut V0idTfheBlob,
     progress_cb: ProgressFn,
 ) -> i32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        if encrypted_result_out.is_null() {
-            return Err("TFHE CUDA server evaluate received null result output".into());
+        if instructions.is_null() || encrypted_chunk_out.is_null() {
+            return Err("TFHE CUDA chunk encryption received null required pointer".into());
+        }
+        if instruction_count == 0 || instruction_count > MAX_CHUNK_INSTRUCTIONS {
+            return Err("TFHE CUDA chunk instruction count outside cloud limit".into());
+        }
+        if total_instruction_count == 0 || total_instruction_count > MAX_INSTRUCTIONS {
+            return Err("TFHE CUDA total instruction count outside cloud limit".into());
+        }
+        if start_instruction > total_instruction_count ||
+            instruction_count > total_instruction_count - start_instruction {
+            return Err("TFHE CUDA chunk range exceeds total instruction count".into());
         }
 
+        let client_key_bytes = input_blob(client_key_data, client_key_len, "TFHE client key blob")?;
+        let client_key = decode_client_key(client_key_bytes)?;
+        let clear = slice::from_raw_parts(instructions, instruction_count);
+
+        progress(progress_cb, STAGE_ENCRYPT_INPUTS, start_instruction, total_instruction_count);
+        let mut encrypted = Vec::with_capacity(clear.len());
+        for (index, instruction) in clear.iter().enumerate() {
+            encrypted.push(encrypt_instruction(instruction, &client_key));
+            progress(
+                progress_cb,
+                STAGE_ENCRYPT_INPUTS,
+                start_instruction + index + 1,
+                total_instruction_count,
+            );
+        }
+
+        let chunk = EncryptedInstructionChunk {
+            magic: CHUNK_MAGIC,
+            protocol_version: CLOUD_PROTOCOL_VERSION,
+            start_instruction: start_instruction as u64,
+            total_instruction_count: total_instruction_count as u64,
+            instructions: encrypted,
+        };
+        *encrypted_chunk_out = owned_blob(encode(&chunk, "TFHE encrypted instruction chunk")?);
+        Ok(())
+    }));
+
+    ffi_status(result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn v0id_tfhe_cuda_server_session_new(
+    server_key_data: *const u8,
+    server_key_len: usize,
+    encrypted_init_data: *const u8,
+    encrypted_init_len: usize,
+    session_out: *mut *mut V0idTfheServerSession,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if session_out.is_null() {
+            return Err("TFHE CUDA server session received null output handle".into());
+        }
+        *session_out = ptr::null_mut();
+
         let server_key_bytes = input_blob(server_key_data, server_key_len, "TFHE server key blob")?;
-        let encrypted_job_bytes =
-            input_blob(encrypted_job_data, encrypted_job_len, "TFHE encrypted job blob")?;
+        let init_bytes = input_blob(encrypted_init_data, encrypted_init_len, "TFHE encrypted init blob")?;
 
         let server_key_envelope: ServerKeyEnvelope =
             decode(server_key_bytes, "TFHE server key envelope")?;
@@ -300,46 +369,128 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_server_evaluate(
             server_key_envelope.protocol_version,
             "server key",
         )?;
-        let job: EncryptedCloudJob = decode(encrypted_job_bytes, "TFHE encrypted cloud job")?;
-        require_version_and_magic(job.magic, JOB_MAGIC, job.protocol_version, "cloud job")?;
+        let init: EncryptedCloudInit = decode(init_bytes, "TFHE encrypted cloud init")?;
+        require_version_and_magic(init.magic, INIT_MAGIC, init.protocol_version, "cloud init")?;
 
-        let register_count = job.register_count as usize;
+        let register_count = init.register_count as usize;
+        let expected_instruction_count = init.expected_instruction_count as usize;
         if register_count == 0 || register_count > 64 {
-            return Err("TFHE cloud job register count outside [1,64]".into());
+            return Err("TFHE cloud init register count outside [1,64]".into());
         }
-        if job.inputs.len() > MAX_INPUT_WORDS {
-            return Err("TFHE cloud job input count outside limit".into());
+        if expected_instruction_count == 0 || expected_instruction_count > MAX_INSTRUCTIONS {
+            return Err("TFHE cloud init instruction count outside limit".into());
         }
-        if job.instructions.is_empty() || job.instructions.len() > MAX_INSTRUCTIONS {
-            return Err("TFHE cloud job instruction count outside limit".into());
+        if init.inputs.len() > MAX_INPUT_WORDS {
+            return Err("TFHE cloud init input count outside limit".into());
         }
-        if job.output_registers.is_empty() || job.output_registers.len() > MAX_OUTPUT_WORDS {
-            return Err("TFHE cloud job output count outside limit".into());
+        if init.output_registers.is_empty() || init.output_registers.len() > MAX_OUTPUT_WORDS {
+            return Err("TFHE cloud init output count outside limit".into());
         }
 
-        // The evaluator has only the public/evaluation key material. No ClientKey
-        // is deserialized or accepted by this API. Conversion to the GPU server
-        // key happens entirely on the evaluator side.
         let gpu_key = server_key_envelope.key.decompress_to_gpu();
-        set_server_key(gpu_key);
+        set_server_key(gpu_key.clone());
+        let registers = vec![init.encrypted_zero; register_count];
 
-        let mut registers = vec![job.encrypted_zero; register_count];
-        progress(progress_cb, STAGE_EXECUTE, 0, job.instructions.len());
-        for (index, instruction) in job.instructions.iter().enumerate() {
-            execute_instruction(instruction, &mut registers, &job.inputs);
-            progress(progress_cb, STAGE_EXECUTE, index + 1, job.instructions.len());
+        let session = V0idTfheServerSession {
+            gpu_key,
+            registers,
+            inputs: init.inputs,
+            output_registers: init.output_registers,
+            expected_instruction_count,
+            completed_instruction_count: 0,
+        };
+        *session_out = Box::into_raw(Box::new(session));
+        Ok(())
+    }));
+
+    ffi_status(result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn v0id_tfhe_cuda_server_session_eval_chunk(
+    session: *mut V0idTfheServerSession,
+    encrypted_chunk_data: *const u8,
+    encrypted_chunk_len: usize,
+    progress_cb: ProgressFn,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() {
+            return Err("TFHE CUDA evaluator received null server session".into());
+        }
+        let session = &mut *session;
+        let chunk_bytes = input_blob(
+            encrypted_chunk_data,
+            encrypted_chunk_len,
+            "TFHE encrypted instruction chunk",
+        )?;
+        let chunk: EncryptedInstructionChunk =
+            decode(chunk_bytes, "TFHE encrypted instruction chunk")?;
+        require_version_and_magic(chunk.magic, CHUNK_MAGIC, chunk.protocol_version, "instruction chunk")?;
+
+        if chunk.instructions.is_empty() || chunk.instructions.len() > MAX_CHUNK_INSTRUCTIONS {
+            return Err("TFHE cloud chunk instruction count outside limit".into());
+        }
+        if chunk.total_instruction_count as usize != session.expected_instruction_count {
+            return Err("TFHE cloud chunk total instruction count mismatches session".into());
+        }
+        if chunk.start_instruction as usize != session.completed_instruction_count {
+            return Err("TFHE cloud chunk is replayed, reordered, or skips instructions".into());
+        }
+        if chunk.instructions.len() >
+            session.expected_instruction_count - session.completed_instruction_count {
+            return Err("TFHE cloud chunk exceeds remaining instruction budget".into());
         }
 
-        progress(progress_cb, STAGE_OUTPUT, 0, job.output_registers.len());
-        let mut outputs = Vec::with_capacity(job.output_registers.len());
-        for (index, selector) in job.output_registers.iter().enumerate() {
-            outputs.push(select_register(selector, &registers));
-            progress(progress_cb, STAGE_OUTPUT, index + 1, job.output_registers.len());
+        set_server_key(session.gpu_key.clone());
+        progress(
+            progress_cb,
+            STAGE_EXECUTE,
+            session.completed_instruction_count,
+            session.expected_instruction_count,
+        );
+        for instruction in &chunk.instructions {
+            execute_instruction(instruction, &mut session.registers, &session.inputs);
+            session.completed_instruction_count += 1;
+            progress(
+                progress_cb,
+                STAGE_EXECUTE,
+                session.completed_instruction_count,
+                session.expected_instruction_count,
+            );
+        }
+        Ok(())
+    }));
+
+    ffi_status(result)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn v0id_tfhe_cuda_server_session_finish(
+    session: *mut V0idTfheServerSession,
+    encrypted_result_out: *mut V0idTfheBlob,
+    progress_cb: ProgressFn,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() || encrypted_result_out.is_null() {
+            return Err("TFHE CUDA server finish received null required pointer".into());
+        }
+        let session = &mut *session;
+        if session.completed_instruction_count != session.expected_instruction_count {
+            return Err("TFHE CUDA server finish called before all instruction chunks executed".into());
+        }
+
+        set_server_key(session.gpu_key.clone());
+        progress(progress_cb, STAGE_OUTPUT, 0, session.output_registers.len());
+        let mut outputs = Vec::with_capacity(session.output_registers.len());
+        for (index, selector) in session.output_registers.iter().enumerate() {
+            outputs.push(select_register(selector, &session.registers));
+            progress(progress_cb, STAGE_OUTPUT, index + 1, session.output_registers.len());
         }
 
         let result = EncryptedCloudResult {
             magic: RESULT_MAGIC,
             protocol_version: CLOUD_PROTOCOL_VERSION,
+            completed_instruction_count: session.completed_instruction_count as u64,
             outputs,
         };
         *encrypted_result_out = owned_blob(encode(&result, "TFHE encrypted cloud result")?);
@@ -350,11 +501,23 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_server_evaluate(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn v0id_tfhe_cuda_server_session_free(
+    session: *mut V0idTfheServerSession,
+) {
+    if session.is_null() {
+        return;
+    }
+    tfhe::unset_server_key();
+    drop(Box::from_raw(session));
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn v0id_tfhe_cuda_client_decrypt(
     client_key_data: *const u8,
     client_key_len: usize,
     encrypted_result_data: *const u8,
     encrypted_result_len: usize,
+    expected_instruction_count: usize,
     output_words: *mut u64,
     output_word_capacity: usize,
     output_word_count: *mut usize,
@@ -366,22 +529,21 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_decrypt(
         if output_word_capacity == 0 || output_word_capacity > MAX_OUTPUT_WORDS {
             return Err("TFHE CUDA client output capacity outside cloud limit".into());
         }
+        if expected_instruction_count == 0 || expected_instruction_count > MAX_INSTRUCTIONS {
+            return Err("TFHE CUDA client expected instruction count outside cloud limit".into());
+        }
 
         let client_key_bytes = input_blob(client_key_data, client_key_len, "TFHE client key blob")?;
         let encrypted_result_bytes =
             input_blob(encrypted_result_data, encrypted_result_len, "TFHE encrypted result blob")?;
 
-        let client_key_envelope: ClientKeyEnvelope =
-            decode(client_key_bytes, "TFHE client key envelope")?;
-        require_version_and_magic(
-            client_key_envelope.magic,
-            CLIENT_KEY_MAGIC,
-            client_key_envelope.protocol_version,
-            "client key",
-        )?;
+        let client_key = decode_client_key(client_key_bytes)?;
         let result: EncryptedCloudResult =
             decode(encrypted_result_bytes, "TFHE encrypted cloud result")?;
         require_version_and_magic(result.magic, RESULT_MAGIC, result.protocol_version, "cloud result")?;
+        if result.completed_instruction_count as usize != expected_instruction_count {
+            return Err("TFHE CUDA result instruction count mismatches requested execution".into());
+        }
         if result.outputs.is_empty() || result.outputs.len() > MAX_OUTPUT_WORDS {
             return Err("TFHE CUDA result output count outside cloud limit".into());
         }
@@ -391,7 +553,7 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_decrypt(
 
         let out = slice::from_raw_parts_mut(output_words, output_word_capacity);
         for (index, value) in result.outputs.iter().enumerate() {
-            out[index] = value.decrypt(&client_key_envelope.key);
+            out[index] = value.decrypt(&client_key);
         }
         *output_word_count = result.outputs.len();
         Ok(())

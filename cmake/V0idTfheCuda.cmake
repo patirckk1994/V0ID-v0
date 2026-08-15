@@ -46,7 +46,6 @@ function(v0id_finish_tfhe_cuda_setup)
     set_target_properties(v0id_tfhe_cuda PROPERTIES
         IMPORTED_LOCATION "${V0ID_TFHE_CUDA_LIBRARY}"
     )
-    add_dependencies(v0id_tfhe_cuda v0id-tfhe-cuda-sidecar)
 
     if(NOT TARGET v0id_encrypted_boolean_program)
         message(FATAL_ERROR "V0ID TFHE CUDA hook ran before encrypted evaluator target existed")
@@ -58,6 +57,8 @@ function(v0id_finish_tfhe_cuda_setup)
         V0ID_GPU_FHE_ENABLED=1)
     target_link_libraries(v0id_encrypted_boolean_program PUBLIC
         v0id_tfhe_cuda)
+    add_dependencies(v0id_encrypted_boolean_program
+        v0id-tfhe-cuda-sidecar)
 
     if(TARGET v0id-encrypted-boolean-program-tests)
         target_compile_definitions(v0id-encrypted-boolean-program-tests PRIVATE

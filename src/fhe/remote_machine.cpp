@@ -1,5 +1,6 @@
 #include "remote_machine.hpp"
 
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -27,8 +28,21 @@ RemoteEncryptedMachine::RemoteEncryptedMachine(
     remote_detail::validate_shape(shape_);
     if (!zero_)
         throw std::runtime_error("remote machine encrypted zero is empty");
-    if (program_bits_.size() != remote_detail::program_bit_count(shape_))
-        throw std::runtime_error("remote machine program bit count mismatch");
+
+    program_table_bits_ = remote_detail::program_bit_count(shape_);
+    if (program_bits_.size() == program_table_bits_) {
+        program_table_count_ = 1;
+    } else {
+        const auto rounds = remote_detail::checked_size(shape_.rounds, "round count overflow");
+        if (rounds == 0 ||
+            program_table_bits_ > std::numeric_limits<std::size_t>::max() / rounds ||
+            program_bits_.size() != program_table_bits_ * rounds) {
+            throw std::runtime_error(
+                "remote machine program bit count mismatch (expected one table or one table per round)");
+        }
+        program_table_count_ = rounds;
+    }
+
     if (state_.size() != states_)
         throw std::runtime_error("remote machine state bit count mismatch");
     if (head_.size() != tape_cells_)
@@ -40,7 +54,16 @@ RemoteEncryptedMachine::RemoteEncryptedMachine(
 std::size_t RemoteEncryptedMachine::row_offset(std::size_t state, int read) const {
     if (state >= states_ || (read != 0 && read != 1))
         throw std::runtime_error("remote machine transition index out of range");
-    return (state * 2 + static_cast<std::size_t>(read)) * (states_ + 4);
+
+    std::size_t table_base = 0;
+    if (program_table_count_ > 1) {
+        if (round_index_ >= program_table_count_)
+            throw std::runtime_error("remote machine round schedule exhausted");
+        table_base = round_index_ * program_table_bits_;
+    }
+
+    return table_base +
+           (state * 2 + static_cast<std::size_t>(read)) * (states_ + 4);
 }
 
 const lbcrypto::LWECiphertext& RemoteEncryptedMachine::next_state_selector(
@@ -83,6 +106,11 @@ lbcrypto::LWECiphertext RemoteEncryptedMachine::Or(
 }
 
 void RemoteEncryptedMachine::step() {
+    const auto requested_rounds =
+        remote_detail::checked_size(shape_.rounds, "round count overflow");
+    if (round_index_ >= requested_rounds)
+        throw std::runtime_error("remote machine requested round budget exhausted");
+
     std::vector<lbcrypto::LWECiphertext> next_state(states_, zero_);
     std::vector<lbcrypto::LWECiphertext> next_head(tape_cells_, zero_);
     std::vector<lbcrypto::LWECiphertext> write_any(tape_cells_, zero_);
@@ -125,10 +153,11 @@ void RemoteEncryptedMachine::step() {
     state_ = std::move(next_state);
     head_ = std::move(next_head);
     tape_ = std::move(next_tape);
+    ++round_index_;
 }
 
 void RemoteEncryptedMachine::run_fixed() {
-    for (std::uint64_t round = 0; round < shape_.rounds; ++round)
+    while (round_index_ < shape_.rounds)
         step();
 }
 

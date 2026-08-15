@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace v0id::net {
 namespace {
@@ -156,7 +157,7 @@ std::string tfhe_cloud_session_id_hex(const TfheCloudSessionId& id) {
 
 MultipartEnvelope pack_tfhe_cloud_install(
     Envelope envelope,
-    const TfheCloudInstall& install) {
+    TfheCloudInstall install) {
     require_instruction_total(install.total_instruction_count);
     require_outputs(install.output_word_count);
     require_frame_size(install.server_key_blob.size(), "TFHE server key");
@@ -171,12 +172,12 @@ MultipartEnvelope pack_tfhe_cloud_install(
 
     MultipartEnvelope out;
     out.envelope = std::move(envelope);
-    out.frames.push_back(install.server_key_blob);
-    out.frames.push_back(install.encrypted_init_blob);
+    out.frames.push_back(std::move(install.server_key_blob));
+    out.frames.push_back(std::move(install.encrypted_init_blob));
     return out;
 }
 
-TfheCloudInstall unpack_tfhe_cloud_install(const MultipartEnvelope& message) {
+TfheCloudInstall unpack_tfhe_cloud_install(MultipartEnvelope message) {
     require_type(message, MessageType::install_tfhe_session);
     if (message.frames.size() != 2)
         throw std::runtime_error("INSTALL_TFHE_SESSION requires exactly two blob frames");
@@ -195,14 +196,14 @@ TfheCloudInstall unpack_tfhe_cloud_install(const MultipartEnvelope& message) {
     require_outputs(out.output_word_count);
     require_frame_length(server_len, message.frames[0], "TFHE server key");
     require_frame_length(init_len, message.frames[1], "TFHE encrypted init");
-    out.server_key_blob = message.frames[0];
-    out.encrypted_init_blob = message.frames[1];
+    out.server_key_blob = std::move(message.frames[0]);
+    out.encrypted_init_blob = std::move(message.frames[1]);
     return out;
 }
 
 MultipartEnvelope pack_tfhe_cloud_chunk(
     Envelope envelope,
-    const TfheCloudChunk& chunk) {
+    TfheCloudChunk chunk) {
     require_instruction_total(chunk.total_instruction_count);
     if (chunk.instruction_count == 0 ||
         chunk.instruction_count > kTfheCloudMaxChunkInstructions)
@@ -221,11 +222,11 @@ MultipartEnvelope pack_tfhe_cloud_chunk(
 
     MultipartEnvelope out;
     out.envelope = std::move(envelope);
-    out.frames.push_back(chunk.encrypted_chunk_blob);
+    out.frames.push_back(std::move(chunk.encrypted_chunk_blob));
     return out;
 }
 
-TfheCloudChunk unpack_tfhe_cloud_chunk(const MultipartEnvelope& message) {
+TfheCloudChunk unpack_tfhe_cloud_chunk(MultipartEnvelope message) {
     require_type(message, MessageType::tfhe_instruction_chunk);
     if (message.frames.size() != 1)
         throw std::runtime_error("TFHE_INSTRUCTION_CHUNK requires exactly one blob frame");
@@ -248,7 +249,7 @@ TfheCloudChunk unpack_tfhe_cloud_chunk(const MultipartEnvelope& message) {
         out.instruction_count > out.total_instruction_count - out.start_instruction)
         throw std::runtime_error("TFHE cloud chunk exceeds advertised instruction total");
     require_frame_length(chunk_len, message.frames[0], "TFHE encrypted chunk");
-    out.encrypted_chunk_blob = message.frames[0];
+    out.encrypted_chunk_blob = std::move(message.frames[0]);
     return out;
 }
 
@@ -314,7 +315,7 @@ TfheCloudFinish unpack_tfhe_cloud_finish(const MultipartEnvelope& message) {
 
 MultipartEnvelope pack_tfhe_cloud_result(
     Envelope envelope,
-    const TfheCloudResult& result) {
+    TfheCloudResult result) {
     require_frame_size(result.encrypted_result_blob.size(), "TFHE encrypted result");
     envelope.type = MessageType::tfhe_job_result;
     envelope.payload = metadata_prefix(PayloadKind::result, result.session_id);
@@ -323,11 +324,11 @@ MultipartEnvelope pack_tfhe_cloud_result(
 
     MultipartEnvelope out;
     out.envelope = std::move(envelope);
-    out.frames.push_back(result.encrypted_result_blob);
+    out.frames.push_back(std::move(result.encrypted_result_blob));
     return out;
 }
 
-TfheCloudResult unpack_tfhe_cloud_result(const MultipartEnvelope& message) {
+TfheCloudResult unpack_tfhe_cloud_result(MultipartEnvelope message) {
     require_type(message, MessageType::tfhe_job_result);
     if (message.frames.size() != 1)
         throw std::runtime_error("TFHE_JOB_RESULT requires exactly one blob frame");
@@ -340,7 +341,7 @@ TfheCloudResult unpack_tfhe_cloud_result(const MultipartEnvelope& message) {
     const auto result_len = get_u64(p, end);
     require_exact_end(p, end);
     require_frame_length(result_len, message.frames[0], "TFHE encrypted result");
-    out.encrypted_result_blob = message.frames[0];
+    out.encrypted_result_blob = std::move(message.frames[0]);
     return out;
 }
 

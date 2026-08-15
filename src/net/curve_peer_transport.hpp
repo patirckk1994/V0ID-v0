@@ -2,8 +2,12 @@
 
 #include "peer_transport.hpp"
 
+#include <array>
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace v0id::net {
@@ -26,6 +30,13 @@ CurveKeyPair generate_curve_keypair();
 // stable User-Id. receive_multipart() exposes that User-Id in
 // MultipartEnvelope::authenticated_user_id so application session state can be
 // bound to the cryptographically authenticated transport identity.
+//
+// The server also keeps one bounded idempotent reply record per authenticated
+// User-Id for the state-changing TFHE cloud acknowledgements/results. An exact
+// retry of the immediately preceding authenticated request is answered from the
+// cached reply without re-entering application execution. The cache stores only
+// a SHA3-512 request fingerprint plus the reply that already had to be returned;
+// it does not retain computation traces or historical evaluator state.
 class CurvePeerServer {
 public:
     CurvePeerServer(const std::string& bind_endpoint,
@@ -42,9 +53,29 @@ public:
     std::string last_endpoint() const;
 
 private:
+    using ReplayDigest512 = std::array<std::uint8_t, 64>;
+
+    struct ReplayRecord {
+        ReplayDigest512 request_digest{};
+        MultipartEnvelope reply;
+        std::chrono::steady_clock::time_point stored_at;
+    };
+
     zmq::context_t context_{1};
     zmq::socket_t socket_{context_, zmq::socket_type::rep};
     std::thread zap_thread_;
+
+    // REP sockets process one application request at a time. The pending fields
+    // bind reply_multipart() to the exact request returned by receive_multipart().
+    bool pending_request_{};
+    std::string pending_user_id_;
+    ReplayDigest512 pending_request_digest_{};
+
+    // One replayable response per authenticated user is enough for the REQ/REP
+    // protocol: a client cannot legitimately advance to its next request before
+    // receiving the previous reply. A later distinct request invalidates the old
+    // replay window for that user.
+    std::unordered_map<std::string, ReplayRecord> replay_by_user_;
 };
 
 class CurvePeerClient {

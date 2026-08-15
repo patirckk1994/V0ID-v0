@@ -22,6 +22,7 @@ set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WITH_DOCS OFF CACHE BOOL "" FORCE)
 set(ENABLE_DRAFTS OFF CACHE BOOL "" FORCE)
 set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     libzmq
@@ -38,6 +39,14 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(cppzmq)
+
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
 
 option(V0ID_ENABLE_MATHVM "Build the WAMR-backed V0ID sandbox components" ON)
 if(V0ID_ENABLE_MATHVM)
@@ -372,6 +381,40 @@ target_link_libraries(v0id_net PUBLIC cppzmq OpenSSL::Crypto)
 
 add_executable(v0id-module-sync-tests src/net/module_sync_tests.cpp)
 target_link_libraries(v0id-module-sync-tests PRIVATE v0id_net)
+
+# Local operator control plane. The C++ process remains authoritative; the PHP
+# frontend only reads state snapshots and queues bounded JSON commands. This
+# target intentionally stays independent of OpenFHE/TFHE so it can also be
+# embedded into future client/cloud executors without pulling GPU state into PHP.
+add_library(v0id_control
+    src/control/local_control.cpp
+)
+target_include_directories(v0id_control PUBLIC
+    src/control
+    src/net
+    src/polymorph
+    src/crypto
+)
+target_link_libraries(v0id_control PUBLIC
+    v0id_core
+    v0id_net
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+)
+if(V0ID_ENABLE_MATHVM)
+    target_include_directories(v0id_control PUBLIC src/mathvm)
+    target_link_libraries(v0id_control PUBLIC
+        v0id_mathvm
+        v0id_wasm_polymorph
+    )
+    target_compile_definitions(v0id_control PRIVATE
+        V0ID_CONTROL_HAVE_MATHVM=1)
+endif()
+
+add_executable(v0id-local-control
+    src/control/local_control_main.cpp
+)
+target_link_libraries(v0id-local-control PRIVATE v0id_control)
 
 add_library(v0id_neural
     src/neural/neural_graph.cpp

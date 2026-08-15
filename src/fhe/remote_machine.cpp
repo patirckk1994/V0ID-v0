@@ -7,6 +7,40 @@
 
 namespace v0id::fhe {
 
+std::vector<int> canonical_remote_program_bits(
+    const v0id::core::Program& program) {
+    program.validate();
+
+    std::vector<int> bits;
+    bits.reserve(program.states * 2 * (program.states + 4));
+    for (std::size_t q = 0; q < program.states; ++q) {
+        for (int read = 0; read <= 1; ++read) {
+            const auto& r = program.rule(q, read);
+            for (std::size_t q2 = 0; q2 < program.states; ++q2)
+                bits.push_back(q2 == r.next_state ? 1 : 0);
+            bits.push_back(r.write == 1 ? 1 : 0);
+            bits.push_back(r.move < 0 ? 1 : 0);
+            bits.push_back(r.move == 0 ? 1 : 0);
+            bits.push_back(r.move > 0 ? 1 : 0);
+        }
+    }
+    return bits;
+}
+
+std::vector<lbcrypto::LWECiphertext> encrypt_remote_bits(
+    lbcrypto::BinFHEContext& cc,
+    const lbcrypto::LWEPrivateKey& sk,
+    const std::vector<int>& bits) {
+    std::vector<lbcrypto::LWECiphertext> out;
+    out.reserve(bits.size());
+    for (const int bit : bits) {
+        if (bit != 0 && bit != 1)
+            throw std::runtime_error("remote machine client cannot encrypt non-binary bit");
+        out.push_back(cc.Encrypt(sk, bit));
+    }
+    return out;
+}
+
 RemoteEncryptedMachine::RemoteEncryptedMachine(
     lbcrypto::BinFHEContext& cc,
     const PublicMachineShape& shape,

@@ -373,6 +373,29 @@ target_link_libraries(v0id_net PUBLIC cppzmq OpenSSL::Crypto)
 add_executable(v0id-module-sync-tests src/net/module_sync_tests.cpp)
 target_link_libraries(v0id-module-sync-tests PRIVATE v0id_net)
 
+add_library(v0id_neural
+    src/neural/neural_graph.cpp
+)
+target_include_directories(v0id_neural PUBLIC
+    src/neural
+    src/net
+)
+target_link_libraries(v0id_neural PUBLIC
+    v0id_net
+    OpenSSL::Crypto
+)
+
+add_executable(v0id-neural-graph-tests
+    src/neural/neural_graph_tests.cpp
+)
+target_link_libraries(v0id-neural-graph-tests PRIVATE v0id_neural)
+
+add_custom_target(v0id-test-neural-graph
+    COMMAND $<TARGET_FILE:v0id-neural-graph-tests>
+    DEPENDS v0id-neural-graph-tests
+    USES_TERMINAL
+    COMMENT "Running V0ID modular neural graph regression tests")
+
 add_executable(v0id-peer src/net/peer_demo.cpp)
 target_link_libraries(v0id-peer PRIVATE v0id_net)
 

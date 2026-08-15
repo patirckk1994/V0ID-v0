@@ -136,6 +136,7 @@ function(v0id_finish_tfhe_cuda_setup)
             "${V0ID_TFHE_CUDA_MANIFEST}"
             "${CMAKE_SOURCE_DIR}/rust-toolchain.toml"
             "${CMAKE_SOURCE_DIR}/rust/v0id_tfhe_cuda/src/lib.rs"
+            "${CMAKE_SOURCE_DIR}/rust/v0id_tfhe_cuda/src/cloud.rs"
         USES_TERMINAL
         VERBATIM
         COMMENT "Building V0ID TFHE-rs CUDA sidecar"

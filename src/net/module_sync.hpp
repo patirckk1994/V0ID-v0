@@ -14,6 +14,7 @@ enum class ModuleKind : std::uint8_t {
     strategy_wasm = 1,
     mathvm_wasm = 2,
     polymorphism_wasm = 3,
+    neural_wasm = 4,
 };
 
 enum class ModuleVisibility : std::uint8_t {

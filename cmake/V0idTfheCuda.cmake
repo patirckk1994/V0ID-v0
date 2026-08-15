@@ -15,6 +15,87 @@ function(v0id_finish_tfhe_cuda_setup)
     find_program(V0ID_CARGO_EXECUTABLE cargo REQUIRED)
     find_program(V0ID_RUSTC_EXECUTABLE rustc REQUIRED)
     find_program(V0ID_NVCC_EXECUTABLE nvcc REQUIRED)
+    find_program(V0ID_NVIDIA_SMI_EXECUTABLE nvidia-smi)
+
+    execute_process(
+        COMMAND "${V0ID_RUSTC_EXECUTABLE}" --version
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RESULT_VARIABLE V0ID_RUSTC_RESULT
+        OUTPUT_VARIABLE V0ID_RUSTC_VERSION_TEXT
+        ERROR_VARIABLE V0ID_RUSTC_VERSION_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT V0ID_RUSTC_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "V0ID TFHE CUDA requires Rust 1.91.1. rustc is present but no usable "
+            "toolchain is selected. Run:\n"
+            "  rustup toolchain install 1.91.1 --profile minimal\n"
+            "The repository rust-toolchain.toml will then select it automatically.\n"
+            "rustc said: ${V0ID_RUSTC_VERSION_ERROR}")
+    endif()
+
+    string(REGEX MATCH "rustc ([0-9]+\\.[0-9]+\\.[0-9]+)"
+        _V0ID_RUSTC_MATCH "${V0ID_RUSTC_VERSION_TEXT}")
+    set(V0ID_RUSTC_VERSION "${CMAKE_MATCH_1}")
+    if(NOT V0ID_RUSTC_VERSION OR V0ID_RUSTC_VERSION VERSION_LESS "1.91.1")
+        message(FATAL_ERROR
+            "V0ID TFHE CUDA requires Rust >= 1.91.1 for TFHE-rs 1.6.1; "
+            "found '${V0ID_RUSTC_VERSION_TEXT}'. Run:\n"
+            "  rustup toolchain install 1.91.1 --profile minimal")
+    endif()
+
+    execute_process(
+        COMMAND "${V0ID_NVCC_EXECUTABLE}" --version
+        RESULT_VARIABLE V0ID_NVCC_RESULT
+        OUTPUT_VARIABLE V0ID_NVCC_VERSION_TEXT
+        ERROR_VARIABLE V0ID_NVCC_VERSION_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT V0ID_NVCC_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "V0ID TFHE CUDA found nvcc but could not execute it: "
+            "${V0ID_NVCC_VERSION_ERROR}")
+    endif()
+    string(REGEX MATCH "release ([0-9]+\\.[0-9]+)"
+        _V0ID_NVCC_MATCH "${V0ID_NVCC_VERSION_TEXT}")
+    set(V0ID_CUDA_TOOLKIT_VERSION "${CMAKE_MATCH_1}")
+
+    set(V0ID_GPU_COMPUTE_CAPABILITY "unknown")
+    if(V0ID_NVIDIA_SMI_EXECUTABLE)
+        execute_process(
+            COMMAND "${V0ID_NVIDIA_SMI_EXECUTABLE}"
+                --query-gpu=compute_cap --format=csv,noheader
+            RESULT_VARIABLE V0ID_SMI_RESULT
+            OUTPUT_VARIABLE V0ID_SMI_COMPUTE_CAPS
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(V0ID_SMI_RESULT EQUAL 0)
+            string(REGEX MATCH "^([0-9]+)\\.([0-9]+)"
+                _V0ID_CAP_MATCH "${V0ID_SMI_COMPUTE_CAPS}")
+            if(CMAKE_MATCH_1)
+                set(V0ID_GPU_COMPUTE_CAPABILITY
+                    "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+            endif()
+        endif()
+    endif()
+
+    # Blackwell (compute capability 10.x / 12.x) first has native CUDA Toolkit
+    # support in 12.8. A newer driver reported by nvidia-smi does not upgrade the
+    # nvcc compiler installed on disk, so fail with a useful diagnostic here.
+    if(NOT V0ID_GPU_COMPUTE_CAPABILITY STREQUAL "unknown"
+       AND V0ID_GPU_COMPUTE_CAPABILITY VERSION_GREATER_EQUAL "10.0"
+       AND V0ID_CUDA_TOOLKIT_VERSION
+       AND V0ID_CUDA_TOOLKIT_VERSION VERSION_LESS "12.8")
+        message(FATAL_ERROR
+            "V0ID TFHE CUDA detected a Blackwell-class GPU (compute capability "
+            "${V0ID_GPU_COMPUTE_CAPABILITY}) but nvcc is CUDA Toolkit "
+            "${V0ID_CUDA_TOOLKIT_VERSION}. Blackwell requires CUDA Toolkit >= 12.8. "
+            "nvidia-smi reports driver capability, not the installed nvcc toolkit. "
+            "Install/select CUDA Toolkit 12.8 or newer, then re-run the gpu-fhe preset.")
+    endif()
 
     set(V0ID_TFHE_CUDA_MANIFEST
         "${CMAKE_SOURCE_DIR}/rust/v0id_tfhe_cuda/Cargo.toml")
@@ -33,6 +114,7 @@ function(v0id_finish_tfhe_cuda_setup)
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         DEPENDS
             "${V0ID_TFHE_CUDA_MANIFEST}"
+            "${CMAKE_SOURCE_DIR}/rust-toolchain.toml"
             "${CMAKE_SOURCE_DIR}/rust/v0id_tfhe_cuda/src/lib.rs"
         USES_TERMINAL
         VERBATIM
@@ -70,12 +152,20 @@ function(v0id_finish_tfhe_cuda_setup)
     endif()
 
     message(STATUS "V0ID TFHE CUDA backend: ENABLED")
-    message(STATUS "  cargo : ${V0ID_CARGO_EXECUTABLE}")
-    message(STATUS "  rustc : ${V0ID_RUSTC_EXECUTABLE}")
-    message(STATUS "  nvcc  : ${V0ID_NVCC_EXECUTABLE}")
+    message(STATUS "  cargo      : ${V0ID_CARGO_EXECUTABLE}")
+    message(STATUS "  rustc      : ${V0ID_RUSTC_VERSION_TEXT}")
+    message(STATUS "  nvcc       : ${V0ID_NVCC_EXECUTABLE} (CUDA ${V0ID_CUDA_TOOLKIT_VERSION})")
+    message(STATUS "  GPU CC     : ${V0ID_GPU_COMPUTE_CAPABILITY}")
     message(STATUS "  Rust sidecar: ${V0ID_TFHE_CUDA_LIBRARY}")
 endfunction()
 
-# This file is loaded through CMAKE_PROJECT_INCLUDE by the GPU preset. Defer the
-# target wiring until the top-level CMakeLists has created the evaluator targets.
-cmake_language(DEFER CALL v0id_finish_tfhe_cuda_setup)
+# The GPU preset loads this only for the first/top-level project() call. The
+# explicit DIRECTORY also makes the hook robust against stale caches that still
+# inject it through CMAKE_PROJECT_INCLUDE: target wiring always runs at the end
+# of V0ID's top-level CMakeLists, after the encrypted evaluator targets exist.
+if(NOT V0ID_TFHE_CUDA_SETUP_DEFERRED)
+    set(V0ID_TFHE_CUDA_SETUP_DEFERRED TRUE CACHE INTERNAL
+        "V0ID TFHE CUDA setup has been scheduled")
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+        CALL v0id_finish_tfhe_cuda_setup)
+endif()

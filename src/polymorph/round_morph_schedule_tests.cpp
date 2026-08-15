@@ -16,10 +16,14 @@ namespace {
 using v0id::core::Program;
 using v0id::core::compose_bounded_with_integrity;
 using v0id::crypto::SeriesFirstStackContext;
+using v0id::polymorph::DerivedSeries;
+using v0id::polymorph::FunctionalSeriesGenerator;
 using v0id::polymorph::KmacSeriesGenerator;
 using v0id::polymorph::MorphSeed;
+using v0id::polymorph::PolymorphicSeriesGenerator;
 using v0id::polymorph::ProgramMorpher;
 using v0id::polymorph::RoundMorphedProgramSchedule;
+using v0id::polymorph::SeriesProfile;
 using v0id::polymorph::SeriesSeed;
 
 struct RunResult {
@@ -129,6 +133,17 @@ SeriesFirstStackContext combined_stack_context() {
         c.generator_binding[i] = static_cast<std::uint8_t>((i * 9 + 7) & 0xffu);
     }
     return c;
+}
+
+bool is_prefix(const std::vector<std::uint8_t>& prefix,
+               const std::vector<std::uint8_t>& whole) {
+    if (prefix.size() > whole.size())
+        return false;
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        if (prefix[i] != whole[i])
+            return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -301,12 +316,69 @@ int main() try {
     for (const int bit : input)
         series_input.push_back(static_cast<std::uint8_t>(bit & 1));
 
+    // KMACXOF256 is the built-in private-series implementation, not the
+    // polymorphism architecture itself. These checks lock down the XOF behavior
+    // while the PolymorphicSeriesGenerator interface remains replaceable.
     KmacSeriesGenerator generator(64);
+    KmacSeriesGenerator longer_generator(128);
     const auto root_a = private_root_a();
     const auto root_b = private_root_b();
-    const auto derived_a = generator.derive(series_input, root_a, combined_stack_context().epoch);
-    const auto derived_a_again = generator.derive(series_input, root_a, combined_stack_context().epoch);
-    const auto derived_b = generator.derive(series_input, root_b, combined_stack_context().epoch);
+    const auto epoch = combined_stack_context().epoch;
+    const auto derived_a = generator.derive(series_input, root_a, epoch);
+    const auto derived_a_again = generator.derive(series_input, root_a, epoch);
+    const auto derived_b = generator.derive(series_input, root_b, epoch);
+    const auto derived_long = longer_generator.derive(series_input, root_a, epoch);
+
+    auto changed_input = series_input;
+    changed_input[0] ^= 1u;
+    const auto derived_changed_input = generator.derive(changed_input, root_a, epoch);
+    const auto derived_changed_epoch = generator.derive(series_input, root_a, epoch + 1);
+
+    const auto kmac_profile = generator.profile();
+    pass(kmac_profile.generator_id == "v0id-series-kmacxof256-v2" &&
+             kmac_profile.version == 2,
+         "built-in private series profile explicitly identifies KMACXOF256 v2");
+    pass(derived_a.series.size() == 64 && derived_long.series.size() == 128,
+         "KMACXOF256 expands the same private root to caller-selected series lengths");
+    pass(is_prefix(derived_a.series, derived_long.series),
+         "KMACXOF256 longer output preserves the shorter private-series prefix");
+    pass(derived_a.series == derived_a_again.series &&
+             derived_a.morph_seed == derived_a_again.morph_seed &&
+             derived_a.private_manifest == derived_a_again.private_manifest,
+         "KMACXOF256 private derivation is deterministic for identical root/input/epoch");
+    pass(derived_a.series != derived_b.series,
+         "changing the issuer-private root changes the KMACXOF256 private series");
+    pass(derived_a.series != derived_changed_input.series,
+         "changing semantic input changes the KMACXOF256 private series");
+    pass(derived_a.series != derived_changed_epoch.series,
+         "changing epoch changes the KMACXOF256 private series");
+
+    // Prove the engine consumes the abstract interface rather than requiring
+    // KMAC. A custom generator can supply an entirely different private series
+    // strategy without changing ProgramMorpher or stack integration.
+    FunctionalSeriesGenerator custom_generator(
+        SeriesProfile{"test-custom-series", 7, {0x42}},
+        [](const std::vector<std::uint8_t>& custom_input,
+           const SeriesSeed& custom_root,
+           std::uint64_t custom_epoch) {
+            DerivedSeries out;
+            out.series = {
+                0xc5,
+                static_cast<std::uint8_t>(custom_input.size() & 0xffu),
+                custom_root[0],
+                static_cast<std::uint8_t>(custom_epoch & 0xffu),
+            };
+            for (std::size_t i = 0; i < out.morph_seed.size(); ++i)
+                out.morph_seed[i] = static_cast<unsigned char>(0x80u + i);
+            out.private_manifest = {0x51, 0x52, 0x53};
+            return out;
+        });
+    const PolymorphicSeriesGenerator& selected_generator = custom_generator;
+    const auto custom = selected_generator.derive(series_input, root_a, epoch);
+    pass(selected_generator.profile().generator_id == "test-custom-series" &&
+             custom.series.size() == 4 && custom.series[0] == 0xc5 &&
+             custom.private_manifest == std::vector<std::uint8_t>({0x51, 0x52, 0x53}),
+         "custom generator substitutes through PolymorphicSeriesGenerator without KMAC coupling");
 
     const auto stack_seed_a = v0id::crypto::derive_program_morph_seed_from_stack(
         root_a, combined_stack_context(), derived_a.series);

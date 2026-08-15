@@ -5,7 +5,7 @@ small client-side control ABI, not a second cloud protocol.
 
 ## Trust boundary
 
-The local V0ID process is authoritative. The PHP page is only an operator UI.
+The local V0ID process is authoritative. The PHP pages are only operator UIs.
 The remote evaluator is still the untrusted/limited party.
 
 The client is allowed to know its own models, module wiring, Series-First
@@ -14,42 +14,47 @@ SeriesSeed currently remains process-local by default simply because serializing
 it into browser-visible state is unnecessary; this is not a claim that the local
 client must be hidden from itself.
 
-Current flow:
+The encrypted cloud page follows the intended split:
 
 ```text
 browser
   |
   | localhost HTTP
   v
-web/index.php
+web/cloud.php
   |
-  | reads state.json
-  | atomically creates command JSON
+  | local JSON command
   v
-runtime root
-  |-- state.json
-  |-- registry.json
-  |-- commands/*.json
-  |-- responses/*.json
-  |-- uploads/*.wasm
-  `-- modules/<sha3-512>.wasm
-  ^
-  |
 v0id-local-control
   |
-  +-- Series-First stack
-  +-- built-in KMACXOF256 series generator
-  +-- POLYMORPHISM_WASM generator
-  +-- module descriptors/bindings
-  `-- MathVM/WAMR execution
+  | trusted client preparation
+  | TFHE ClientKey stays local
+  | encrypt program/input locally
+  v
+ZeroMQ CURVE/ZAP cloud transport
+  |
+  v
+remote evaluator
+  |
+  | server/evaluation key + ciphertext only
+  | encrypted chunk execution
+  v
+encrypted result
+  |
+  v
+local client decryption
+  |
+  v
+cloud_state.json -> browser progress/result
 ```
 
-The runtime directory should be outside the HTTP document root.
+The dashboard itself does not need to run on the remote evaluator. The runtime
+directory should remain outside the HTTP document root.
 
-## What is wired now
+## Local module / Series-First interface
 
-The C++ control plane exposes the existing V0ID abstractions rather than
-reimplementing them in PHP:
+`web/index.php` exposes the existing V0ID abstractions rather than reimplementing
+them in PHP:
 
 - built-in `KmacSeriesGenerator`;
 - `PolymorphicSeriesGenerator` profile selection;
@@ -63,10 +68,110 @@ reimplementing them in PHP:
 - bounded local MathVM execution through the existing WAMR sandbox;
 - progress snapshots which can be polled while the C++ process is busy.
 
-The current control plane does **not** yet submit the existing streamed TFHE CUDA
-cloud job. The state schema already treats computation/progress generically so a
-future cloud-client adapter can publish the existing client/server progress
-callbacks into the same UI without changing the PHP protocol.
+The ordinary local-control directory remains:
+
+```text
+state.json
+registry.json
+commands/*.json
+responses/*.json
+uploads/*.wasm
+modules/<sha3-512>.wasm
+```
+
+## Remote encrypted TFHE interface
+
+GPU builds now add a second worker to the same `v0id-local-control` process. It
+uses a separate queue so a long encrypted remote job cannot consume or reorder
+module/Series-First administrative commands:
+
+```text
+cloud_state.json
+cloud_registry.json
+cloud_commands/*.json
+cloud_responses/*.json
+```
+
+`web/cloud.php` can:
+
+1. configure an existing remote evaluator endpoint;
+2. select the local CURVE client key files and pinned server public key file;
+3. select the expected authenticated server peer id;
+4. choose timeout, exact-request retry attempts and encrypted chunk size;
+5. submit a `BooleanProgramImage` plus its input words;
+6. watch trusted-client preparation, encrypted chunk submission, remote chunk
+   completion, result retrieval and local decryption progress;
+7. display the final locally decrypted output words.
+
+The current remote job format is the existing compact Boolean VM. The page accepts
+all current `BooleanProgramOpcode` values:
+
+```text
+XOR2
+XOR5
+XOR_ROT1
+ROT_COPY
+CHI
+XOR_INPUT
+XOR_CONST
+```
+
+The page contains a one-instruction identity example by default, but the JSON
+editor can submit any program accepted by `BooleanProgramImage::validate()` and
+the existing TFHE cloud protocol limits.
+
+The C++ adapter is `execute_boolean_program_tfhe_cloud()`. It reuses the existing:
+
+- TFHE CUDA client preparation API;
+- encrypted instruction chunk API;
+- typed `TfheCloudInstall`, `TfheCloudChunk`, `TfheCloudFinish`, and result codec;
+- ZeroMQ CURVE/ZAP authenticated transport;
+- local TFHE decryption API.
+
+It does not create a separate cloud wire protocol.
+
+## Retry semantics
+
+For a transport failure, the client reconnects and resends the **exact same**
+authenticated request. This matches the server-side idempotent replay window:
+
+```text
+chunk request -> server executes -> ACK lost
+same chunk request -> cached ACK returned, no re-execution
+
+finish request -> result built -> RESULT lost
+same finish request -> cached encrypted result returned
+```
+
+The control-plane setting is named `retry_attempts`; it is the total number of
+attempts for one exact request, including the first send.
+
+## Progress
+
+The local module/Series-First page polls `state.json`. The encrypted cloud page
+polls `cloud_state.json`. Both are atomically replaced JSON snapshots.
+
+Cloud stages include:
+
+```text
+plaintext-oracle          optional cheap local reference
+client-key-generation
+client-client-encryption
+client-prepare
+remote-install
+encrypt-chunk
+remote-execution
+transport-retry
+remote-finish
+client-decrypt
+verify
+completed / failed
+```
+
+The current request/reply cloud protocol reports remote progress at **chunk
+boundaries**, not instruction-by-instruction while a remote request is still in
+flight. Lowering `instruction_chunk_size` gives more frequent remote progress
+updates at the cost of more network request/ack boundaries.
 
 ## Module editing model
 
@@ -86,114 +191,48 @@ Shared bound modules are committed through `shared_module_set_digest512()` into
 `SeriesFirstStackContext::shared_modules_binding` when a stack computation is
 run.
 
-## JSON command ABI
-
-Commands use one immutable file per operation:
-
-```json
-{
-  "protocol": "v0id-local-control-v1",
-  "command_id": "4a95...",
-  "command": "configure_series",
-  "payload": {
-    "mode": "kmacxof256",
-    "series_bytes": 64
-  }
-}
-```
-
-Supported commands in this first slice:
-
-```text
-register_module
-update_module_config
-remove_module
-bind_module
-unbind_module
-configure_series
-run_computation
-shutdown
-```
-
-`run_computation` currently supports:
-
-```text
-series_generator
-series_first_stack
-mathvm
-```
-
-## Progress
-
-`state.json` contains a live computation object:
-
-```json
-{
-  "computation": {
-    "job_id": "...",
-    "type": "series_first_stack",
-    "state": "running",
-    "stage": "algorithm-later",
-    "current": 3,
-    "total": 5,
-    "percent": 60.0,
-    "message": "expanding selected algorithm only after purpose series exists",
-    "result": {}
-  }
-}
-```
-
-The PHP page polls the state endpoint once per second, so the progress display is
-independent of the command-processing loop.
-
 ## Build and run
 
-After pulling the branch, reconfigure once because the control target adds a
-pinned `nlohmann_json` FetchContent dependency:
+The `gpu-fhe` preset now includes the TFHE remote-control hook. Reconfigure after
+pulling because the preset project include changed:
 
 ```bash
 cmake --preset gpu-fhe
 cmake --build --preset gpu-fhe --target v0id-local-control
 ```
 
-For a non-GPU build, use whichever existing configure/build directory you use;
-the local control target itself does not require OpenFHE CUDA/TFHE.
-
-Start the C++ side:
+Start the local C++ client/control process:
 
 ```bash
 mkdir -p /tmp/v0id-control
 ./build-gpu/v0id-local-control /tmp/v0id-control
 ```
 
-In another shell, start PHP on loopback only:
+Start PHP on loopback only:
 
 ```bash
 V0ID_CONTROL_ROOT=/tmp/v0id-control \
 php -S 127.0.0.1:8080 -t web
 ```
 
-Then open `http://127.0.0.1:8080/` locally.
+Open:
+
+```text
+http://127.0.0.1:8080/           module / Series-First interface
+http://127.0.0.1:8080/cloud.php  encrypted remote execution interface
+```
 
 The PHP process and C++ process need filesystem permissions to the same runtime
 directory.
 
-## Next integration boundary
+## Remote evaluator
 
-Do not add another cloud protocol for the dashboard. The next useful adapter is
-to let the existing TFHE cloud client publish its real stages through the same
-control state:
+The remote machine still runs the existing evaluator/server side. For example,
+a test evaluator generated through `v0id-tfhe-cloud keygen` can be launched with
+the existing server command and an allowlisted client public key. The local cloud
+page then points at that server's `tcp://host:port` endpoint and pins the server
+public key locally.
 
-```text
-client preparation
-key/server material preparation
-encrypted chunk generation
-chunk upload
-remote execution progress
-output selection
-result download
-client decryption
-```
-
-The actual TFHE transport/session semantics remain the existing CURVE/ZAP + typed
-multipart protocol.
+The remote evaluator receives no TFHE ClientKey and no plaintext program/input
+through this interface. The final encrypted result is returned to the local
+client and decrypted there.

@@ -112,6 +112,13 @@ void validate_wasm_descriptor(const v0id::net::ModuleDescriptor& descriptor) {
         throw std::runtime_error("neural Wasm module uses unsupported module-sync protocol");
     if (descriptor.kind != v0id::net::ModuleKind::neural_wasm)
         throw std::runtime_error("neural Wasm node must reference a NEURAL_WASM module");
+    switch (descriptor.visibility) {
+        case v0id::net::ModuleVisibility::private_local:
+        case v0id::net::ModuleVisibility::shared_sync:
+            break;
+        default:
+            throw std::runtime_error("neural Wasm module has invalid visibility");
+    }
     if (descriptor.module_id.empty() || descriptor.module_version == 0)
         throw std::runtime_error("neural Wasm module descriptor missing id/version");
     if (descriptor.byte_size == 0 || digest_all_zero(descriptor.digest))
@@ -333,6 +340,30 @@ void NeuralInvocation::validate(const NeuralGraph& graph) const {
 
     if (model_state_digest && digest_all_zero(*model_state_digest))
         throw std::runtime_error("neural model-state checksum must be nonzero when present");
+}
+
+NeuralDigest512 NeuralInvocation::digest512(const NeuralGraph& graph) const {
+    validate(graph);
+
+    std::vector<NeuralContextRef> sorted_contexts = contexts;
+    std::sort(sorted_contexts.begin(), sorted_contexts.end(),
+              [](const auto& a, const auto& b) { return a.name < b.name; });
+
+    std::vector<std::uint8_t> canonical;
+    put_string(canonical, "V0ID-NEURAL-INVOCATION-v1");
+    put_digest(canonical, graph.digest512());
+    put_u64(canonical, static_cast<std::uint64_t>(execution_mode));
+    put_u64(canonical, static_cast<std::uint64_t>(sorted_contexts.size()));
+    for (const auto& context : sorted_contexts) {
+        put_string(canonical, context.name);
+        put_u64(canonical, static_cast<std::uint64_t>(context.location));
+        put_digest(canonical, context.digest);
+    }
+    put_u64(canonical, model_state_digest ? 1u : 0u);
+    if (model_state_digest)
+        put_digest(canonical, *model_state_digest);
+
+    return v0id::net::module_digest512(canonical);
 }
 
 std::string to_string(NeuralExecutionMode mode) {

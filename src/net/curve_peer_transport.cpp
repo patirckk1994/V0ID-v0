@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <exception>
 #include <future>
 #include <stdexcept>
 #include <string>
@@ -42,6 +43,14 @@ std::array<std::uint8_t, 32> decode_z85_public_key(const std::string& key) {
     if (!zmq_z85_decode(decoded.data(), key.c_str()))
         throw std::runtime_error("failed to decode CURVE public key");
     return decoded;
+}
+
+std::string derive_curve_public_key(const std::string& secret_key_z85) {
+    require_z85_key(secret_key_z85, "CURVE secret key");
+    std::array<char, 41> public_key{};
+    if (zmq_curve_public(public_key.data(), secret_key_z85.c_str()) != 0)
+        throw std::runtime_error(std::string("zmq_curve_public failed: ") + zmq_strerror(zmq_errno()));
+    return std::string(public_key.data());
 }
 
 void require_user_id(const std::string& user_id) {
@@ -109,6 +118,8 @@ void configure_curve_client(zmq::socket_t& socket,
     require_z85_key(client_keys.public_key_z85, "CURVE client public key");
     require_z85_key(client_keys.secret_key_z85, "CURVE client secret key");
     require_z85_key(server_public_key_z85, "CURVE server public key");
+    if (derive_curve_public_key(client_keys.secret_key_z85) != client_keys.public_key_z85)
+        throw std::runtime_error("CURVE client public/secret key files do not form a keypair");
 
     checked_setsockopt(socket.handle(), ZMQ_CURVE_PUBLICKEY,
                        client_keys.public_key_z85.data(), client_keys.public_key_z85.size(),
@@ -143,15 +154,20 @@ void send_text_frame(zmq::socket_t& socket,
 
 std::vector<zmq::message_t> receive_all_frames(zmq::socket_t& socket) {
     std::vector<zmq::message_t> frames;
+    bool excessive = false;
     while (true) {
-        frames.emplace_back();
-        if (!socket.recv(frames.back(), zmq::recv_flags::none))
+        zmq::message_t frame;
+        if (!socket.recv(frame, zmq::recv_flags::none))
             throw std::runtime_error("ZeroMQ receive timed out");
+        if (frames.size() < 32)
+            frames.push_back(std::move(frame));
+        else
+            excessive = true;
         if (!socket.get(zmq::sockopt::rcvmore))
             break;
-        if (frames.size() > 32)
-            throw std::runtime_error("excessive ZAP frame count");
     }
+    if (excessive)
+        throw std::runtime_error("excessive ZAP frame count");
     return frames;
 }
 
@@ -249,15 +265,20 @@ MultipartEnvelope recv_multipart(zmq::socket_t& socket,
         out.authenticated_user_id = user_id;
     }
 
+    bool too_many = false;
     while (socket.get(zmq::sockopt::rcvmore)) {
-        if (out.frames.size() >= MAX_MULTIPART_FRAMES)
-            throw std::runtime_error("too many CURVE V0ID multipart frames");
         zmq::message_t frame;
         if (!socket.recv(frame, zmq::recv_flags::none))
             throw std::runtime_error("ZeroMQ CURVE multipart receive timed out");
+        if (out.frames.size() >= MAX_MULTIPART_FRAMES) {
+            too_many = true;
+            continue;
+        }
         const auto* begin = static_cast<const std::uint8_t*>(frame.data());
         out.frames.emplace_back(begin, begin + frame.size());
     }
+    if (too_many)
+        throw std::runtime_error("too many CURVE V0ID multipart frames");
     return out;
 }
 

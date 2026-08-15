@@ -270,24 +270,31 @@ int main() try {
     }};
     integrity_marker.validate();
 
+    constexpr std::size_t integrity_rounds = 1;
     const auto combined = compose_bounded_with_integrity(
-        increment, 0, rounds, integrity_marker, 0);
+        increment, 0, rounds, integrity_marker, 0, integrity_rounds);
 
     pass(combined.semantic_state_count == rounds * increment.states &&
              combined.integrity_state_offset == rounds * increment.states &&
              combined.program.states == rounds * increment.states + integrity_marker.states,
          "semantic and integrity fragments compile into one bounded program image");
 
+    pass(combined.semantic_rounds == rounds &&
+             combined.integrity_rounds == integrity_rounds &&
+             combined.total_execution_rounds == rounds + integrity_rounds,
+         "combined program explicitly accounts semantic + integrity execution rounds");
+
     const auto combined_after_semantic =
-        run_program(combined.program, combined.initial_state, input, rounds);
+        run_program(combined.program, combined.initial_state, input, combined.semantic_rounds);
     pass(combined_after_semantic.tape == base_full_tape &&
              combined_after_semantic.state == combined.integrity_state_offset,
          "combined program enters integrity code only after the requested semantic rounds");
 
     const auto combined_after_integrity =
-        run_program(combined.program, combined.initial_state, input, rounds + 1);
+        run_program(combined.program, combined.initial_state, input,
+                    combined.total_execution_rounds);
     pass(combined_after_integrity.tape != base_full_tape,
-         "embedded integrity fragment executes as part of the same program");
+         "total execution budget actually executes the embedded integrity fragment");
 
     std::vector<std::uint8_t> series_input;
     series_input.reserve(input.size());
@@ -337,9 +344,11 @@ int main() try {
          "integrity logic survives the same secret state permutation as useful logic");
 
     const auto morphed_after_semantic =
-        run_program(combined_morph.program, combined_morph.initial_state, input, rounds);
+        run_program(combined_morph.program, combined_morph.initial_state, input,
+                    combined.semantic_rounds);
     const auto morphed_after_integrity =
-        run_program(combined_morph.program, combined_morph.initial_state, input, rounds + 1);
+        run_program(combined_morph.program, combined_morph.initial_state, input,
+                    combined.total_execution_rounds);
     pass(morphed_after_semantic.tape == base_full_tape &&
              morphed_after_integrity.tape == combined_after_integrity.tape,
          "combined useful+integrity semantics survive one shared polymorphic transform");

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <vector>
 
 namespace v0id::fhe {
@@ -19,6 +20,8 @@ inline constexpr const char* kRequestedFheBackendName = "OpenFHE BinFHE CPU";
 inline constexpr const char* kActiveFheBackendName = "OpenFHE BinFHE CPU reference";
 #endif
 
+inline constexpr std::size_t kTfheCudaInstructionChunkSize = 32;
+
 enum class GpuFheProgressStage : std::uint32_t {
     KeyGeneration = 1,
     ClientEncryption = 2,
@@ -31,48 +34,70 @@ using GpuFheProgressCallback = std::function<void(
     std::size_t current,
     std::size_t total)>;
 
-// Serialized artifacts produced on the trusted client side. client_key_blob is
-// private and must never be sent to the evaluator. server_key_blob and
-// encrypted_job_blob are the evaluator-facing cloud payloads.
-struct TfheCudaPreparedJob {
+// Trusted-client artifacts. The client key never belongs on the evaluator.
+// The server key is installed once per evaluator session; encrypted_init_blob
+// contains encrypted inputs/zero/output selectors but no instruction stream.
+struct TfheCudaPreparedSession {
     std::vector<std::uint8_t> client_key_blob;
     std::vector<std::uint8_t> server_key_blob;
-    std::vector<std::uint8_t> encrypted_job_blob;
+    std::vector<std::uint8_t> encrypted_init_blob;
+    std::size_t instruction_count{};
     std::size_t output_word_count{};
 };
 
-// True only in builds linked against the Rust TFHE-rs CUDA sidecar.
 bool tfhe_cuda_backend_available();
 
-// Trusted client boundary: key generation plus encryption/serialization of the
-// compact Boolean program image and inputs. The returned ClientKey blob remains
-// client-only; only server_key_blob + encrypted_job_blob belong on the wire.
-TfheCudaPreparedJob prepare_boolean_program_image_tfhe_cuda_client(
+TfheCudaPreparedSession prepare_boolean_program_image_tfhe_cuda_client(
     const v0id::integrity::BooleanProgramImage& image,
     const std::vector<std::uint64_t>& input_words,
     GpuFheProgressCallback progress = {});
 
-// Untrusted evaluator boundary: accepts no client key and no plaintext program.
-// It deserializes the compressed TFHE server key and encrypted job, executes the
-// fixed-path VM under CUDA, and returns only an encrypted serialized result.
-std::vector<std::uint8_t> evaluate_boolean_program_image_tfhe_cuda_server(
-    const std::vector<std::uint8_t>& server_key_blob,
-    const std::vector<std::uint8_t>& encrypted_job_blob,
+// Encrypt only one contiguous instruction range. start_instruction is bound
+// into the encrypted chunk envelope; the evaluator rejects replay, reordering
+// and gaps relative to its cached session progress.
+std::vector<std::uint8_t> encrypt_boolean_program_chunk_tfhe_cuda_client(
+    const std::vector<std::uint8_t>& client_key_blob,
+    std::span<const v0id::integrity::BooleanProgramInstruction> instructions,
+    std::size_t start_instruction,
+    std::size_t total_instruction_count,
     GpuFheProgressCallback progress = {});
 
-// Trusted client boundary: decrypt a serialized evaluator result with the
-// client-only key blob. expected_output_word_count is public shape metadata and
-// prevents accepting a result with a silently different output cardinality.
+// Evaluator-owned cached session. It owns the GPU server key plus encrypted
+// registers/inputs between chunks. The handle is process-local and deliberately
+// opaque to callers; a network evaluator can map its own session id to this
+// object without exposing a ClientKey.
+class TfheCudaServerSession final {
+public:
+    TfheCudaServerSession(
+        const std::vector<std::uint8_t>& server_key_blob,
+        const std::vector<std::uint8_t>& encrypted_init_blob);
+    ~TfheCudaServerSession();
+
+    TfheCudaServerSession(const TfheCudaServerSession&) = delete;
+    TfheCudaServerSession& operator=(const TfheCudaServerSession&) = delete;
+    TfheCudaServerSession(TfheCudaServerSession&& other) noexcept;
+    TfheCudaServerSession& operator=(TfheCudaServerSession&& other) noexcept;
+
+    void evaluate_chunk(
+        const std::vector<std::uint8_t>& encrypted_chunk_blob,
+        GpuFheProgressCallback progress = {});
+
+    std::vector<std::uint8_t> finish(
+        GpuFheProgressCallback progress = {});
+
+private:
+    void* handle_{};
+};
+
 std::vector<std::uint64_t> decrypt_boolean_program_image_tfhe_cuda_client(
     const std::vector<std::uint8_t>& client_key_blob,
     const std::vector<std::uint8_t>& encrypted_result_blob,
+    std::size_t expected_instruction_count,
     std::size_t expected_output_word_count);
 
-// Convenience differential/stress wrapper. It now exercises the exact same
-// serialized client -> evaluator -> client seam above in one process. No secret
-// key enters evaluate_boolean_program_image_tfhe_cuda_server(). Moving the two
-// evaluator-facing blobs over ZeroMQ is therefore a transport step, not a new
-// cryptographic execution path.
+// Local differential/stress wrapper around the same streamed seam that a
+// future ZeroMQ client/evaluator will use: prepare once, cache server state,
+// encrypt/send bounded chunks, finish, decrypt locally.
 std::vector<std::uint64_t> evaluate_boolean_program_image_tfhe_cuda(
     const v0id::integrity::BooleanProgramImage& image,
     const std::vector<std::uint64_t>& input_words,

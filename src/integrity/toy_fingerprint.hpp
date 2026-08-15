@@ -17,12 +17,27 @@ inline constexpr std::uint32_t TOY_FINGERPRINT_INITIAL_STATE = 0x56304944u; // "
 // write bit, then move-left/stay/right one-hot bits.
 std::vector<int> canonical_program_bits(const v0id::core::Program& program);
 
+// Concatenate the canonical transition image of every round-specific program in
+// order. This is the plaintext counterpart of encrypting one complete table per
+// round for the round-polymorphic execution schedule.
+std::vector<int> canonical_program_schedule_bits(
+    const std::vector<v0id::core::Program>& round_programs);
+
 // Test-only 32-bit Boolean mixer. This deliberately is NOT a cryptographic hash;
 // it exists to prove the self-fingerprint/morph-manifest plumbing before a real
 // Keccak/KMAC circuit is attempted under BinFHE.
 std::uint32_t toy_fingerprint32_plain(const v0id::core::Program& program,
                                       const std::vector<int>& initial_tape,
                                       std::uint32_t nonce);
+
+// Same plumbing over an entire round-polymorphic program schedule. The FHE side
+// already consumes a flat encrypted-program-bit vector, so concatenating every
+// encrypted table makes the existing evaluator-side mixer bind the exact ordered
+// schedule without adding a second integrity construction.
+std::uint32_t toy_fingerprint32_plain_schedule(
+    const std::vector<v0id::core::Program>& round_programs,
+    const std::vector<int>& initial_tape,
+    std::uint32_t nonce);
 
 std::vector<lbcrypto::LWECiphertext>
 encrypt_plain_bits(lbcrypto::BinFHEContext& cc,
@@ -36,7 +51,9 @@ EncryptedDigest32 encrypt_u32_bits(lbcrypto::BinFHEContext& cc,
 // Evaluator-side fingerprint. No secret key is required. The client supplies 32
 // independently encrypted mixer-state bits because OpenFHE BinFHE rejects a gate
 // whose two operands are the same ciphertext object. The evaluator then runs the
-// same Boolean mixer over encrypted program semantics, input and nonce.
+// same Boolean mixer over encrypted program semantics, input and nonce. For a
+// round schedule, encrypted_program_bits is simply the ordered concatenation of
+// all round tables.
 EncryptedDigest32 toy_fingerprint32_fhe(
     lbcrypto::BinFHEContext& cc,
     const std::vector<lbcrypto::LWECiphertext>& encrypted_program_bits,

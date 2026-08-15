@@ -16,6 +16,14 @@ std::vector<int> append_nonce_bits(std::vector<int> bits, std::uint32_t nonce) {
     return bits;
 }
 
+void append_tape_bits(std::vector<int>& bits, const std::vector<int>& initial_tape) {
+    for (int bit : initial_tape) {
+        if (bit != 0 && bit != 1)
+            throw std::runtime_error("toy fingerprint tape must be binary");
+        bits.push_back(bit);
+    }
+}
+
 std::uint32_t mix_plain(const std::vector<int>& source_bits) {
     if (source_bits.empty())
         throw std::runtime_error("toy fingerprint needs at least one source bit");
@@ -74,15 +82,33 @@ std::vector<int> canonical_program_bits(const v0id::core::Program& program) {
     return bits;
 }
 
+std::vector<int> canonical_program_schedule_bits(
+    const std::vector<v0id::core::Program>& round_programs) {
+    if (round_programs.empty())
+        throw std::runtime_error("toy fingerprint schedule must not be empty");
+
+    std::vector<int> bits;
+    for (const auto& program : round_programs) {
+        auto table = canonical_program_bits(program);
+        bits.insert(bits.end(), table.begin(), table.end());
+    }
+    return bits;
+}
+
 std::uint32_t toy_fingerprint32_plain(const v0id::core::Program& program,
                                       const std::vector<int>& initial_tape,
                                       std::uint32_t nonce) {
     auto bits = canonical_program_bits(program);
-    for (int bit : initial_tape) {
-        if (bit != 0 && bit != 1)
-            throw std::runtime_error("toy fingerprint tape must be binary");
-        bits.push_back(bit);
-    }
+    append_tape_bits(bits, initial_tape);
+    return mix_plain(append_nonce_bits(std::move(bits), nonce));
+}
+
+std::uint32_t toy_fingerprint32_plain_schedule(
+    const std::vector<v0id::core::Program>& round_programs,
+    const std::vector<int>& initial_tape,
+    std::uint32_t nonce) {
+    auto bits = canonical_program_schedule_bits(round_programs);
+    append_tape_bits(bits, initial_tape);
     return mix_plain(append_nonce_bits(std::move(bits), nonce));
 }
 

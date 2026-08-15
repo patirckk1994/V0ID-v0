@@ -5,6 +5,8 @@
 #include "program.hpp"
 #include "program_morpher.hpp"
 #include "series_generator.hpp"
+#include "series_first_stack.hpp"
+#include "stack_polymorph_bridge.hpp"
 #include "toy_fingerprint.hpp"
 #include "quine_hash.hpp"
 
@@ -46,6 +48,7 @@ constexpr std::size_t MAX_CACHED_EVALUATOR_SESSIONS = 4;
 constexpr std::uint64_t DEMO_EPOCH = 1;
 
 using v0id::core::Program;
+using v0id::crypto::SeriesFirstStackContext;
 using v0id::fhe::ByteBlob;
 using v0id::fhe::CryptoProfileId;
 using v0id::fhe::DigestBlob32;
@@ -490,8 +493,35 @@ int run_client(const std::string& peer_id,
     const auto derived_series =
         series_generator->derive(series_input, series_seed, DEMO_EPOCH);
 
+    // The live morph must be job-bound. Establish the public routing/session id
+    // and the actual job id before deriving the ProgramMorpher seed. The issuer-
+    // private series root remains private; the evaluator only later sees the
+    // already-morphed encrypted program.
+    const auto evaluator_session_id = random_evaluator_session_id();
+    const std::string request_job_id = wasm_path.empty()
+        ? "v0id-v046-pq-series-first-remote-increment"
+        : "v0id-v046-pq-wasm-morphed-rmj3-remote-increment";
+
+    const auto semantic_binding = v0id::integrity::semantic_job_hash512(
+        increment, 0, 0, input, FIXED_ROUNDS);
+    const auto generator_binding = v0id::integrity::generator_binding512(
+        series_profile, wasm_bytes);
+
+    SeriesFirstStackContext stack_context;
+    stack_context.session_id = evaluator_session_id;
+    stack_context.job_id = request_job_id;
+    stack_context.epoch = DEMO_EPOCH;
+    stack_context.machine_protocol = "v0id-remote-machine-v3";
+    stack_context.fhe_parameter_set = "STD128Q";
+    stack_context.semantic_binding = semantic_binding;
+    stack_context.generator_binding = generator_binding;
+
+    const auto job_bound_morph_seed =
+        v0id::crypto::derive_program_morph_seed_from_stack(
+            series_seed, stack_context, derived_series.series);
+
     auto morph = ProgramMorpher::morph(
-        increment, 0, PUBLIC_STATES, derived_series.morph_seed, INTEGRITY_SLOTS);
+        increment, 0, PUBLIC_STATES, job_bound_morph_seed, INTEGRITY_SLOTS);
 
     if (run_plaintext(morph.program, morph.initial_state, input, FIXED_ROUNDS) != expected)
         throw std::runtime_error("remote demo plaintext morph mismatch");
@@ -505,6 +535,8 @@ int run_client(const std::string& peer_id,
     if (!wasm_path.empty())
         std::cout << "local Wasm file      : " << wasm_path << '\n';
     std::cout << "private series bytes : " << derived_series.series.size() << '\n'
+              << "morph derivation     : StackPurpose::polymorphism -> program-morpher-v1\n"
+              << "morph job-bound      : session + job + epoch + semantic + generator\n"
               << "public state count   : " << PUBLIC_STATES << '\n'
               << "public tape cells    : " << TAPE_CELLS << '\n'
               << "public round budget  : " << FIXED_ROUNDS << '\n'
@@ -521,10 +553,6 @@ int run_client(const std::string& peer_id,
               << "generating OpenFHE bootstrapping keys...\n" << std::flush;
     cc.BTKeyGen(sk);
 
-    // Evaluator cache routing state is public and independent of the issuer-only
-    // series root. The root therefore does not become predictable merely because
-    // the evaluator participates in this session.
-    const auto evaluator_session_id = random_evaluator_session_id();
     EvaluatorSessionBundle setup;
     setup.session_id = evaluator_session_id;
     setup.primitive_id = "openfhe-binfhe";
@@ -553,15 +581,8 @@ int run_client(const std::string& peer_id,
     require_session_ready_reply(setup_reply, evaluator_session_id);
     std::cout << "evaluator session    : READY / cached remotely\n";
 
-    const std::string request_job_id = wasm_path.empty()
-        ? "v0id-v046-pq-series-first-remote-increment"
-        : "v0id-v046-pq-wasm-morphed-rmj3-remote-increment";
-
-    // Client-private quine commitment. It binds the issuer's semantic program,
-    // exact local generator implementation, selected public crypto profile,
-    // session/job/epoch, private challenge and morphed executable image. It is
-    // intentionally NOT advertised as a proof that the evaluator executed every
-    // round; that requires an FHE/verifiable-computation mechanism still open.
+    // Client-private quine commitment. It binds the same job/session context that
+    // already selected the live morph, plus the final morphed executable image.
     auto quine_context = v0id::integrity::QuineHashContext{};
     quine_context.shape = demo_shape();
     quine_context.profile = demo_profile(series_profile);
@@ -571,10 +592,8 @@ int run_client(const std::string& peer_id,
     quine_context.initial_state = morph.initial_state;
     quine_context.initial_head = 0;
     quine_context.initial_tape = input;
-    quine_context.semantic_binding = v0id::integrity::semantic_job_hash512(
-        increment, 0, 0, input, FIXED_ROUNDS);
-    quine_context.generator_binding = v0id::integrity::generator_binding512(
-        series_profile, wasm_bytes);
+    quine_context.semantic_binding = semantic_binding;
+    quine_context.generator_binding = generator_binding;
     const auto audit_challenge = v0id::integrity::derive_audit_challenge256(
         series_seed, evaluator_session_id, request_job_id, DEMO_EPOCH);
     const auto quine_digest = v0id::integrity::quine_hash512(
@@ -693,8 +712,9 @@ int run_client(const std::string& peer_id,
               << "OK: PQ-profile series-derived morphed encrypted machine executed remotely\n"
                  "    + OpenFHE STD128Q selected for the remote BinFHE profile\n"
                  "    + private series root generated from OpenSSL private DRBG\n"
-                 "    + public evaluator session id generated from public DRBG\n"
-                 "    + KMACXOF/guest series derived before trusted ProgramMorpher\n"
+                 "    + public evaluator session id generated before morph derivation\n"
+                 "    + full job context bound before ProgramMorpher algorithm-later stage\n"
+                 "    + local generator series remains private and influences morph material\n"
                  "    + SHA3-512 quine binds semantic job + exact generator + morph + profile\n"
                  "    + quine/audit challenge remain issuer-private\n"
                  "    + expensive BinFHE evaluator material installed once\n"

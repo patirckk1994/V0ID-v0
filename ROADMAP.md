@@ -11,8 +11,8 @@
 3. **Private and shared state stay distinct.** An evaluator-visible or post-KEM shared root must never become the sole source of issuer-private polymorphism.
 4. **Composition claims are narrower than primitive claims.** A good hash, KEM, FHE scheme, or sandbox can still be composed badly.
 5. **Timeout / solver UNKNOWN is INCONCLUSIVE, never PASS.**
-6. **Commitment is not execution proof.** QuineHash512 commits to the intended job image; it does not prove the evaluator performed every requested round.
-7. **The coin remains a wrapper until work is cheaply verifiable.**
+6. **Commitment is not execution proof.** QuineHash512 commits to the intended job image; it does not by itself prove the evaluator performed the requested encrypted execution.
+7. **Ledger engineering and compute minting are separate gates.** Canonical transactions, blocks and deterministic state transitions may be built before useful-compute verification is solved. Protocol issuance for useful compute remains disabled until its evidence earns consensus trust.
 
 ## 1. Runtime-verified checkpoint
 
@@ -159,9 +159,7 @@ If classification remains high, polymorphism must be changed or narrowed. If cla
 
 ## 4. Machine-cheating phase: malicious evaluator harness
 
-This is the next major architectural attack surface.
-
-The harness should deliberately implement dishonest evaluator variants against the same client/job interface:
+The legacy harness deliberately implements dishonest evaluator variants against the same client/job interface:
 
 - **skip-round evaluator**: executes fewer than the public round budget
 - **early-return evaluator**: returns an otherwise well-formed result immediately
@@ -182,35 +180,85 @@ For every cheating mode record:
 - cost to verifier
 - exact assumptions required
 
-Expected result today:
+### Concrete fixed-point failure already reproduced
 
-- many substitution/replay mistakes should be caught by existing bindings
-- **skipping actual encrypted rounds remains an OPEN soundness problem**
+With one stable morphed transition table, the increment benchmark reaches the same accepted tape after 2 rounds as after 4. The legacy encrypted fingerprint authenticates the encrypted job image but is independent of how many machine rounds actually execute, so a 2/4 early return can preserve both the semantic tape and the fingerprint.
+
+Round receipts were added as one narrow external audit and correctly document their own boundary. They are not the final execution architecture.
+
+### Round-polymorphic repair experiment — implemented, NOT runtime-verified yet
+
+`ProgramMorpher::morph_round_schedule()` now derives a different secret state-label encoding for every round boundary. Round `r`'s transition table consumes boundary-`r` labels and emits boundary-`r+1` labels. The first construction requires `public_state_count >= rounds + 1` and uses a KMAC-seeded secret permutation plus full-cycle stride so each logical state has a distinct public label at every requested boundary.
+
+New targets:
+
+- `v0id-round-morph-schedule-tests` — fast plaintext semantics / boundary-encoding gate
+- `v0id-round-morph-fhe-harness` — real BinFHE experiment over the complete encrypted round schedule
+
+`RemoteEncryptedMachine` can now consume either one encrypted transition table or exactly one encrypted table per requested round. The toy FHE self-fingerprint can bind the ordered concatenation of every table in the schedule.
+
+The specific claim being tested is narrow:
+
+```text
+2/4 evaluator:
+    semantic tape may already equal the 4/4 tape
+    hidden machine state remains encoded for boundary 2
+
+4/4 evaluator:
+    semantic tape is correct
+    hidden machine state is encoded for boundary 4
+```
+
+A plain skip-and-stop evaluator should therefore fail the final hidden-state check even at a semantic fixed point.
+
+Do **not** promote this to a general proof of work. A faster equivalent transform of the encrypted hidden representation, a structural distinguisher, or another shortcut remains **UNCERTAIN** until attacked directly.
 
 ## 5. Execution-bound integrity
 
 Goal:
 
-> Bind an accepted result to the actual requested execution, not merely to the intended job image.
+> Bind an accepted result to the requested hidden computation strongly enough that useful-compute settlement does not rely on a separable public sidecar.
 
-Candidate research directions should be implemented as experiments, not security claims:
+The current direction is now deliberately closer to the intended V0ID construction:
 
-- round-chained commitments / accumulators
+```text
+client semantic machine
+        + private series/challenge
+        + round-dependent polymorphic representation
+        + integrity binding over the complete hidden schedule
+                    |
+                    v
+             encrypted schedule
+                    |
+                    v
+        generic fixed-path BinFHE evaluator
+                    |
+                    v
+       semantic result + hidden final state
+                    |
+                    v
+               client checks
+```
+
+The schedule-wide toy fingerprint remains only plumbing; it is not a cryptographic replacement for SHA3/KMAC and it is still visibly implemented as an evaluator circuit. The research target is to make integrity depend on the same hidden representation that useful execution must traverse, rather than asking an unrelated receipt to prove a static machine image did work.
+
+Candidate escalation, only if the round-polymorphic construction fails or leaves an economically meaningful shortcut:
+
+- execution-dependent encrypted accumulators coupled to hidden representation changes
 - challenge-dependent checkpoint state
 - randomized audit positions where compatible with the threat model
-- result receipts bound to job/session/round count
 - proof-carrying execution
 - established verifiable-computation / succinct-proof systems if they can support the required encrypted computation economically
 
 Any candidate must answer:
 
-1. Can a malicious evaluator skip work and still produce a valid receipt?
-2. Can a previous receipt be replayed?
-3. Can receipts be spliced across sessions/jobs?
+1. Can a malicious evaluator obtain the client-accepted hidden final representation while skipping economically meaningful work?
+2. Can a previous result/evidence object be replayed?
+3. Can evidence be spliced across sessions/jobs?
 4. Can verification be substantially cheaper than repeating the FHE computation?
-5. Does the proof leak hidden program semantics or private polymorphism state?
+5. Does the evidence leak hidden program semantics, round mappings or private polymorphism state?
 
-Until these questions have satisfactory answers, useful compute is not eligible for a consensus-grade monetary claim.
+Until these questions have satisfactory answers, useful compute is **not eligible for protocol-funded issuance**. User-funded compute settlement may be modeled separately because it transfers existing value rather than creating supply.
 
 ## 6. Transport and peer authentication
 
@@ -243,7 +291,7 @@ Visibility modes:
 - `private_local`: issuer-only; cannot be synchronized
 - `shared_sync`: content-addressed, transmitted intentionally, exact module-set identity bound into the stack context
 
-## 8. Coin / blockchain wrapper — freeze until verification catches up
+## 8. Coin / blockchain wrapper — ledger work may proceed; compute issuance stays frozen
 
 The current coin layer is intentionally only a typed wrapper around accepted work.
 
@@ -265,23 +313,93 @@ Interpretation:
 - **Invariant**: common denomination independent of exact implementation
 - **Combo**: binds both mining and compute dimensions/identities
 
-The three branches are not automatically three units of minted value. Future consensus may choose parallel rewards, one-of-N redemption, weighting or other issuance policy.
+The three branches are not automatically three units of minted value. Future consensus may choose parallel rewards, one-of-N redemption, weighting or another issuance policy.
 
-Do not build consensus economics until useful-compute proofs become cheap enough to verify.
+### What is now explicitly UNFROZEN
 
-## 9. Eventual consensus research
+A deterministic ledger skeleton does not depend on solved useful-compute verification and may proceed now:
 
-Only after execution verification exists:
+1. canonical byte encoding and domain-separated hashes
+2. transaction IDs and typed transaction envelopes
+3. deterministic account/object state transition
+4. block header / block body / root calculation
+5. nonce and replay rejection
+6. `WorkEventId` / proof / nullifier duplicate rejection
+7. local multi-block simulator and save/reload tests
+8. consensus adapter boundary with no production economic assumptions
 
-- define canonical block/work certificate format
-- define mining challenge and difficulty
-- define useful-compute acceptance proof
-- bind compute work to current block challenge to prevent stockpiling/replay
-- define normalization units without embedding arbitrary economic exchange rates in the cryptographic wrapper
-- define issuance policy over MI/MV/MC/CI/CV/CC
-- define double-spend / replay rules around `WorkEventId`
-- define public vs hidden smart-contract semantics
-- evaluate verifier cost and denial-of-service surface
+This work should begin under `src/chain/` and must not silently import an EVM, staking system, networking stack or monetary policy merely because other chains have them.
+
+### What remains FROZEN
+
+- protocol-funded useful-compute issuance
+- a permanent mining:compute exchange rate
+- validator/verifier reward multiplication
+- public consensus claims based on unverified compute evidence
+- production smart-contract semantics
+
+Verification is a validity/dispute function, not an independently Sybil-mintable work axis.
+
+## 9. Blockchain / consensus research
+
+The deterministic chain substrate may now be developed in parallel with execution-soundness research. Public consensus economics remains a later gate.
+
+### First chain milestone — no sockets, no mining, no staking
+
+Build `src/chain/` around deterministic state transition only:
+
+- canonical hash / serialization primitives
+- typed transaction families
+- `TransactionId`, `BlockId`, `StateRoot`, `WorkEventId`
+- account/object balances and nonces
+- block header and body roots
+- deterministic `apply(block, state) -> state'`
+- replay / duplicate / malformed-transition rejection
+- persistence and reload
+- deterministic tests across repeated executions
+
+No generic `Blockchain` god-class. Keep consensus, state, computation and economics as separate boundaries.
+
+### Second milestone — local consensus adapter / devnet
+
+After the deterministic state machine is stable, attach an established BFT-style ordering/finality boundary for a small research devnet. The application state transition must remain independently testable from consensus.
+
+### Computation lane before minting
+
+Model the lifecycle with reward = 0 first:
+
+```text
+job posted
+    -> executor assignment / acceptance
+    -> encrypted computation
+    -> result + execution evidence
+    -> accept / dispute / reject
+    -> accounting record
+```
+
+User-funded job fees may later settle through escrow because they are transfers. Protocol inflation for compute remains disabled until execution evidence is cheap and strong enough.
+
+### Eventual public-economic questions
+
+Only after those earlier boundaries earn promotion:
+
+- canonical block/work certificate format
+- mining challenge and difficulty
+- useful-compute acceptance evidence
+- binding compute work to fresh chain challenges to prevent stockpiling/replay
+- normalization units without embedding arbitrary physical equivalence between hashes and FHE work
+- bounded epoch issuance policy over mining and compute allocations
+- double-spend / replay rules around `WorkEventId`
+- public vs hidden smart-contract semantics
+- verifier cost and denial-of-service surface
+
+One monetary invariant should survive every later policy experiment:
+
+```text
+protocol_issuance(epoch) <= epoch_emission_budget(epoch)
+```
+
+Unlimited mining attempts or compute submissions must not imply unlimited token issuance.
 
 ## 10. Long-term release gates
 
@@ -303,10 +421,11 @@ Before calling V0ID anything stronger than a research prototype:
 - arbitrary/full-width structural recovery attacks
 - future quantum algorithms against the composed construction
 - whether polymorphism defeats strong real-world distinguishers
-- malicious evaluator execution soundness
-- cheap proof of useful encrypted computation
+- general malicious-evaluator execution soundness beyond tested attacks
+- whether round-polymorphic hidden-state encoding has an economically cheap shortcut
+- cheap proof/evidence of useful encrypted computation
 - production peer authentication / secure transport
 - economically sound work normalization
-- consensus and token issuance policy
+- production consensus and token issuance policy
 
 These are not documentation defects. They are the research frontier.

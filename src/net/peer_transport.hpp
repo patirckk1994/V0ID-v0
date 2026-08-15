@@ -47,9 +47,12 @@ struct Envelope {
 // Frame 0 is always the canonical V0ID Envelope. Additional frames carry large
 // opaque objects without concatenating them into another giant serialization.
 // TFHE cloud transport uses this for server keys, encrypted init/chunks/results.
+// authenticated_user_id is empty on the legacy unauthenticated transport and is
+// populated from ZeroMQ ZAP User-Id by CurvePeerServer.
 struct MultipartEnvelope {
     Envelope envelope;
     std::vector<std::vector<std::uint8_t>> frames;
+    std::string authenticated_user_id;
 };
 
 std::string to_string(MessageType type);

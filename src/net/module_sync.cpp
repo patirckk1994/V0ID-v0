@@ -79,6 +79,7 @@ void validate_kind(ModuleKind kind) {
         case ModuleKind::strategy_wasm:
         case ModuleKind::mathvm_wasm:
         case ModuleKind::polymorphism_wasm:
+        case ModuleKind::neural_wasm:
             return;
     }
     throw std::runtime_error("unknown module kind");
@@ -278,6 +279,7 @@ std::string to_string(ModuleKind kind) {
         case ModuleKind::strategy_wasm: return "STRATEGY_WASM";
         case ModuleKind::mathvm_wasm: return "MATHVM_WASM";
         case ModuleKind::polymorphism_wasm: return "POLYMORPHISM_WASM";
+        case ModuleKind::neural_wasm: return "NEURAL_WASM";
     }
     return "UNKNOWN_MODULE_KIND";
 }

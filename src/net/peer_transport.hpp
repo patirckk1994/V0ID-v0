@@ -2,6 +2,7 @@
 
 #include <zmq.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -23,6 +24,12 @@ enum class MessageType : std::uint8_t {
     module_request = 11,
     module_blob = 12,
     module_ready = 13,
+    install_tfhe_session = 14,
+    tfhe_session_ready = 15,
+    tfhe_instruction_chunk = 16,
+    tfhe_chunk_ready = 17,
+    tfhe_job_finish = 18,
+    tfhe_job_result = 19,
     error = 255,
 };
 
@@ -37,6 +44,14 @@ struct Envelope {
     static Envelope decode(const void* data, std::size_t size);
 };
 
+// Frame 0 is always the canonical V0ID Envelope. Additional frames carry large
+// opaque objects without concatenating them into another giant serialization.
+// TFHE cloud transport uses this for server keys, encrypted init/chunks/results.
+struct MultipartEnvelope {
+    Envelope envelope;
+    std::vector<std::vector<std::uint8_t>> frames;
+};
+
 std::string to_string(MessageType type);
 
 class PeerServer {
@@ -45,6 +60,9 @@ public:
 
     Envelope receive();
     void reply(const Envelope& envelope);
+
+    MultipartEnvelope receive_multipart();
+    void reply_multipart(const MultipartEnvelope& message);
 
 private:
     zmq::context_t context_{1};
@@ -56,6 +74,7 @@ public:
     explicit PeerClient(const std::string& connect_endpoint, int timeout_ms = 10000);
 
     Envelope round_trip(const Envelope& envelope);
+    MultipartEnvelope round_trip_multipart(const MultipartEnvelope& message);
 
 private:
     zmq::context_t context_{1};

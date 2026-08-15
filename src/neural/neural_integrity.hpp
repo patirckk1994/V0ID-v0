@@ -110,6 +110,9 @@ struct NeuralIntegrityReceipt {
     NeuralDigest512 plan_digest{};
     std::vector<NeuralIntegrityObservation> observed;
 
+    // Validation re-derives every checkpoint commitment from the supplied trace.
+    // A server cannot satisfy this API merely by attaching expected digests to a
+    // trace whose actual checkpoint values differ.
     void validate(const NeuralGraph& graph,
                   const NeuralInvocation& invocation,
                   const NeuralExecutionTrace& trace,
@@ -295,6 +298,33 @@ inline void validate_observation_set(
     }
 }
 
+inline const NeuralTraceEntry& require_checkpoint_entry(
+    const NeuralExecutionTrace& trace,
+    const NeuralIntegrityCheckpoint& checkpoint) {
+    const auto it = std::find_if(trace.entries.begin(), trace.entries.end(),
+                                 [&](const auto& entry) {
+                                     return entry.step_index == checkpoint.step_index &&
+                                            entry.node_id == checkpoint.node_id &&
+                                            entry.port_name == checkpoint.port_name;
+                                 });
+    if (it == trace.entries.end())
+        throw std::runtime_error("neural integrity checkpoint missing from execution trace: " +
+                                 checkpoint.label);
+    return *it;
+}
+
+inline const NeuralIntegrityObservation& require_observation(
+    const std::vector<NeuralIntegrityObservation>& observations,
+    const std::string& label) {
+    const auto it = std::find_if(observations.begin(), observations.end(),
+                                 [&](const auto& observation) {
+                                     return observation.label == label;
+                                 });
+    if (it == observations.end())
+        throw std::runtime_error("neural integrity observation missing label: " + label);
+    return *it;
+}
+
 } // namespace integrity_detail
 
 inline NeuralDigest512 NeuralTraceEntry::commitment512() const {
@@ -455,6 +485,21 @@ inline void NeuralIntegrityReceipt::validate(
     if (plan_digest != plan.digest512(graph))
         throw std::runtime_error("neural integrity receipt plan binding mismatch");
     validate_observation_set(observed, plan, "neural integrity receipt");
+
+    // Re-derive checkpoint commitments from the actual supplied trace rather
+    // than trusting receipt.observed as server-provided metadata.
+    for (const auto& checkpoint : plan.checkpoints) {
+        const auto& entry = require_checkpoint_entry(trace, checkpoint);
+        if (entry.representation != NeuralTraceRepresentation::canonical_plaintext)
+            throw std::runtime_error(
+                "neural integrity receipt requires client-normalized plaintext trace value: " +
+                checkpoint.label);
+        const auto& observation = require_observation(observed, checkpoint.label);
+        if (observation.entry_commitment != entry.commitment512())
+            throw std::runtime_error(
+                "neural integrity receipt observation does not match execution trace: " +
+                checkpoint.label);
+    }
 }
 
 inline NeuralIntegrityReceipt make_neural_integrity_receipt(
@@ -474,21 +519,13 @@ inline NeuralIntegrityReceipt make_neural_integrity_receipt(
     receipt.observed.reserve(plan.checkpoints.size());
 
     for (const auto& checkpoint : plan.checkpoints) {
-        const auto it = std::find_if(trace.entries.begin(), trace.entries.end(),
-                                     [&](const auto& entry) {
-                                         return entry.step_index == checkpoint.step_index &&
-                                                entry.node_id == checkpoint.node_id &&
-                                                entry.port_name == checkpoint.port_name;
-                                     });
-        if (it == trace.entries.end())
-            throw std::runtime_error("neural integrity checkpoint missing from execution trace: " +
-                                     checkpoint.label);
-        if (it->representation != NeuralTraceRepresentation::canonical_plaintext)
+        const auto& entry = require_checkpoint_entry(trace, checkpoint);
+        if (entry.representation != NeuralTraceRepresentation::canonical_plaintext)
             throw std::runtime_error(
                 "neural integrity checkpoint requires client-normalized plaintext trace value: " +
                 checkpoint.label);
         receipt.observed.push_back(
-            NeuralIntegrityObservation{checkpoint.label, it->commitment512()});
+            NeuralIntegrityObservation{checkpoint.label, entry.commitment512()});
     }
 
     receipt.validate(graph, invocation, trace, plan);

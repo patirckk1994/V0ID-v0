@@ -102,14 +102,17 @@ fn execute_instruction(ins: &EncInstruction,
     let e = select_register(&ins.e, registers);
     let input = select_input(&ins.input_index, inputs);
 
+    // Build every candidate that only borrows a/b first. TFHE-rs's RotateLeft
+    // trait consumes its ciphertext receiver, so deliberately move b only after
+    // CHI and the other borrowed uses are complete, then move a last.
     let xor2 = &a ^ &b;
     let xor5 = (((&a ^ &b) ^ &c) ^ &d) ^ &e;
-    let xor_rot1 = &a ^ b.rotate_left(1u8);
-    let encrypted_rotate: FheUint64 = ins.rotate.clone().cast_into();
-    let rot_copy = a.rotate_left(&encrypted_rotate);
     let chi = &a ^ ((!&b) & &c);
     let xor_input = &a ^ &input;
     let xor_const = &a ^ &ins.immediate;
+    let xor_rot1 = &a ^ b.rotate_left(1u8);
+    let encrypted_rotate: FheUint64 = ins.rotate.clone().cast_into();
+    let rot_copy = a.rotate_left(&encrypted_rotate);
 
     let candidates = [
         xor2,

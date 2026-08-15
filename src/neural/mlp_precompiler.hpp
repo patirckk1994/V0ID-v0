@@ -82,6 +82,7 @@ public:
             std::uint32_t input_width{};
             std::uint32_t output_width{};
             Endpoint forward_input;
+            Endpoint preactivation;
             Endpoint forward_output;
             std::string weight_node;
             std::string bias_node;
@@ -142,7 +143,8 @@ public:
             out.weight_nodes.push_back(weight_id);
             out.bias_nodes.push_back(bias_id);
 
-            Endpoint layer_output{dense_id, "y"};
+            const Endpoint preactivation{dense_id, "y"};
+            Endpoint layer_output = preactivation;
             if (spec.layers[i].activation) {
                 const auto activation_id = "forward." + prefix + ".activation";
                 graph.nodes.push_back(node(
@@ -166,6 +168,7 @@ public:
                 input_width,
                 output_width,
                 current,
+                preactivation,
                 layer_output,
                 weight_id,
                 bias_id,
@@ -250,6 +253,12 @@ public:
                         port("activation_in", NeuralPortDirection::input,
                              NeuralPortRole::activation,
                              {spec.batch_size, layer.input_width}, spec.format),
+                        port("preactivation", NeuralPortDirection::input,
+                             NeuralPortRole::activation,
+                             {spec.batch_size, layer.output_width}, spec.format),
+                        port("activation_out", NeuralPortDirection::input,
+                             NeuralPortRole::activation,
+                             {spec.batch_size, layer.output_width}, spec.format),
                         port("weight", NeuralPortDirection::input,
                              NeuralPortRole::weight,
                              {layer.input_width, layer.output_width}, spec.format, true),
@@ -272,6 +281,14 @@ public:
                                        layer.forward_input.port_name,
                                        backprop_id,
                                        "activation_in"});
+                graph.edges.push_back({layer.preactivation.node_id,
+                                       layer.preactivation.port_name,
+                                       backprop_id,
+                                       "preactivation"});
+                graph.edges.push_back({layer.forward_output.node_id,
+                                       layer.forward_output.port_name,
+                                       backprop_id,
+                                       "activation_out"});
                 graph.edges.push_back({layer.weight_node,
                                        "weight",
                                        backprop_id,

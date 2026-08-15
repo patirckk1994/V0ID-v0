@@ -8,7 +8,7 @@
 namespace v0id::fhe {
 namespace {
 
-[[noreturn]] void throw_unavailable() {
+[[maybe_unused, noreturn]] void throw_unavailable() {
     throw std::runtime_error(
         "TFHE CUDA backend was not compiled; configure with V0ID_ENABLE_GPU_FHE=ON");
 }

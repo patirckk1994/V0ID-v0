@@ -1,6 +1,6 @@
 # V0ID TFHE-rs CUDA cloud boundary
 
-Status: serialized, streamed trust-boundary scaffold. This is not yet a network protocol and is not production-audited cryptography.
+Status: streamed TFHE trust split plus a bounded ZeroMQ multipart protocol scaffold. This is not yet an authenticated public service and is not production-audited cryptography.
 
 ## Goal
 
@@ -16,73 +16,138 @@ encrypted job  2,501,584,840 bytes
 
 That proved the trust split but also proved a monolithic encrypted-program blob is the wrong transport shape.
 
-The current v2 boundary keeps the server key and encrypted machine state resident in one evaluator session and streams bounded encrypted instruction chunks.
+The current boundary keeps the server key and encrypted machine state resident in one evaluator session and streams bounded encrypted instruction chunks.
 
 ```text
 TRUSTED CLIENT
-    client_prepare_session
+    prepare session
         plaintext inputs + public shape
         -> private ClientKey blob
         -> CompressedServerKey blob
         -> encrypted init blob
 
+ZERO MQ MULTIPART
+    frame 0: small V0ID envelope + typed TFHE metadata
+    frame N: bounded opaque key/ciphertext objects
+
 UNTRUSTED EVALUATOR
-    server_session_new
+    install session
         server key + encrypted init
         -> GPU server key cached in process
         -> encrypted registers/inputs kept resident
 
 TRUSTED CLIENT
-    client_encrypt_chunk
-        private ClientKey + next plaintext instruction range
+    encrypt next instruction range
+        private ClientKey + plaintext instruction range
         -> encrypted instruction chunk
 
 UNTRUSTED EVALUATOR
-    server_session_eval_chunk
+    evaluate chunk
         encrypted chunk only
-        -> reject replay/reorder/gaps
+        -> reject wrong session/job/epoch/order/count
         -> advance resident encrypted registers
 
 UNTRUSTED EVALUATOR
-    server_session_finish
+    finish
         -> encrypted output result
+        -> release completed evaluator session
 
 TRUSTED CLIENT
-    client_decrypt
+    decrypt
         private ClientKey + encrypted result
         -> plaintext output words
 ```
 
 The evaluator APIs have no `ClientKey` parameter and receive no plaintext instruction, image or input arguments.
 
-## Streaming shape
+## Network protocol
 
-The C++ adapter currently uses 32 encrypted instructions per chunk. Rust accepts at most 64 instructions per chunk.
+`src/net/tfhe_cloud_codec.*` defines protocol version 1 with random nonzero 128-bit session ids and these message types:
+
+```text
+INSTALL_TFHE_SESSION
+TFHE_SESSION_READY
+TFHE_INSTRUCTION_CHUNK
+TFHE_CHUNK_READY
+TFHE_JOB_FINISH
+TFHE_JOB_RESULT
+```
+
+The V0ID envelope carries `peer_id`, `job_id` and `epoch`. The typed TFHE metadata carries session id plus explicit instruction/output counters. Large opaque objects are separate ZeroMQ multipart frames rather than being concatenated into a second giant serialization.
+
+The current frame shapes are:
+
+```text
+INSTALL_TFHE_SESSION
+    metadata:
+        session id
+        total instruction count
+        output word count
+        server-key frame length
+        encrypted-init frame length
+    frame 1: compressed server key
+    frame 2: encrypted init
+
+TFHE_INSTRUCTION_CHUNK
+    metadata:
+        session id
+        start instruction
+        instruction count
+        total instruction count
+        encrypted-chunk frame length
+    frame 1: encrypted instruction chunk
+
+TFHE_JOB_FINISH
+    metadata:
+        session id
+        expected instruction count
+        expected output word count
+
+TFHE_JOB_RESULT
+    metadata:
+        session id
+        completed instruction count
+        encrypted-result frame length
+    frame 1: encrypted result
+```
+
+Limits are checked before evaluator work:
+
+```text
+maximum instructions          65536
+maximum instructions/chunk       64
+maximum outputs                  64
+maximum opaque frame       512 MiB
+maximum cached sessions           4
+session idle TTL          30 minutes
+```
+
+The server binds an installed session to the request `peer_id`, `job_id` and `epoch`, and requires every subsequent chunk/finish request to match. `peer_id` is currently only protocol metadata: without channel authentication it is not proof of remote identity.
+
+## Ordering and fail-closed behavior
 
 Every chunk binds:
 
 ```text
 start_instruction
+instruction_count
 total_instruction_count
-encrypted instructions[]
+encrypted chunk
 ```
 
-The evaluator requires `start_instruction == completed_instruction_count` and requires the advertised total to equal the session total. A repeated, reordered or skipped transport chunk therefore fails closed before execution. This is protocol ordering integrity, not a proof that a malicious evaluator honestly performed the expensive FHE work.
-
-The evaluator session owns:
+The network session requires:
 
 ```text
-CudaServerKey
-encrypted registers
-encrypted inputs
-encrypted output selectors
-expected instruction count
-completed instruction count
+start_instruction == completed_instruction_count
+total_instruction_count == installed total
+chunk_count <= remaining instructions
 ```
 
-The server key is decompressed to CUDA once when the session is installed. Before a chunk or final output selection, that cached GPU key is selected as the TFHE-rs thread-local server key.
+The Rust encrypted-chunk envelope independently requires contiguous ordering as well. A repeated, reordered, skipped or over-budget transport chunk therefore fails before the session advances.
 
-## C++ boundary
+This is transport/order integrity. It is **not** a proof that a malicious evaluator honestly performed the expensive FHE computation.
+
+## C++ / Rust boundary
 
 `src/fhe/gpu_fhe_backend.*` exposes:
 
@@ -100,63 +165,55 @@ decrypt_boolean_program_image_tfhe_cuda_client(...)
 ```text
 client_key_blob       PRIVATE / client only
 server_key_blob       evaluator-visible, once per session
-encrypted_init_blob   evaluator-visible, once per job/session
+encrypted_init_blob   evaluator-visible, once per session
 instruction_count     public shape metadata
 output_word_count     public shape metadata
 ```
 
-The convenience `evaluate_boolean_program_image_tfhe_cuda(...)` now traverses this same streamed seam in one process.
+The Rust sidecar still uses bounded Serde/bincode objects internally because TFHE-rs implements serialization for its key/ciphertext types. It adds fixed-int encoding, trailing-byte rejection, explicit magic/version checks, size/shape limits and panic containment at the C ABI.
 
-## Serialization boundary
+Raw Serde remains a research scaffold. Before accepting hostile public jobs as a production service, move toward TFHE-rs safe/conformant serialization or an equally validated representation.
 
-The Rust sidecar currently uses Serde/bincode because TFHE-rs implements serialization for its key and ciphertext types. V0ID adds:
+## Build and local two-process smoke test
 
-- 512 MiB maximum per serialized object,
-- fixed-int bincode encoding,
-- trailing-byte rejection,
-- explicit magic/version checks,
-- register/input/instruction/output limits,
-- maximum 64 instructions per transport chunk,
-- contiguous chunk-order validation,
-- panic containment at every C ABI entry point.
+Build the cloud target with the GPU preset:
 
-The per-object ceiling is intentionally back below the temporary 8 GiB monolithic-test value now that no job needs to fit in one blob.
-
-Raw Serde remains a research scaffold. Before accepting hostile public jobs as a production service, the format should move toward TFHE-rs safe/conformant serialization or an equally validated representation.
-
-## What is not implemented yet
-
-- ZeroMQ transport for session/init/chunk/result messages
-- authenticated peer/channel binding
-- public execution-class padding (register/input/instruction/output buckets)
-- bounded evaluator session table / expiry / quotas
-- persistence or checkpoint/resume
-- execution proof / protocol-funded useful-compute issuance
-
-## Next minimal milestone
-
-Carry the already-separated objects over the existing transport:
-
-```text
-INSTALL_TFHE_SESSION
-    session id
-    compressed server key
-    encrypted init
-
-TFHE_INSTRUCTION_CHUNK
-    session id
-    job id
-    start instruction
-    encrypted chunk
-
-TFHE_JOB_FINISH
-    session id
-    job id
-
-TFHE_JOB_RESULT
-    session id
-    job id
-    encrypted result
+```bash
+cmake --preset gpu-fhe
+cmake --build --preset gpu-fhe --target v0id-tfhe-cloud
 ```
 
-The client key remains outside every evaluator message. Network transport should preserve this exact trust split rather than reintroducing plaintext program handling in the server process.
+Run the cheap codec-only regression test:
+
+```bash
+cmake --build --preset gpu-fhe --target v0id-test-tfhe-cloud-codec
+```
+
+Then use two terminals for the real one-instruction TFHE network smoke test.
+
+Evaluator terminal:
+
+```bash
+CUDA_MODULE_LOADING=EAGER \
+./build-gpu/v0id-tfhe-cloud server gpu-node tcp://*:7788 1
+```
+
+Client terminal:
+
+```bash
+CUDA_MODULE_LOADING=EAGER \
+./build-gpu/v0id-tfhe-cloud client client-a tcp://127.0.0.1:7788
+```
+
+The smoke client intentionally uses one encrypted instruction so this checks the actual networked FHE boundary without turning every cloud regression into the full SHA3 stress run.
+
+## What is still deliberately missing
+
+- authenticated peer/channel binding (use a standard authenticated transport; do not invent a custom TLS replacement)
+- execution-class padding for register/input/instruction/output buckets
+- persistence or checkpoint/resume
+- multi-worker scheduling and admission control beyond the local session cap/TTL
+- execution proof / malicious-evaluator soundness
+- protocol-funded useful-compute issuance
+
+The next cloud-security milestone should be authenticated channel/session binding plus explicit execution classes. The next research milestone remains execution soundness; neither should be conflated with ciphertext confidentiality.

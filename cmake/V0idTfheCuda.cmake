@@ -1,5 +1,31 @@
 option(V0ID_ENABLE_GPU_FHE "Build the TFHE-rs CUDA FHE backend" OFF)
 
+# The authenticated TFHE cloud path uses ZeroMQ CURVE. libzmq 4.3.5 defaults
+# both ENABLE_CURVE and WITH_LIBSODIUM to OFF, so a normal FetchContent build
+# silently omits CURVE unless the parent project opts in before libzmq is added.
+# Make the GPU/cloud preset fail during configuration instead of compiling a
+# transport binary that can only discover the missing capability at runtime.
+if(V0ID_ENABLE_GPU_FHE)
+    find_path(V0ID_SODIUM_INCLUDE_DIR NAMES sodium.h)
+    find_library(V0ID_SODIUM_LIBRARY NAMES sodium libsodium)
+    if(NOT V0ID_SODIUM_INCLUDE_DIR OR NOT V0ID_SODIUM_LIBRARY)
+        message(FATAL_ERROR
+            "V0ID authenticated TFHE cloud requires libsodium development files "
+            "so the fetched libzmq can build CURVE support. On Debian/Ubuntu run:\n"
+            "  sudo apt install libsodium-dev pkg-config\n"
+            "Then remove/reconfigure build-gpu and run the gpu-fhe preset again.")
+    endif()
+
+    # Seed the exact cache variables consumed by libzmq v4.3.5 before
+    # FetchContent_MakeAvailable(libzmq) runs in the top-level CMakeLists.
+    set(ENABLE_CURVE ON CACHE BOOL "Enable libzmq CURVE security" FORCE)
+    set(WITH_LIBSODIUM ON CACHE BOOL "Use libsodium for libzmq CURVE" FORCE)
+    set(SODIUM_INCLUDE_DIRS "${V0ID_SODIUM_INCLUDE_DIR}" CACHE PATH
+        "libsodium include directory for libzmq" FORCE)
+    set(SODIUM_LIBRARIES "${V0ID_SODIUM_LIBRARY}" CACHE FILEPATH
+        "libsodium library for libzmq" FORCE)
+endif()
+
 function(v0id_finish_tfhe_cuda_setup)
     if(NOT V0ID_ENABLE_GPU_FHE)
         return()

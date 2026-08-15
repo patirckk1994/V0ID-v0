@@ -1,5 +1,6 @@
 #include "mlp_precompiler.hpp"
 #include "neural_graph.hpp"
+#include "neural_integrity_regression.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -366,6 +367,8 @@ int main() try {
                  "zero MLP layer width");
     ++passed;
 
+    passed += run_neural_integrity_regression_tests();
+
     std::cout << "V0ID neural graph tests PASS: " << passed << "/" << passed << '\n';
     std::cout << "module tree          : YES\n"
               << "typed dataflow       : YES\n"
@@ -378,7 +381,11 @@ int main() try {
               << "MLP port precompiler : YES\n"
               << "generic weight matrix: YES\n"
               << "backprop macro       : YES\n"
-              << "SGD update macro     : YES\n";
+              << "SGD update macro     : YES\n"
+              << "execution trace      : STRUCTURAL COMMITMENT\n"
+              << "integrity checkpoints: ORDINARY OUTPUT PORTS\n"
+              << "known-answer receipt : YES\n"
+              << "semantic proof       : NOT CLAIMED\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "V0ID neural graph tests FAILED: " << e.what() << '\n';

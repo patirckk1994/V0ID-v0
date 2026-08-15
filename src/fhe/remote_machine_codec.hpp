@@ -12,20 +12,18 @@
 namespace v0id::fhe {
 
 using ByteBlob = std::vector<std::uint8_t>;
-using DigestBlob32 = std::array<ByteBlob, 32>;
 using EvaluatorSessionId = std::array<std::uint8_t, 32>;
 
 struct PublicMachineShape {
     std::uint64_t states{};
     std::uint64_t tape_cells{};
     std::uint64_t rounds{};
+
+    // Reserved public capacity for future execution-bound integrity material.
+    // Zero is valid. RMJ4/RMR4 carry no ToyFingerprint candidate bank.
     std::uint64_t integrity_slots{};
 };
 
-// Public self-description only. This is intentionally not yet a negotiated
-// plugin ABI: peers identify already-installed protocol families and versions.
-// The series generator runs on the client; its id/version is provenance for
-// later correlation experiments, not executable code sent to the evaluator.
 struct CryptoProfileId {
     std::string primitive_id;
     std::string parameter_set;
@@ -37,9 +35,6 @@ struct CryptoProfileId {
     bool operator==(const CryptoProfileId&) const = default;
 };
 
-// Process-local evaluator setup. This is the expensive material that should be
-// installed once and reused by many jobs. It deliberately contains no client
-// secret key and no private series/morph manifest.
 struct EvaluatorSessionBundle {
     EvaluatorSessionId session_id{};
     std::string primitive_id;
@@ -49,27 +44,19 @@ struct EvaluatorSessionBundle {
     ByteBlob switching_key;
 };
 
-// Everything in this structure is evaluator-visible. V0.4.3/RMJ3 references a
-// previously installed evaluator session rather than embedding the huge BinFHE
-// context/bootstrap material in every job.
+// RMJ4 contains only evaluator-visible encrypted machine state. The obsolete
+// ToyFingerprint nonce/initial-state/mask fields were removed rather than kept
+// as dummy wire baggage.
 struct RemoteMachineBundle {
     EvaluatorSessionId session_id{};
     PublicMachineShape shape;
     CryptoProfileId profile;
 
-    // One independently encrypted zero used only as an accumulator seed.
     ByteBlob encrypted_zero;
-
-    // Canonical row layout: for each (state, read), next-state one-hot bits,
-    // write bit, move-left/stay/right bits.
     std::vector<ByteBlob> program_bits;
     std::vector<ByteBlob> state_bits;
     std::vector<ByteBlob> head_bits;
     std::vector<ByteBlob> tape_bits;
-
-    DigestBlob32 nonce_bits;
-    DigestBlob32 fingerprint_initial_state_bits;
-    std::vector<DigestBlob32> integrity_mask_bits;
 };
 
 struct RemoteMachineResult {
@@ -79,7 +66,6 @@ struct RemoteMachineResult {
     std::vector<ByteBlob> state_bits;
     std::vector<ByteBlob> head_bits;
     std::vector<ByteBlob> tape_bits;
-    std::vector<DigestBlob32> integrity_candidates;
 };
 
 namespace remote_detail {
@@ -87,9 +73,9 @@ namespace remote_detail {
 inline constexpr std::array<std::uint8_t, 8> SESSION_MAGIC{
     'V','0','I','D','R','M','S','3'};
 inline constexpr std::array<std::uint8_t, 8> JOB_MAGIC{
-    'V','0','I','D','R','M','J','3'};
+    'V','0','I','D','R','M','J','4'};
 inline constexpr std::array<std::uint8_t, 8> RESULT_MAGIC{
-    'V','0','I','D','R','M','R','3'};
+    'V','0','I','D','R','M','R','4'};
 
 inline constexpr std::uint64_t MAX_STATES = 128;
 inline constexpr std::uint64_t MAX_TAPE_CELLS = 65536;
@@ -106,8 +92,8 @@ inline void validate_shape(const PublicMachineShape& shape) {
         throw std::runtime_error("remote machine tape size outside limit");
     if (shape.rounds > MAX_ROUNDS)
         throw std::runtime_error("remote machine round budget outside limit");
-    if (shape.integrity_slots == 0 || shape.integrity_slots > MAX_INTEGRITY_SLOTS)
-        throw std::runtime_error("remote machine integrity slot count outside limit");
+    if (shape.integrity_slots > MAX_INTEGRITY_SLOTS)
+        throw std::runtime_error("remote machine integrity slot capacity outside limit");
 }
 
 inline void validate_profile_field(const std::string& value, const char* what) {
@@ -270,21 +256,6 @@ inline ByteBlob read_blob(const std::uint8_t*& p, const std::uint8_t* end) {
     return out;
 }
 
-template <std::size_t N>
-inline void append_blob_array(ByteBlob& out, const std::array<ByteBlob, N>& array) {
-    for (const auto& blob : array)
-        append_blob(out, blob);
-}
-
-template <std::size_t N>
-inline std::array<ByteBlob, N> read_blob_array(const std::uint8_t*& p,
-                                                const std::uint8_t* end) {
-    std::array<ByteBlob, N> out;
-    for (auto& blob : out)
-        blob = read_blob(p, end);
-    return out;
-}
-
 inline void require_magic(const std::uint8_t*& p,
                           const std::uint8_t* end,
                           const std::array<std::uint8_t, 8>& magic) {
@@ -351,15 +322,15 @@ inline ByteBlob pack_remote_machine_bundle(const RemoteMachineBundle& bundle) {
 
     require_exact_size(bundle.program_bits.size(), program_bit_count(bundle.shape),
                        "wrong encrypted program bit count");
-    require_exact_size(bundle.state_bits.size(), checked_size(bundle.shape.states, "state count overflow"),
+    require_exact_size(bundle.state_bits.size(),
+                       checked_size(bundle.shape.states, "state count overflow"),
                        "wrong encrypted state bit count");
-    require_exact_size(bundle.head_bits.size(), checked_size(bundle.shape.tape_cells, "head count overflow"),
+    require_exact_size(bundle.head_bits.size(),
+                       checked_size(bundle.shape.tape_cells, "head count overflow"),
                        "wrong encrypted head bit count");
-    require_exact_size(bundle.tape_bits.size(), checked_size(bundle.shape.tape_cells, "tape count overflow"),
+    require_exact_size(bundle.tape_bits.size(),
+                       checked_size(bundle.shape.tape_cells, "tape count overflow"),
                        "wrong encrypted tape bit count");
-    require_exact_size(bundle.integrity_mask_bits.size(),
-                       checked_size(bundle.shape.integrity_slots, "integrity slot count overflow"),
-                       "wrong encrypted integrity mask count");
 
     ByteBlob out;
     out.insert(out.end(), JOB_MAGIC.begin(), JOB_MAGIC.end());
@@ -367,16 +338,10 @@ inline ByteBlob pack_remote_machine_bundle(const RemoteMachineBundle& bundle) {
     put_shape(out, bundle.shape);
     put_profile(out, bundle.profile);
     append_blob(out, bundle.encrypted_zero);
-
     for (const auto& blob : bundle.program_bits) append_blob(out, blob);
     for (const auto& blob : bundle.state_bits) append_blob(out, blob);
     for (const auto& blob : bundle.head_bits) append_blob(out, blob);
     for (const auto& blob : bundle.tape_bits) append_blob(out, blob);
-    append_blob_array(out, bundle.nonce_bits);
-    append_blob_array(out, bundle.fingerprint_initial_state_bits);
-    for (const auto& mask : bundle.integrity_mask_bits)
-        append_blob_array(out, mask);
-
     return out;
 }
 
@@ -410,14 +375,6 @@ inline RemoteMachineBundle unpack_remote_machine_bundle(const ByteBlob& wire) {
     bundle.tape_bits.resize(checked_size(bundle.shape.tape_cells, "tape count overflow"));
     for (auto& blob : bundle.tape_bits) blob = read_blob(p, end);
 
-    bundle.nonce_bits = read_blob_array<32>(p, end);
-    bundle.fingerprint_initial_state_bits = read_blob_array<32>(p, end);
-
-    bundle.integrity_mask_bits.resize(
-        checked_size(bundle.shape.integrity_slots, "integrity slot count overflow"));
-    for (auto& mask : bundle.integrity_mask_bits)
-        mask = read_blob_array<32>(p, end);
-
     if (p != end)
         throw std::runtime_error("trailing bytes in V0ID remote machine bundle");
     return bundle;
@@ -428,15 +385,15 @@ inline ByteBlob pack_remote_machine_result(const RemoteMachineResult& result) {
     validate_session_id(result.session_id);
     validate_shape(result.shape);
     validate_profile(result.profile);
-    require_exact_size(result.state_bits.size(), checked_size(result.shape.states, "state count overflow"),
+    require_exact_size(result.state_bits.size(),
+                       checked_size(result.shape.states, "state count overflow"),
                        "wrong result state bit count");
-    require_exact_size(result.head_bits.size(), checked_size(result.shape.tape_cells, "head count overflow"),
+    require_exact_size(result.head_bits.size(),
+                       checked_size(result.shape.tape_cells, "head count overflow"),
                        "wrong result head bit count");
-    require_exact_size(result.tape_bits.size(), checked_size(result.shape.tape_cells, "tape count overflow"),
+    require_exact_size(result.tape_bits.size(),
+                       checked_size(result.shape.tape_cells, "tape count overflow"),
                        "wrong result tape bit count");
-    require_exact_size(result.integrity_candidates.size(),
-                       checked_size(result.shape.integrity_slots, "integrity slot count overflow"),
-                       "wrong result integrity candidate count");
 
     ByteBlob out;
     out.insert(out.end(), RESULT_MAGIC.begin(), RESULT_MAGIC.end());
@@ -446,8 +403,6 @@ inline ByteBlob pack_remote_machine_result(const RemoteMachineResult& result) {
     for (const auto& blob : result.state_bits) append_blob(out, blob);
     for (const auto& blob : result.head_bits) append_blob(out, blob);
     for (const auto& blob : result.tape_bits) append_blob(out, blob);
-    for (const auto& candidate : result.integrity_candidates)
-        append_blob_array(out, candidate);
     return out;
 }
 
@@ -476,11 +431,6 @@ inline RemoteMachineResult unpack_remote_machine_result(const ByteBlob& wire) {
 
     result.tape_bits.resize(checked_size(result.shape.tape_cells, "tape count overflow"));
     for (auto& blob : result.tape_bits) blob = read_blob(p, end);
-
-    result.integrity_candidates.resize(
-        checked_size(result.shape.integrity_slots, "integrity slot count overflow"));
-    for (auto& candidate : result.integrity_candidates)
-        candidate = read_blob_array<32>(p, end);
 
     if (p != end)
         throw std::runtime_error("trailing bytes in V0ID remote machine result");

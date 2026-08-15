@@ -1,3 +1,4 @@
+#include "mlp_precompiler.hpp"
 #include "neural_graph.hpp"
 
 #include <algorithm>
@@ -37,6 +38,33 @@ NeuralPort port(std::string name,
     out.format = NeuralNumericFormat::fixed16_16;
     out.mutable_state = mutable_state;
     return out;
+}
+
+const NeuralModuleNode& require_node(const NeuralGraph& graph, const std::string& id) {
+    const auto it = std::find_if(graph.nodes.begin(), graph.nodes.end(),
+                                 [&](const auto& node) { return node.id == id; });
+    if (it == graph.nodes.end())
+        throw std::runtime_error("missing neural node: " + id);
+    return *it;
+}
+
+const NeuralPort& require_port(const NeuralModuleNode& node, const std::string& name) {
+    const auto it = std::find_if(node.ports.begin(), node.ports.end(),
+                                 [&](const auto& p) { return p.name == name; });
+    if (it == node.ports.end())
+        throw std::runtime_error("missing neural port: " + node.id + "." + name);
+    return *it;
+}
+
+bool has_edge(const NeuralGraph& graph,
+              const std::string& from_node,
+              const std::string& from_port,
+              const std::string& to_node,
+              const std::string& to_port) {
+    return std::any_of(graph.edges.begin(), graph.edges.end(), [&](const auto& edge) {
+        return edge.from_node == from_node && edge.from_port == from_port &&
+               edge.to_node == to_node && edge.to_port == to_port;
+    });
 }
 
 NeuralGraph example_graph() {
@@ -233,6 +261,111 @@ int main() try {
             "NEURAL_WASM module-sync round trip failed");
     ++passed;
 
+    MlpPrecompileSpec inference_spec;
+    inference_spec.graph_id = "mlp-inference";
+    inference_spec.batch_size = 2;
+    inference_spec.input_size = 4;
+    inference_spec.layers = {{8, true}, {6, true}, {3, false}};
+    inference_spec.training = MlpTrainingMode::inference;
+    const auto inference = MlpPortPrecompiler::compile(inference_spec);
+    require(inference.dense_nodes.size() == 3 &&
+            inference.weight_nodes.size() == 3 &&
+            inference.bias_nodes.size() == 3 &&
+            inference.activation_nodes.size() == 2 &&
+            inference.backprop_nodes.empty() &&
+            inference.weight_update_nodes.empty(),
+            "MLP inference precompiler expansion counts mismatch");
+    ++passed;
+
+    const auto& dense0 = require_node(inference.graph, "forward.layer.0.dense");
+    require(require_port(dense0, "x").shape.dimensions ==
+                std::vector<std::uint32_t>({2, 4}) &&
+            require_port(dense0, "weight").shape.dimensions ==
+                std::vector<std::uint32_t>({4, 8}) &&
+            require_port(dense0, "bias").shape.dimensions ==
+                std::vector<std::uint32_t>({8}) &&
+            require_port(dense0, "y").shape.dimensions ==
+                std::vector<std::uint32_t>({2, 8}),
+            "MLP dense macro did not derive generic matrix/port dimensions");
+    ++passed;
+
+    const auto& dense2 = require_node(inference.graph, "forward.layer.2.dense");
+    require(require_port(dense2, "weight").shape.dimensions ==
+                std::vector<std::uint32_t>({6, 3}) &&
+            has_edge(inference.graph,
+                     "forward.layer.1.activation", "y",
+                     "forward.layer.2.dense", "x") &&
+            has_edge(inference.graph,
+                     "forward.layer.2.dense", "y",
+                     inference.output_node, "activation"),
+            "MLP forward layer wiring mismatch");
+    ++passed;
+
+    auto training_spec = inference_spec;
+    training_spec.graph_id = "mlp-training";
+    training_spec.training = MlpTrainingMode::backprop_sgd;
+    const auto training = MlpPortPrecompiler::compile(training_spec);
+    require(training.backprop_nodes.size() == 3 &&
+            training.weight_update_nodes.size() == 3 &&
+            !training.loss_node.empty() &&
+            !training.target_node.empty() &&
+            !training.learning_rate_node.empty(),
+            "MLP training precompiler did not emit loss/backprop/SGD structure");
+    ++passed;
+
+    const auto& bp2 = require_node(training.graph, "trainer.layer.2.backprop");
+    const auto& update2 = require_node(training.graph, "trainer.layer.2.weight-update");
+    require(require_port(bp2, "gradient_in").shape.dimensions ==
+                std::vector<std::uint32_t>({2, 3}) &&
+            require_port(bp2, "gradient_out").shape.dimensions ==
+                std::vector<std::uint32_t>({2, 6}) &&
+            require_port(bp2, "weight_gradient").shape.dimensions ==
+                std::vector<std::uint32_t>({6, 3}) &&
+            require_port(update2, "updated_weight").shape.dimensions ==
+                std::vector<std::uint32_t>({6, 3}) &&
+            require_port(update2, "updated_bias").shape.dimensions ==
+                std::vector<std::uint32_t>({3}),
+            "MLP backprop/weight-update macro dimensions mismatch");
+    ++passed;
+
+    require(has_edge(training.graph,
+                     training.loss_node, "gradient",
+                     "trainer.layer.2.backprop", "gradient_in") &&
+            has_edge(training.graph,
+                     "trainer.layer.2.backprop", "gradient_out",
+                     "trainer.layer.1.backprop", "gradient_in") &&
+            has_edge(training.graph,
+                     "trainer.layer.0.backprop", "weight_gradient",
+                     "trainer.layer.0.weight-update", "weight_gradient") &&
+            has_edge(training.graph,
+                     training.learning_rate_node, "learning_rate",
+                     "trainer.layer.0.weight-update", "learning_rate"),
+            "MLP training reverse/SGD wiring mismatch");
+    ++passed;
+
+    const auto training_digest = training.graph.digest512();
+    const auto training_again = MlpPortPrecompiler::compile(training_spec);
+    require(training_again.graph.digest512() == training_digest,
+            "MLP precompiler is not deterministic");
+    ++passed;
+
+    auto changed_width_spec = training_spec;
+    changed_width_spec.layers[1].width = 7;
+    require(MlpPortPrecompiler::compile(changed_width_spec).graph.digest512() !=
+                training_digest,
+            "MLP graph commitment ignored layer width change");
+    ++passed;
+
+    auto invalid_spec = inference_spec;
+    invalid_spec.input_size = 0;
+    expect_throw([&] { (void)MlpPortPrecompiler::compile(invalid_spec); },
+                 "zero MLP input width");
+    invalid_spec = inference_spec;
+    invalid_spec.layers[1].width = 0;
+    expect_throw([&] { (void)MlpPortPrecompiler::compile(invalid_spec); },
+                 "zero MLP layer width");
+    ++passed;
+
     std::cout << "V0ID neural graph tests PASS: " << passed << "/" << passed << '\n';
     std::cout << "module tree          : YES\n"
               << "typed dataflow       : YES\n"
@@ -241,7 +374,11 @@ int main() try {
               << "plain mode           : YES\n"
               << "TFHE mode            : ABI/selection scaffold\n"
               << "invocation commitment: YES\n"
-              << "neural Wasm kind     : YES\n";
+              << "neural Wasm kind     : YES\n"
+              << "MLP port precompiler : YES\n"
+              << "generic weight matrix: YES\n"
+              << "backprop macro       : YES\n"
+              << "SGD update macro     : YES\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "V0ID neural graph tests FAILED: " << e.what() << '\n';

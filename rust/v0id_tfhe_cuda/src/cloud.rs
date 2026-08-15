@@ -7,6 +7,14 @@ use std::ptr;
 
 const CLOUD_PROTOCOL_VERSION: u32 = 1;
 const MAX_SERIALIZED_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_INPUT_WORDS: usize = 4096;
+const MAX_INSTRUCTIONS: usize = 65536;
+const MAX_OUTPUT_WORDS: usize = 64;
+
+const CLIENT_KEY_MAGIC: [u8; 8] = *b"V0IDCK01";
+const SERVER_KEY_MAGIC: [u8; 8] = *b"V0IDSK01";
+const JOB_MAGIC: [u8; 8] = *b"V0IDCJ01";
+const RESULT_MAGIC: [u8; 8] = *b"V0IDCR01";
 
 #[repr(C)]
 pub struct V0idTfheBlob {
@@ -15,7 +23,22 @@ pub struct V0idTfheBlob {
 }
 
 #[derive(Serialize, Deserialize)]
+struct ClientKeyEnvelope {
+    magic: [u8; 8],
+    protocol_version: u32,
+    key: ClientKey,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ServerKeyEnvelope {
+    magic: [u8; 8],
+    protocol_version: u32,
+    key: CompressedServerKey,
+}
+
+#[derive(Serialize, Deserialize)]
 struct EncryptedCloudJob {
+    magic: [u8; 8],
     protocol_version: u32,
     register_count: u32,
     encrypted_zero: FheUint64,
@@ -26,6 +49,7 @@ struct EncryptedCloudJob {
 
 #[derive(Serialize, Deserialize)]
 struct EncryptedCloudResult {
+    magic: [u8; 8],
     protocol_version: u32,
     outputs: Vec<FheUint64>,
 }
@@ -76,7 +100,25 @@ unsafe fn input_blob<'a>(data: *const u8, len: usize, what: &str) -> Result<&'a 
     if data.is_null() {
         return Err(format!("{what} pointer is null"));
     }
+    if len as u64 > MAX_SERIALIZED_BLOB_BYTES {
+        return Err(format!("{what} exceeds V0ID TFHE cloud blob limit"));
+    }
     Ok(slice::from_raw_parts(data, len))
+}
+
+fn require_version_and_magic(
+    actual_magic: [u8; 8],
+    expected_magic: [u8; 8],
+    version: u32,
+    what: &str,
+) -> Result<(), String> {
+    if actual_magic != expected_magic {
+        return Err(format!("bad V0ID TFHE {what} magic"));
+    }
+    if version != CLOUD_PROTOCOL_VERSION {
+        return Err(format!("unsupported V0ID TFHE {what} version"));
+    }
+    Ok(())
 }
 
 fn ffi_status(result: std::thread::Result<Result<(), String>>) -> i32 {
@@ -138,11 +180,14 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
         if register_count == 0 || register_count > 64 {
             return Err("TFHE CUDA register count must be in [1,64]".into());
         }
-        if instruction_count == 0 {
-            return Err("TFHE CUDA program has no instructions".into());
+        if instruction_count == 0 || instruction_count > MAX_INSTRUCTIONS {
+            return Err("TFHE CUDA instruction count outside cloud limit".into());
         }
-        if output_register_count == 0 {
-            return Err("TFHE CUDA program has no output registers".into());
+        if input_word_count > MAX_INPUT_WORDS {
+            return Err("TFHE CUDA input word count outside cloud limit".into());
+        }
+        if output_register_count == 0 || output_register_count > MAX_OUTPUT_WORDS {
+            return Err("TFHE CUDA output count outside cloud limit".into());
         }
 
         let instructions = slice::from_raw_parts(instructions, instruction_count);
@@ -191,7 +236,18 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
             progress(progress_cb, STAGE_ENCRYPT_INPUTS, encrypted_count, encryption_total);
         }
 
+        let client_key_envelope = ClientKeyEnvelope {
+            magic: CLIENT_KEY_MAGIC,
+            protocol_version: CLOUD_PROTOCOL_VERSION,
+            key: client_key,
+        };
+        let server_key_envelope = ServerKeyEnvelope {
+            magic: SERVER_KEY_MAGIC,
+            protocol_version: CLOUD_PROTOCOL_VERSION,
+            key: compressed_server_key,
+        };
         let job = EncryptedCloudJob {
+            magic: JOB_MAGIC,
             protocol_version: CLOUD_PROTOCOL_VERSION,
             register_count: register_count as u32,
             encrypted_zero,
@@ -200,8 +256,8 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_prepare(
             output_registers: encrypted_outputs,
         };
 
-        let client_key_bytes = encode(&client_key, "TFHE client key")?;
-        let server_key_bytes = encode(&compressed_server_key, "TFHE compressed server key")?;
+        let client_key_bytes = encode(&client_key_envelope, "TFHE client key envelope")?;
+        let server_key_bytes = encode(&server_key_envelope, "TFHE server key envelope")?;
         let encrypted_job_bytes = encode(&job, "TFHE encrypted cloud job")?;
 
         *client_key_out = owned_blob(client_key_bytes);
@@ -231,28 +287,35 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_server_evaluate(
         let encrypted_job_bytes =
             input_blob(encrypted_job_data, encrypted_job_len, "TFHE encrypted job blob")?;
 
-        let compressed_server_key: CompressedServerKey =
-            decode(server_key_bytes, "TFHE compressed server key")?;
+        let server_key_envelope: ServerKeyEnvelope =
+            decode(server_key_bytes, "TFHE server key envelope")?;
+        require_version_and_magic(
+            server_key_envelope.magic,
+            SERVER_KEY_MAGIC,
+            server_key_envelope.protocol_version,
+            "server key",
+        )?;
         let job: EncryptedCloudJob = decode(encrypted_job_bytes, "TFHE encrypted cloud job")?;
+        require_version_and_magic(job.magic, JOB_MAGIC, job.protocol_version, "cloud job")?;
 
-        if job.protocol_version != CLOUD_PROTOCOL_VERSION {
-            return Err("unsupported V0ID TFHE cloud job version".into());
-        }
         let register_count = job.register_count as usize;
         if register_count == 0 || register_count > 64 {
             return Err("TFHE cloud job register count outside [1,64]".into());
         }
-        if job.instructions.is_empty() {
-            return Err("TFHE cloud job has no instructions".into());
+        if job.inputs.len() > MAX_INPUT_WORDS {
+            return Err("TFHE cloud job input count outside limit".into());
         }
-        if job.output_registers.is_empty() {
-            return Err("TFHE cloud job has no output selectors".into());
+        if job.instructions.is_empty() || job.instructions.len() > MAX_INSTRUCTIONS {
+            return Err("TFHE cloud job instruction count outside limit".into());
+        }
+        if job.output_registers.is_empty() || job.output_registers.len() > MAX_OUTPUT_WORDS {
+            return Err("TFHE cloud job output count outside limit".into());
         }
 
         // The evaluator has only the public/evaluation key material. No ClientKey
         // is deserialized or accepted by this API. Conversion to the GPU server
         // key happens entirely on the evaluator side.
-        let gpu_key = compressed_server_key.decompress_to_gpu();
+        let gpu_key = server_key_envelope.key.decompress_to_gpu();
         set_server_key(gpu_key);
 
         let mut registers = vec![job.encrypted_zero; register_count];
@@ -270,6 +333,7 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_server_evaluate(
         }
 
         let result = EncryptedCloudResult {
+            magic: RESULT_MAGIC,
             protocol_version: CLOUD_PROTOCOL_VERSION,
             outputs,
         };
@@ -294,16 +358,27 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_decrypt(
         if output_words.is_null() || output_word_count.is_null() {
             return Err("TFHE CUDA client decrypt received null output pointer".into());
         }
+        if output_word_capacity == 0 || output_word_capacity > MAX_OUTPUT_WORDS {
+            return Err("TFHE CUDA client output capacity outside cloud limit".into());
+        }
 
         let client_key_bytes = input_blob(client_key_data, client_key_len, "TFHE client key blob")?;
         let encrypted_result_bytes =
             input_blob(encrypted_result_data, encrypted_result_len, "TFHE encrypted result blob")?;
 
-        let client_key: ClientKey = decode(client_key_bytes, "TFHE client key")?;
+        let client_key_envelope: ClientKeyEnvelope =
+            decode(client_key_bytes, "TFHE client key envelope")?;
+        require_version_and_magic(
+            client_key_envelope.magic,
+            CLIENT_KEY_MAGIC,
+            client_key_envelope.protocol_version,
+            "client key",
+        )?;
         let result: EncryptedCloudResult =
             decode(encrypted_result_bytes, "TFHE encrypted cloud result")?;
-        if result.protocol_version != CLOUD_PROTOCOL_VERSION {
-            return Err("unsupported V0ID TFHE cloud result version".into());
+        require_version_and_magic(result.magic, RESULT_MAGIC, result.protocol_version, "cloud result")?;
+        if result.outputs.is_empty() || result.outputs.len() > MAX_OUTPUT_WORDS {
+            return Err("TFHE CUDA result output count outside cloud limit".into());
         }
         if result.outputs.len() > output_word_capacity {
             return Err("TFHE CUDA client output buffer is too small".into());
@@ -311,7 +386,7 @@ pub unsafe extern "C" fn v0id_tfhe_cuda_client_decrypt(
 
         let out = slice::from_raw_parts_mut(output_words, output_word_capacity);
         for (index, value) in result.outputs.iter().enumerate() {
-            out[index] = value.decrypt(&client_key);
+            out[index] = value.decrypt(&client_key_envelope.key);
         }
         *output_word_count = result.outputs.len();
         Ok(())

@@ -14,7 +14,7 @@
         "V0ID_ENABLE_GPU_FHE": "ON",
         "CMAKE_PROJECT_INCLUDE": "",
         "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "",
-        "CMAKE_PROJECT_v0id_INCLUDE": "${sourceDir}/cmake/V0idTfheCuda.cmake"
+        "CMAKE_PROJECT_v0id_INCLUDE": "${sourceDir}/cmake/V0idTfheRemoteControl.cmake"
       }
     }
   ],

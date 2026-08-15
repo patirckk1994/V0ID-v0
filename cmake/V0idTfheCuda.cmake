@@ -152,20 +152,16 @@ function(v0id_finish_tfhe_cuda_setup)
     endif()
 
     message(STATUS "V0ID TFHE CUDA backend: ENABLED")
-    message(STATUS "  cargo      : ${V0ID_CARGO_EXECUTABLE}")
-    message(STATUS "  rustc      : ${V0ID_RUSTC_VERSION_TEXT}")
-    message(STATUS "  nvcc       : ${V0ID_NVCC_EXECUTABLE} (CUDA ${V0ID_CUDA_TOOLKIT_VERSION})")
-    message(STATUS "  GPU CC     : ${V0ID_GPU_COMPUTE_CAPABILITY}")
+    message(STATUS "  cargo       : ${V0ID_CARGO_EXECUTABLE}")
+    message(STATUS "  rustc       : ${V0ID_RUSTC_VERSION_TEXT}")
+    message(STATUS "  nvcc        : ${V0ID_NVCC_EXECUTABLE} (CUDA ${V0ID_CUDA_TOOLKIT_VERSION})")
+    message(STATUS "  GPU CC      : ${V0ID_GPU_COMPUTE_CAPABILITY}")
     message(STATUS "  Rust sidecar: ${V0ID_TFHE_CUDA_LIBRARY}")
 endfunction()
 
 # The GPU preset loads this only for the first/top-level project() call. The
-# explicit DIRECTORY also makes the hook robust against stale caches that still
-# inject it through CMAKE_PROJECT_INCLUDE: target wiring always runs at the end
-# of V0ID's top-level CMakeLists, after the encrypted evaluator targets exist.
-if(NOT V0ID_TFHE_CUDA_SETUP_DEFERRED)
-    set(V0ID_TFHE_CUDA_SETUP_DEFERRED TRUE CACHE INTERNAL
-        "V0ID TFHE CUDA setup has been scheduled")
-    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
-        CALL v0id_finish_tfhe_cuda_setup)
-endif()
+# explicit DIRECTORY also makes the hook robust against a stale build tree that
+# still knows about the old injection mechanism: target wiring always runs at
+# the end of V0ID's top-level CMakeLists, after the evaluator targets exist.
+cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}"
+    CALL v0id_finish_tfhe_cuda_setup)

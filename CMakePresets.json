@@ -12,7 +12,8 @@
         "V0ID_ENABLE_MATHVM": "OFF",
         "V0ID_ENABLE_Z3_BITVECTOR_AUDIT": "OFF",
         "V0ID_ENABLE_GPU_FHE": "ON",
-        "CMAKE_PROJECT_INCLUDE": "${sourceDir}/cmake/V0idTfheCuda.cmake"
+        "CMAKE_PROJECT_INCLUDE": "",
+        "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "${sourceDir}/cmake/V0idTfheCuda.cmake"
       }
     }
   ],

@@ -11,3 +11,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tfhe = { version = "=1.6.1", features = ["integer", "gpu"] }
+
+# TFHE-rs 1.6.1 was released against these exact workspace crate versions.
+# Its crates.io manifest expresses some of them as semver ranges; in particular
+# `tfhe-csprng = "0.9.0"` can otherwise resolve to 0.9.2, which depends on
+# tfhe-versionable 0.8 while tfhe 1.6.1 itself uses tfhe-versionable 0.7. That
+# yields distinct Versionize traits and hundreds of derive failures. Keep the
+# sidecar on the release-compatible set instead of allowing that transitive
+# upgrade.
+tfhe-csprng = "=0.9.0"
+tfhe-versionable = "=0.7.0"
+tfhe-ntt = "=0.7.1"

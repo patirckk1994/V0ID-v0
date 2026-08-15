@@ -3,11 +3,14 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::slice;
 use std::sync::{Mutex, OnceLock};
 
+use serde::{Deserialize, Serialize};
 use tfhe::prelude::*;
 use tfhe::{
     set_server_key, ClientKey, CompressedServerKey, ConfigBuilder, FheUint16,
     FheUint64, FheUint8,
 };
+
+mod cloud;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -46,6 +49,7 @@ fn progress(cb: ProgressFn, stage: u32, current: usize, total: usize) {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct EncInstruction {
     op: FheUint8,
     dst: FheUint8,

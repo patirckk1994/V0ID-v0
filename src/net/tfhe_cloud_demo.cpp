@@ -1,4 +1,5 @@
 #include "boolean_program_image.hpp"
+#include "curve_peer_transport.hpp"
 #include "gpu_fhe_backend.hpp"
 #include "peer_transport.hpp"
 #include "tfhe_cloud_codec.hpp"
@@ -9,11 +10,15 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <fcntl.h>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -24,11 +29,13 @@ using v0id::fhe::TfheCudaServerSession;
 using v0id::integrity::BooleanProgramImage;
 using v0id::integrity::BooleanProgramInstruction;
 using v0id::integrity::BooleanProgramOpcode;
+using v0id::net::CurveAuthorizedClient;
+using v0id::net::CurveKeyPair;
+using v0id::net::CurvePeerClient;
+using v0id::net::CurvePeerServer;
 using v0id::net::Envelope;
 using v0id::net::MessageType;
 using v0id::net::MultipartEnvelope;
-using v0id::net::PeerClient;
-using v0id::net::PeerServer;
 using v0id::net::TfheCloudAck;
 using v0id::net::TfheCloudChunk;
 using v0id::net::TfheCloudFinish;
@@ -42,7 +49,7 @@ constexpr auto TFHE_SESSION_TTL = std::chrono::minutes(30);
 constexpr std::uint64_t DEMO_EPOCH = 1;
 
 struct CachedTfheSession {
-    std::string peer_id;
+    std::string authenticated_user_id;
     std::string job_id;
     std::uint64_t epoch{};
     std::size_t expected_instruction_count{};
@@ -55,20 +62,96 @@ struct CachedTfheSession {
 void usage(const char* argv0) {
     std::cerr
         << "usage:\n"
-        << "  " << argv0 << " server <peer-id> <bind-endpoint> [finished-job-count]\n"
-        << "  " << argv0 << " client <peer-id> <connect-endpoint>\n\n"
+        << "  " << argv0 << " keygen <output-prefix>\n"
+        << "  " << argv0 << " server <server-peer-id> <bind-endpoint>"
+           " <server-secret-file> <allowed-client-public-file>"
+           " <allowed-client-peer-id> [finished-job-count]\n"
+        << "  " << argv0 << " client <client-peer-id> <connect-endpoint>"
+           " <client-public-file> <client-secret-file>"
+           " <server-public-file> <expected-server-peer-id>\n\n"
         << "Example:\n"
-        << "  " << argv0 << " server gpu-node tcp://*:7788 1\n"
-        << "  " << argv0 << " client client-a tcp://127.0.0.1:7788\n\n"
-        << "The client keeps ClientKey locally. The evaluator receives a compressed\n"
-        << "server key once, encrypted init once, then bounded encrypted instruction\n"
-        << "chunks over ZeroMQ multipart frames. This demo is not an authenticated\n"
-        << "public service; peer_id/job_id binding is protocol state, not identity proof.\n";
+        << "  " << argv0 << " keygen server\n"
+        << "  " << argv0 << " keygen client-a\n"
+        << "  " << argv0 << " server gpu-node tcp://*:7788"
+           " server.secret client-a.public client-a 1\n"
+        << "  " << argv0 << " client client-a tcp://127.0.0.1:7788"
+           " client-a.public client-a.secret server.public gpu-node\n\n"
+        << "TFHE cloud transport requires ZeroMQ CURVE. The server pins authorized\n"
+        << "client public keys through an in-process ZAP allowlist; the client pins\n"
+        << "the evaluator public key. Secret CURVE keys are read from files instead\n"
+        << "of command-line arguments. The TFHE ClientKey remains client-local.\n";
 }
 
 void require(bool condition, const std::string& what) {
     if (!condition)
         throw std::runtime_error(what);
+}
+
+void write_all(int fd, const char* data, std::size_t size) {
+    while (size != 0) {
+        const auto n = ::write(fd, data, size);
+        if (n < 0)
+            throw std::runtime_error("failed writing CURVE key file");
+        data += n;
+        size -= static_cast<std::size_t>(n);
+    }
+}
+
+void write_key_file_exclusive(const std::string& path,
+                              const std::string& key,
+                              mode_t mode) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, mode);
+    if (fd < 0)
+        throw std::runtime_error("refusing to overwrite CURVE key file: " + path);
+    try {
+        const std::string line = key + "\n";
+        write_all(fd, line.data(), line.size());
+        if (::close(fd) != 0)
+            throw std::runtime_error("failed closing CURVE key file: " + path);
+    } catch (...) {
+        ::close(fd);
+        ::unlink(path.c_str());
+        throw;
+    }
+}
+
+std::string read_key_file(const std::string& path) {
+    std::ifstream in(path);
+    if (!in)
+        throw std::runtime_error("cannot open CURVE key file: " + path);
+    std::string key;
+    std::string extra;
+    if (!(in >> key))
+        throw std::runtime_error("CURVE key file is empty: " + path);
+    if (in >> extra)
+        throw std::runtime_error("CURVE key file contains extra tokens: " + path);
+    if (key.size() != 40)
+        throw std::runtime_error("CURVE key file must contain one 40-character Z85 key: " + path);
+    return key;
+}
+
+CurveKeyPair load_keypair(const std::string& public_path,
+                          const std::string& secret_path) {
+    return CurveKeyPair{read_key_file(public_path), read_key_file(secret_path)};
+}
+
+int run_keygen(const std::string& prefix) {
+    if (prefix.empty())
+        throw std::runtime_error("key output prefix must not be empty");
+    const auto keys = v0id::net::generate_curve_keypair();
+    const auto public_path = prefix + ".public";
+    const auto secret_path = prefix + ".secret";
+    write_key_file_exclusive(public_path, keys.public_key_z85, 0644);
+    try {
+        write_key_file_exclusive(secret_path, keys.secret_key_z85, 0600);
+    } catch (...) {
+        ::unlink(public_path.c_str());
+        throw;
+    }
+    std::cout << "generated CURVE keypair\n"
+              << "  public: " << public_path << " (0644)\n"
+              << "  secret: " << secret_path << " (0600)\n";
+    return 0;
 }
 
 TfheCloudSessionId random_session_id() {
@@ -101,7 +184,19 @@ MultipartEnvelope error_reply(const std::string& server_peer_id,
     Envelope out = base_envelope(server_peer_id, job_id, epoch);
     out.type = MessageType::error;
     out.payload = v0id::net::bytes(error);
-    return MultipartEnvelope{std::move(out), {}};
+    return MultipartEnvelope{std::move(out), {}, {}};
+}
+
+void require_server_reply_binding(const MultipartEnvelope& reply,
+                                  const std::string& expected_server_peer_id,
+                                  const std::string& job_id,
+                                  std::uint64_t epoch) {
+    if (reply.envelope.peer_id != expected_server_peer_id)
+        throw std::runtime_error("TFHE cloud reply server peer-id mismatch");
+    if (reply.envelope.job_id != job_id)
+        throw std::runtime_error("TFHE cloud reply job binding mismatch");
+    if (reply.envelope.epoch != epoch)
+        throw std::runtime_error("TFHE cloud reply epoch binding mismatch");
 }
 
 void throw_if_error(const MultipartEnvelope& reply, const char* operation) {
@@ -111,11 +206,11 @@ void throw_if_error(const MultipartEnvelope& reply, const char* operation) {
 }
 
 void require_same_binding(const CachedTfheSession& session,
-                          const std::string& peer_id,
+                          const std::string& authenticated_user_id,
                           const std::string& job_id,
                           std::uint64_t epoch) {
-    if (session.peer_id != peer_id)
-        throw std::runtime_error("TFHE cloud peer binding mismatch");
+    if (session.authenticated_user_id != authenticated_user_id)
+        throw std::runtime_error("TFHE cloud authenticated transport identity mismatch");
     if (session.job_id != job_id)
         throw std::runtime_error("TFHE cloud job binding mismatch");
     if (session.epoch != epoch)
@@ -153,15 +248,23 @@ BooleanProgramImage smoke_image() {
 
 int run_server(const std::string& peer_id,
                const std::string& endpoint,
+               const std::string& server_secret_key,
+               const std::string& allowed_client_public_key,
+               const std::string& allowed_client_peer_id,
                int finished_job_limit) {
-    PeerServer server(endpoint, CLOUD_TIMEOUT_MS);
+    CurvePeerServer server(
+        endpoint,
+        server_secret_key,
+        {CurveAuthorizedClient{allowed_client_public_key, allowed_client_peer_id}},
+        CLOUD_TIMEOUT_MS);
     std::unordered_map<std::string, std::unique_ptr<CachedTfheSession>> sessions;
 
     std::cout << "V0ID TFHE CUDA evaluator " << peer_id
-              << " listening on " << endpoint << '\n'
+              << " listening on " << server.last_endpoint() << '\n'
               << "session cache cap      : " << MAX_CACHED_TFHE_SESSIONS << '\n'
               << "session TTL            : 30 minutes\n"
-              << "transport              : ZeroMQ multipart\n"
+              << "transport              : ZeroMQ CURVE + ZAP / multipart\n"
+              << "authorized client      : " << allowed_client_peer_id << '\n'
               << "client secret key recv : NO\n";
 
     int finish_requests = 0;
@@ -171,14 +274,17 @@ int run_server(const std::string& peer_id,
 
         const auto request_type = request.envelope.type;
         const auto request_peer_id = request.envelope.peer_id;
+        const auto request_authenticated_user_id = request.authenticated_user_id;
         const auto request_job_id = request.envelope.job_id;
         const auto request_epoch = request.envelope.epoch;
         const bool counts_as_finish = request_type == MessageType::tfhe_job_finish;
 
         MultipartEnvelope reply;
         try {
-            if (request_peer_id.empty())
-                throw std::runtime_error("TFHE cloud peer id must not be empty");
+            if (request_authenticated_user_id.empty())
+                throw std::runtime_error("TFHE cloud request lacks authenticated transport identity");
+            if (request_peer_id != request_authenticated_user_id)
+                throw std::runtime_error("TFHE cloud claimed peer-id differs from CURVE/ZAP identity");
             if (request_job_id.empty())
                 throw std::runtime_error("TFHE cloud job id must not be empty");
 
@@ -191,7 +297,7 @@ int run_server(const std::string& peer_id,
                     throw std::runtime_error("TFHE cloud evaluator session cache is full");
 
                 auto cached = std::make_unique<CachedTfheSession>();
-                cached->peer_id = request_peer_id;
+                cached->authenticated_user_id = request_authenticated_user_id;
                 cached->job_id = request_job_id;
                 cached->epoch = request_epoch;
                 cached->expected_instruction_count =
@@ -212,10 +318,12 @@ int run_server(const std::string& peer_id,
                     MessageType::tfhe_session_ready);
 
                 std::cout << "installed TFHE session=" << short_id
+                          << " auth-user=" << request_authenticated_user_id
                           << " instructions=" << install.total_instruction_count
                           << " outputs=" << install.output_word_count
                           << " cached=" << sessions.size() << '\n'
-                          << "  server key received : YES\n"
+                          << "  CURVE authenticated  : YES\n"
+                          << "  server key received  : YES\n"
                           << "  encrypted init recv  : YES\n"
                           << "  plaintext program    : NO\n"
                           << "  plaintext inputs     : NO\n"
@@ -226,7 +334,8 @@ int run_server(const std::string& peer_id,
                 if (it == sessions.end())
                     throw std::runtime_error("TFHE instruction chunk references unknown session");
                 auto& cached = *it->second;
-                require_same_binding(cached, request_peer_id, request_job_id, request_epoch);
+                require_same_binding(cached, request_authenticated_user_id,
+                                     request_job_id, request_epoch);
 
                 if (chunk.total_instruction_count != cached.expected_instruction_count)
                     throw std::runtime_error("TFHE chunk total differs from installed session total");
@@ -247,6 +356,7 @@ int run_server(const std::string& peer_id,
 
                 std::cout << "session="
                           << v0id::net::tfhe_cloud_session_id_hex(chunk.session_id).substr(0, 16)
+                          << " auth-user=" << request_authenticated_user_id
                           << " executed chunk start=" << chunk.start_instruction
                           << " count=" << chunk.instruction_count
                           << " completed=" << cached.completed_instruction_count
@@ -258,7 +368,8 @@ int run_server(const std::string& peer_id,
                 if (it == sessions.end())
                     throw std::runtime_error("TFHE finish references unknown session");
                 auto& cached = *it->second;
-                require_same_binding(cached, request_peer_id, request_job_id, request_epoch);
+                require_same_binding(cached, request_authenticated_user_id,
+                                     request_job_id, request_epoch);
 
                 if (finish.expected_instruction_count != cached.expected_instruction_count)
                     throw std::runtime_error("TFHE finish instruction count mismatch");
@@ -282,6 +393,7 @@ int run_server(const std::string& peer_id,
 
                 std::cout << "finished TFHE session="
                           << v0id::net::tfhe_cloud_session_id_hex(session_id).substr(0, 16)
+                          << " auth-user=" << request_authenticated_user_id
                           << " completed=" << completed
                           << " session released=YES\n";
             } else {
@@ -300,7 +412,10 @@ int run_server(const std::string& peer_id,
 }
 
 int run_client(const std::string& peer_id,
-               const std::string& endpoint) {
+               const std::string& endpoint,
+               const CurveKeyPair& client_keys,
+               const std::string& server_public_key,
+               const std::string& expected_server_peer_id) {
     const auto image = smoke_image();
     constexpr std::uint64_t input_word = 0x0123456789abcdefULL;
     const std::vector<std::uint64_t> inputs{input_word};
@@ -332,7 +447,7 @@ int run_client(const std::string& peer_id,
     const auto server_key_bytes = prepared.server_key_blob.size();
     const auto init_bytes = prepared.encrypted_init_blob.size();
 
-    PeerClient client(endpoint, CLOUD_TIMEOUT_MS);
+    CurvePeerClient client(endpoint, client_keys, server_public_key, CLOUD_TIMEOUT_MS);
 
     TfheCloudInstall install;
     install.session_id = session_id;
@@ -343,15 +458,17 @@ int run_client(const std::string& peer_id,
 
     std::cout << "session id             : "
               << v0id::net::tfhe_cloud_session_id_hex(session_id).substr(0, 16) << "...\n"
+              << "transport              : ZeroMQ CURVE + pinned server key\n"
               << "client key bytes       : " << prepared.client_key_blob.size() << '\n'
               << "server key frame bytes : " << server_key_bytes << '\n'
               << "encrypted init bytes   : " << init_bytes << '\n'
               << "evaluator receives SK  : NO\n"
-              << "installing remote GPU session...\n" << std::flush;
+              << "installing authenticated remote GPU session...\n" << std::flush;
 
     auto install_reply = client.round_trip_multipart(
         v0id::net::pack_tfhe_cloud_install(
             base_envelope(peer_id, job_id, DEMO_EPOCH), std::move(install)));
+    require_server_reply_binding(install_reply, expected_server_peer_id, job_id, DEMO_EPOCH);
     throw_if_error(install_reply, "TFHE session install");
     const auto install_ack = v0id::net::unpack_tfhe_cloud_ack(
         install_reply, MessageType::tfhe_session_ready);
@@ -360,7 +477,7 @@ int run_client(const std::string& peer_id,
     require(install_ack.completed_instruction_count == 0,
             "new TFHE session acknowledgement must start at instruction zero");
 
-    std::cout << "remote evaluator       : SESSION READY\n";
+    std::cout << "remote evaluator       : AUTHENTICATED / SESSION READY\n";
 
     for (std::size_t first = 0; first < image.instructions.size();
          first += v0id::fhe::kTfheCudaInstructionChunkSize) {
@@ -393,6 +510,7 @@ int run_client(const std::string& peer_id,
         auto chunk_reply = client.round_trip_multipart(
             v0id::net::pack_tfhe_cloud_chunk(
                 base_envelope(peer_id, job_id, DEMO_EPOCH), std::move(chunk)));
+        require_server_reply_binding(chunk_reply, expected_server_peer_id, job_id, DEMO_EPOCH);
         throw_if_error(chunk_reply, "TFHE chunk execution");
         const auto ack = v0id::net::unpack_tfhe_cloud_ack(
             chunk_reply, MessageType::tfhe_chunk_ready);
@@ -412,6 +530,7 @@ int run_client(const std::string& peer_id,
     auto finish_reply = client.round_trip_multipart(
         v0id::net::pack_tfhe_cloud_finish(
             base_envelope(peer_id, job_id, DEMO_EPOCH), finish));
+    require_server_reply_binding(finish_reply, expected_server_peer_id, job_id, DEMO_EPOCH);
     throw_if_error(finish_reply, "TFHE job finish");
     auto result = v0id::net::unpack_tfhe_cloud_result(std::move(finish_reply));
     require(result.session_id == session_id,
@@ -428,7 +547,9 @@ int run_client(const std::string& peer_id,
     require(decrypted == plain.output_words,
             "remote TFHE cloud result differs from plaintext oracle");
 
-    std::cout << "[PASS] TFHE server key installed once over ZeroMQ multipart\n"
+    std::cout << "[PASS] CURVE authenticated/encrypted the cloud channel\n"
+              << "[PASS] ZAP bound the session to the authorized client public key\n"
+              << "[PASS] TFHE server key installed once over ZeroMQ multipart\n"
               << "[PASS] encrypted instruction chunks executed in bound order\n"
               << "[PASS] evaluator never received ClientKey or plaintext program/input\n"
               << "[PASS] encrypted remote result decrypted to the plaintext oracle\n";
@@ -438,26 +559,53 @@ int run_client(const std::string& peer_id,
 } // namespace
 
 int main(int argc, char** argv) try {
-    if (argc < 4) {
+    if (argc >= 2 && std::string(argv[1]) == "keygen") {
+        if (argc != 3) {
+            usage(argv[0]);
+            return 2;
+        }
+        return run_keygen(argv[2]);
+    }
+
+    if (argc < 2) {
         usage(argv[0]);
         return 2;
     }
 
     const std::string mode = argv[1];
-    const std::string peer_id = argv[2];
-    const std::string endpoint = argv[3];
-
     if (mode == "server") {
+        if (argc != 7 && argc != 8) {
+            usage(argv[0]);
+            return 2;
+        }
+        const std::string peer_id = argv[2];
+        const std::string endpoint = argv[3];
+        const auto server_secret_key = read_key_file(argv[4]);
+        const auto allowed_client_public_key = read_key_file(argv[5]);
+        const std::string allowed_client_peer_id = argv[6];
         int count = 1;
-        if (argc >= 5) {
-            count = std::stoi(argv[4]);
+        if (argc == 8) {
+            count = std::stoi(argv[7]);
             if (count <= 0)
                 throw std::runtime_error("finished-job-count must be positive");
         }
-        return run_server(peer_id, endpoint, count);
+        return run_server(peer_id, endpoint, server_secret_key,
+                          allowed_client_public_key, allowed_client_peer_id, count);
     }
-    if (mode == "client")
-        return run_client(peer_id, endpoint);
+
+    if (mode == "client") {
+        if (argc != 8) {
+            usage(argv[0]);
+            return 2;
+        }
+        const std::string peer_id = argv[2];
+        const std::string endpoint = argv[3];
+        const auto client_keys = load_keypair(argv[4], argv[5]);
+        const auto server_public_key = read_key_file(argv[6]);
+        const std::string expected_server_peer_id = argv[7];
+        return run_client(peer_id, endpoint, client_keys,
+                          server_public_key, expected_server_peer_id);
+    }
 
     usage(argv[0]);
     return 2;

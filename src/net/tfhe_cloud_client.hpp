@@ -21,6 +21,7 @@ struct TfheCloudClientConfig {
     std::uint64_t epoch{1};
     int timeout_ms{3'600'000};
     std::uint32_t retry_attempts{2};
+    std::size_t instruction_chunk_size{32};
     bool verify_plaintext_result{true};
 };
 

@@ -1,5 +1,6 @@
 #include "boolean_ir_mutator.hpp"
 #include "boolean_ir_to_program.hpp"
+#include "polymorphic_hash_camouflage.hpp"
 #include "sha3_512_ir.hpp"
 
 #include <openssl/evp.h>
@@ -120,6 +121,59 @@ int main() try {
          "seeded BooleanIR mutation preserves SHA3-512 output");
     pass(mutated.nodes().size() != sha3.ir.nodes().size(),
          "seeded BooleanIR mutation changes circuit structure");
+
+    v0id::integrity::HashCamouflageSpec camouflage_spec;
+    camouflage_spec.seed = 0x0123456789abcdefull;
+    camouflage_spec.signal_terms = 3;
+    const auto camouflaged =
+        v0id::integrity::camouflage_hash_input_edges(sha3.ir, camouflage_spec);
+    v0id::integrity::validate_hash_camouflage(sha3.ir, camouflaged);
+    pass(camouflaged.ir.input_count() == sha3.ir.input_count(),
+         "hash camouflage preserves the physical input tape");
+    pass(camouflaged.trace.inputs.size() == sha3.ir.input_count(),
+         "hash camouflage traces every selected hash input edge");
+    pass(camouflaged.ir.nodes().size() > sha3.ir.nodes().size(),
+         "hash camouflage adds a non-trivial graph morphology region");
+    pass(v0id::integrity::equivalent_on_inputs(sha3.ir, camouflaged, abc_bits),
+         "hash camouflage preserves SHA3-512 semantics");
+    pass(v0id::integrity::lsb_bits_to_bytes(camouflaged.ir.evaluate(abc_bits)) ==
+             openssl_sha3_512(abc),
+         "camouflaged SHA3-512 output still matches OpenSSL");
+
+    bool input_prefix_unchanged = true;
+    for (std::size_t i = 0; i < sha3.ir.input_count(); ++i) {
+        const auto& node = camouflaged.ir.nodes()[i];
+        input_prefix_unchanged = input_prefix_unchanged &&
+            node.op == v0id::integrity::BoolOp::Input &&
+            node.input_index == i;
+    }
+    pass(input_prefix_unchanged,
+         "hash camouflage leaves BooleanIR input nodes unchanged");
+
+    auto alternate_spec = camouflage_spec;
+    alternate_spec.signal_terms = 2;
+    const auto alternate_camouflaged =
+        v0id::integrity::camouflage_hash_input_edges(sha3.ir, alternate_spec);
+    v0id::integrity::validate_hash_camouflage(sha3.ir, alternate_camouflaged);
+    pass(alternate_camouflaged.ir.nodes().size() != camouflaged.ir.nodes().size(),
+         "different camouflage parameters produce a different graph shape");
+    pass(v0id::integrity::equivalent_on_inputs(
+             sha3.ir, alternate_camouflaged, abc_bits),
+         "different camouflage graph shape preserves the same SHA3 output");
+
+    v0id::integrity::HashCamouflageSpec partial_spec;
+    partial_spec.seed = 0xfeedfacecafebeefull;
+    partial_spec.signal_terms = 2;
+    partial_spec.input_indices = {0, 7, 15};
+    const auto partial =
+        v0id::integrity::camouflage_hash_input_edges(sha3.ir, partial_spec);
+    v0id::integrity::validate_hash_camouflage(sha3.ir, partial);
+    pass(partial.trace.inputs.size() == partial_spec.input_indices.size(),
+         "partial hash camouflage wraps exactly the requested input edges");
+    pass(partial.ir.nodes().size() < camouflaged.ir.nodes().size(),
+         "partial hash camouflage adds less morphology than full camouflage");
+    pass(v0id::integrity::equivalent_on_inputs(sha3.ir, partial, abc_bits),
+         "partial hash camouflage preserves SHA3 output");
 
     const auto tiny = tiny_ir();
     auto plan = v0id::integrity::make_default_boolean_ir_lowering_plan(tiny);

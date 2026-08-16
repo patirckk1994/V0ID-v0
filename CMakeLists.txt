@@ -11,8 +11,6 @@ find_package(OpenFHE CONFIG REQUIRED)
 find_package(OpenSSL 3 REQUIRED)
 find_package(Threads REQUIRED)
 
-# CMake 4 removed compatibility with policy versions older than 3.5. Some
-# fetched research dependencies still declare older compatibility ranges.
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING
         "Minimum policy compatibility for legacy fetched dependencies" FORCE)
@@ -24,6 +22,7 @@ set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WITH_DOCS OFF CACHE BOOL "" FORCE)
 set(ENABLE_DRAFTS OFF CACHE BOOL "" FORCE)
 set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     libzmq
@@ -40,6 +39,14 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(cppzmq)
+
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json)
 
 option(V0ID_ENABLE_MATHVM "Build the WAMR-backed V0ID sandbox components" ON)
 if(V0ID_ENABLE_MATHVM)
@@ -137,9 +144,6 @@ function(v0id_use_openfhe target)
     target_link_libraries(${target} PRIVATE ${V0ID_OPENFHE_LIBRARIES})
 endfunction()
 
-# Series-first core: issuer-private KMACXOF schedule, trusted ProgramMorpher,
-# transcript-bound post-KEM scheduling, and a whole-stack purpose schedule where
-# purpose series are derived before concrete algorithm identifiers are chosen.
 add_library(v0id_core
     src/polymorph/program_morpher.cpp
     src/polymorph/series_generator.cpp
@@ -163,17 +167,75 @@ add_executable(v0id-series-first-stack-tests
 )
 target_link_libraries(v0id-series-first-stack-tests PRIVATE v0id_core)
 
-# Fast plaintext gate for the execution-bound polymorphism experiment. It uses
-# one secret state-label encoding per round boundary, so a semantic fixed point
-# does not also become a stable encrypted-machine representation.
 add_executable(v0id-round-morph-schedule-tests
     src/polymorph/round_morph_schedule_tests.cpp
 )
 target_link_libraries(v0id-round-morph-schedule-tests PRIVATE v0id_core)
 
-# PQ-facing plaintext quine commitment plus the hash-agnostic canonical subject
-# and private execution-integrity construction boundary. SHA3-512 is the strong
-# default client reference backend; runtime hash Programs remain private hooks.
+add_library(v0id_boolean_integrity
+    src/integrity/boolean_ir.cpp
+    src/integrity/keccak_ir.cpp
+    src/integrity/sha3_512_ir.cpp
+    src/integrity/boolean_ir_mutator.cpp
+    src/integrity/boolean_ir_lowering_plan.cpp
+    src/integrity/boolean_ir_to_program.cpp
+    src/integrity/boolean_program_image.cpp
+    src/integrity/boolean_program_image_mutator.cpp
+    src/integrity/keccak_program_image.cpp
+)
+target_include_directories(v0id_boolean_integrity PUBLIC
+    src/integrity
+    src/core
+)
+target_link_libraries(v0id_boolean_integrity PUBLIC v0id_core)
+
+add_executable(v0id-sha3-program-tests
+    src/integrity/sha3_program_tests.cpp
+)
+target_link_libraries(v0id-sha3-program-tests PRIVATE
+    v0id_boolean_integrity
+    OpenSSL::Crypto
+)
+
+add_executable(v0id-sha3-image-tests
+    src/integrity/sha3_image_tests.cpp
+)
+target_include_directories(v0id-sha3-image-tests PRIVATE src/fhe)
+target_link_libraries(v0id-sha3-image-tests PRIVATE
+    v0id_boolean_integrity
+    OpenSSL::Crypto
+)
+
+add_library(v0id_encrypted_boolean_program
+    src/fhe/encrypted_boolean_program.cpp
+)
+target_include_directories(v0id_encrypted_boolean_program PUBLIC
+    src/fhe
+    src/integrity
+    ${OPENMP_INCLUDES}
+    ${OpenFHE_INCLUDE}
+    ${OpenFHE_INCLUDE}/third-party/include
+    ${OpenFHE_INCLUDE}/core
+    ${OpenFHE_INCLUDE}/pke
+    ${OpenFHE_INCLUDE}/binfhe
+)
+target_link_libraries(v0id_encrypted_boolean_program PUBLIC
+    v0id_boolean_integrity
+)
+v0id_use_openfhe(v0id_encrypted_boolean_program)
+
+add_executable(v0id-encrypted-boolean-program-tests
+    src/integrity/encrypted_boolean_program_tests.cpp
+)
+target_include_directories(v0id-encrypted-boolean-program-tests PRIVATE
+    src/fhe
+    src/integrity
+)
+target_link_libraries(v0id-encrypted-boolean-program-tests PRIVATE
+    v0id_encrypted_boolean_program
+)
+v0id_use_openfhe(v0id-encrypted-boolean-program-tests)
+
 add_library(v0id_quine
     src/integrity/quine_hash.cpp
     src/integrity/round_receipt.cpp
@@ -201,32 +263,21 @@ add_executable(v0id-integrity-program-tests
 )
 target_link_libraries(v0id-integrity-program-tests PRIVATE v0id_quine)
 
-# Round-receipt execution-bound audit: a cheap SHA3-512 hash chain over
-# evaluator-visible per-round ciphertext digests, bound to session/job/epoch/
-# profile/round-count. Pure logic, no OpenFHE required, so it runs fast and
-# independently of the slow BinFHE-backed malicious evaluator harness below.
 add_executable(v0id-round-receipt-tests
     src/integrity/round_receipt_tests.cpp
 )
 target_link_libraries(v0id-round-receipt-tests PRIVATE v0id_quine)
 
-# Phase-1 polymorphism leakage benchmark. It separates deliberately public fixed
-# evaluator shape from a stronger plaintext diagnostic that the current BinFHE
-# evaluator does not receive. Later wire/timing work is deferred behind execution
-# soundness because honest-execution verification is the critical-path problem.
 add_executable(v0id-polymorphism-distinguisher
     src/integrity/polymorphism_distinguisher.cpp
 )
 target_link_libraries(v0id-polymorphism-distinguisher PRIVATE v0id_core)
 
-# Defensive malicious-evaluator harness. It uses the real ProgramMorpher,
-# RemoteEncryptedMachine and legacy FHE fingerprint plumbing to demonstrate that
-# an evaluator can skip requested rounds while preserving an accepted final
-# output for a fixed-point job -- and that the round-receipt audit above
-# rejects that same cheat while staying far cheaper than recomputation.
+# Defensive execution-soundness harness. ToyFingerprint has been retired; the
+# harness now compares final-output-only verification against the SHA3-512
+# round-receipt audit directly.
 add_executable(v0id-malicious-evaluator-harness
     src/integrity/malicious_evaluator_harness.cpp
-    src/integrity/toy_fingerprint.cpp
     src/fhe/remote_machine.cpp
 )
 target_include_directories(v0id-malicious-evaluator-harness PRIVATE
@@ -241,37 +292,11 @@ target_link_libraries(v0id-malicious-evaluator-harness PRIVATE
 )
 v0id_use_openfhe(v0id-malicious-evaluator-harness)
 
-# Intended execution-binding experiment: the client derives a different hidden
-# state-label encoding for every round boundary, fingerprints the complete
-# ordered encrypted schedule, then checks the final hidden state as well as the
-# semantic tape. The 2/4 fixed-point cheat is expected to retain the right tape
-# but fail the boundary-4 state check.
-add_executable(v0id-round-morph-fhe-harness
-    src/integrity/round_morph_fhe_harness.cpp
-    src/integrity/toy_fingerprint.cpp
-    src/fhe/remote_machine.cpp
-)
-target_include_directories(v0id-round-morph-fhe-harness PRIVATE
-    src/fhe
-    src/integrity
-)
-target_link_libraries(v0id-round-morph-fhe-harness PRIVATE
-    v0id_core
-    OpenSSL::Crypto
-)
-v0id_use_openfhe(v0id-round-morph-fhe-harness)
-
-# Real standardized KEM composition gate. OpenSSL 3.5+ supplies ML-KEM-768;
-# when the provider is unavailable the executable reports SKIP rather than
-# pretending a synthetic shared secret exercised the KEM runtime.
 add_executable(v0id-series-first-mlkem-tests
     src/crypto/series_first_mlkem_tests.cpp
 )
 target_link_libraries(v0id-series-first-mlkem-tests PRIVATE v0id_core OpenSSL::Crypto)
 
-# Future coin/blockchain wrapper only: one accepted event may contain mining
-# work, useful-compute complexity, or both. The six MI/MV/MC + CI/CV/CC payout
-# primitives are classifications over that same event, not an issuance policy.
 add_library(v0id_coin src/coin/work_token.cpp)
 target_include_directories(v0id_coin PUBLIC src/coin)
 target_link_libraries(v0id_coin PUBLIC OpenSSL::Crypto)
@@ -279,30 +304,17 @@ target_link_libraries(v0id_coin PUBLIC OpenSSL::Crypto)
 add_executable(v0id-work-token-tests src/coin/work_token_tests.cpp)
 target_link_libraries(v0id-work-token-tests PRIVATE v0id_coin)
 
-# Exact reduced-domain symbolic falsification gate. Affine and degree<=2 ANF
-# recovery are linear in the unknown attacker coefficients, so a bit-packed
-# Gaussian elimination over GF(2) is both complete for this attacker class and
-# dramatically cheaper than a general SMT solver.
 add_executable(v0id-symbolic-series-audit
     src/integrity/symbolic_series_audit.cpp
 )
 target_link_libraries(v0id-symbolic-series-audit PRIVATE v0id_core)
 
-# Next attacker language: one shared bounded 8-bit straight-line program across
-# the reduced-root family. Z3 may choose sources, immediates and output bits from
-# XOR/AND/ADD/NOT/shift/rotate. Root bits are searched independently so UNKNOWN
-# remains localized. The CEGIS loop rejects candidates against all 256 reduced
-# roots and treats solver UNKNOWN as inconclusive, never as PASS. Z3 remains an
-# audit-only dependency and never enters production V0ID.
 option(V0ID_ENABLE_Z3_BITVECTOR_AUDIT
     "Build the optional Z3 bounded bitvector attacker audit" ON)
 if(V0ID_ENABLE_Z3_BITVECTOR_AUDIT)
     find_path(V0ID_Z3_INCLUDE_DIR z3++.h)
     find_library(V0ID_Z3_LIBRARY NAMES z3 libz3)
     if(V0ID_Z3_INCLUDE_DIR AND V0ID_Z3_LIBRARY)
-        # Exact reduced-domain lifting of production KMAC series outputs into Z3.
-        # This does not symbolically implement SHA3/KMAC; it is a 256-root audit
-        # model used by stronger symbolic experiments.
         add_library(v0id_z3_series_model
             src/integrity/z3_series_model.cpp
         )
@@ -356,17 +368,10 @@ if(V0ID_ENABLE_MATHVM)
     target_link_libraries(v0id-wasm-polymorph-demo PRIVATE v0id_wasm_polymorph)
 endif()
 
-add_executable(v0id
-    src/main.cpp
-    src/integrity/toy_fingerprint.cpp
-)
-target_include_directories(v0id PRIVATE src/integrity)
-target_link_libraries(v0id PRIVATE v0id_core v0id_quine OpenSSL::Crypto)
+add_executable(v0id src/main.cpp)
+target_link_libraries(v0id PRIVATE v0id_core OpenSSL::Crypto)
 v0id_use_openfhe(v0id)
 
-# ZeroMQ remains the transport framing layer. Optional content-addressed Wasm
-# synchronization uses OpenSSL SHA3-512 for exact module identity; executable
-# validation remains the responsibility of WAMR/MathVM after receipt.
 add_library(v0id_net
     src/net/peer_transport.cpp
     src/net/module_sync.cpp
@@ -376,6 +381,63 @@ target_link_libraries(v0id_net PUBLIC cppzmq OpenSSL::Crypto)
 
 add_executable(v0id-module-sync-tests src/net/module_sync_tests.cpp)
 target_link_libraries(v0id-module-sync-tests PRIVATE v0id_net)
+
+# Local operator control plane. The C++ process remains authoritative; the PHP
+# frontend only reads state snapshots and queues bounded JSON commands. This
+# target intentionally stays independent of OpenFHE/TFHE so it can also be
+# embedded into future client/cloud executors without pulling GPU state into PHP.
+add_library(v0id_control
+    src/control/local_control.cpp
+)
+target_include_directories(v0id_control PUBLIC
+    src/control
+    src/net
+    src/polymorph
+    src/crypto
+)
+target_link_libraries(v0id_control PUBLIC
+    v0id_core
+    v0id_net
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+)
+if(V0ID_ENABLE_MATHVM)
+    target_include_directories(v0id_control PUBLIC src/mathvm)
+    target_link_libraries(v0id_control PUBLIC
+        v0id_mathvm
+        v0id_wasm_polymorph
+    )
+    target_compile_definitions(v0id_control PRIVATE
+        V0ID_CONTROL_HAVE_MATHVM=1)
+endif()
+
+add_executable(v0id-local-control
+    src/control/local_control_main.cpp
+)
+target_link_libraries(v0id-local-control PRIVATE v0id_control)
+
+add_library(v0id_neural
+    src/neural/neural_graph.cpp
+)
+target_include_directories(v0id_neural PUBLIC
+    src/neural
+    src/net
+)
+target_link_libraries(v0id_neural PUBLIC
+    v0id_net
+    OpenSSL::Crypto
+)
+
+add_executable(v0id-neural-graph-tests
+    src/neural/neural_graph_tests.cpp
+)
+target_link_libraries(v0id-neural-graph-tests PRIVATE v0id_neural)
+
+add_custom_target(v0id-test-neural-graph
+    COMMAND $<TARGET_FILE:v0id-neural-graph-tests>
+    DEPENDS v0id-neural-graph-tests
+    USES_TERMINAL
+    COMMENT "Running V0ID modular neural graph regression tests")
 
 add_executable(v0id-peer src/net/peer_demo.cpp)
 target_link_libraries(v0id-peer PRIVATE v0id_net)
@@ -388,7 +450,6 @@ v0id_use_openfhe(v0id-fhe-peer)
 add_executable(v0id-remote-machine
     src/net/remote_machine_demo.cpp
     src/fhe/remote_machine.cpp
-    src/integrity/toy_fingerprint.cpp
 )
 target_include_directories(v0id-remote-machine PRIVATE
     src/fhe
@@ -412,5 +473,4 @@ if(UNIX AND NOT APPLE)
     target_link_options(v0id-fhe-peer PRIVATE -Wl,--no-as-needed)
     target_link_options(v0id-remote-machine PRIVATE -Wl,--no-as-needed)
     target_link_options(v0id-malicious-evaluator-harness PRIVATE -Wl,--no-as-needed)
-    target_link_options(v0id-round-morph-fhe-harness PRIVATE -Wl,--no-as-needed)
 endif()

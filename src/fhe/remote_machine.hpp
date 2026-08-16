@@ -1,5 +1,6 @@
 #pragma once
 
+#include "program.hpp"
 #include "remote_machine_codec.hpp"
 
 #include "binfhecontext.h"
@@ -8,6 +9,19 @@
 #include <vector>
 
 namespace v0id::fhe {
+
+// Canonical client-side transition encoding consumed by RemoteEncryptedMachine:
+// for each public (state, read) row, append next-state one-hot bits, write bit,
+// then move-left/stay/right one-hot bits.
+std::vector<int> canonical_remote_program_bits(
+    const v0id::core::Program& program);
+
+// Encrypt a binary vector as independently encrypted BinFHE ciphertexts. This is
+// generic remote-machine client plumbing, not an integrity/fingerprint primitive.
+std::vector<lbcrypto::LWECiphertext> encrypt_remote_bits(
+    lbcrypto::BinFHEContext& cc,
+    const lbcrypto::LWEPrivateKey& sk,
+    const std::vector<int>& bits);
 
 // Fixed-path evaluator for a fully encrypted machine image received from a
 // remote client. It owns no secret key and never branches on encrypted program

@@ -1,8 +1,6 @@
 # V0ID
 
-Research prototype for exact encrypted, runtime-programmable computation with client-side polymorphism, series-first morph derivation, remote BinFHE evaluation and sandboxed Wasm extension layers.
-
-**Current research scaffold: V0.4.5.**
+Research prototype for exact encrypted, runtime-programmable computation with client-side polymorphism, series-first morph derivation, remote FHE evaluation, SHA3-based integrity research and sandboxed Wasm extension layers.
 
 V0ID is experimental research code, not audited production cryptography. The repository intentionally distinguishes runtime-proven plumbing milestones from implemented-but-unverified changes and from security conjectures.
 
@@ -22,24 +20,30 @@ V0ID is experimental research code, not audited production cryptography. The rep
           |                                    /       |        \
  trusted ProgramMorpher                    scalar    bytes    optional PQ
           |
- OpenFHE BinFHE
+ encrypted program/state
           |
- cached remote evaluator
+ OpenFHE BinFHE remote path
+          +-------------------+
+          |                   |
+          |             TFHE-rs CUDA
+          |             Boolean-program path
+          v                   |
+ cached remote evaluator      v
+                       local CUDA stress boundary
 ```
 
 The execution paths solve different problems:
 
 - the encrypted Turing-machine-like interpreter is the universal exact path when program/state semantics should remain hidden from the evaluator;
+- the compact Boolean-program image is a fixed-width private program representation currently used for the SHA3-512/FHE experiments;
 - local `WasmSeriesGenerator` is a client-only programmable polymorphism strategy that derives private morph material before encryption;
 - remote MathVM is the bounded portable path when the Wasm composition itself may be visible but arbitrary peer-supplied native plugins are not acceptable.
 
-Wasm does **not** replace the encrypted Turing machine and an RMJ3 encrypted-machine job does not need to carry a Wasm program. The local polymorphism Wasm is not transmitted to the evaluator.
+Wasm does **not** replace the encrypted machine and an RMJ4 encrypted-machine job does not need to carry a Wasm program. The local polymorphism Wasm is not transmitted to the evaluator.
 
-## Proven V0.4 remote-machine milestone
+## Proven remote-machine baseline
 
-The V0.4 whole-machine path has been run successfully across two local processes.
-
-The client sent encrypted transition/state/head/tape/integrity material; the evaluator executed four fixed BinFHE rounds without receiving the LWE secret key or `MorphManifest` and returned encrypted state.
+The original V0.4 whole-machine path was run successfully across two local processes. The client sent encrypted transition/state/head/tape material; the evaluator executed four fixed BinFHE rounds without receiving the LWE secret key or `MorphManifest` and returned encrypted state.
 
 The client recovered:
 
@@ -48,18 +52,9 @@ The client recovered:
 13 -> 14
 ```
 
-and verified its private integrity candidate.
+That early run transferred roughly 551 MB in the request because BinFHE context/bootstrap material was embedded in each job. RMS3 later separated expensive evaluator setup from recurring jobs.
 
-That run transferred roughly:
-
-```text
-request: ~551 MB
-result : ~666 KB
-```
-
-because BinFHE context/bootstrap material was embedded in each job.
-
-## V0.4.1: series first -> morph later
+## Series first -> morph later
 
 The client-side morph path supports `PolymorphicSeriesGenerator`:
 
@@ -82,15 +77,13 @@ PolymorphicSeriesGenerator
              morphed machine image
 ```
 
-The built-in profile is `v0id-series-kmac-v1`. The private series, series seed, derived morph seed and `MorphManifest` remain client-side.
-
-This is series-first plumbing, not a proof that arbitrary generated series are intrinsically post-quantum hard.
+The built-in profile is `v0id-series-kmac-v1`. The private series, series seed, derived morph seed and `MorphManifest` remain client-side. This is series-first plumbing, not a proof that arbitrary generated series are intrinsically post-quantum hard.
 
 See `docs/SERIES_GENERATOR.md`.
 
-## V0.4.3: cached BinFHE evaluator sessions
+## Cached evaluator sessions: RMS3
 
-V0.4.3 changes the remote-machine protocol to RMS3/RMJ3/RMR3 so expensive evaluator material can be installed once and reused.
+RMS3 installs expensive evaluator material once:
 
 ```text
 RMS3 once
@@ -101,24 +94,92 @@ RMS3 once
           |
           v
  evaluator BTKeyLoad + process-local cache
-          |
-          v
-RMJ3 each job
-    session id
-    encrypted machine material only
 ```
 
-The evaluator demo keeps up to four process-local sessions. Duplicate/all-zero IDs are rejected. The session ID is generated independently of `SeriesSeed` and is public routing/cache state rather than key material.
+The evaluator demo keeps a bounded process-local cache. Duplicate/all-zero IDs are rejected. The session ID is generated independently of `SeriesSeed` and is public routing/cache state rather than key material.
 
-An RMJ3 job must match the cached session's primitive and parameter set; RMR3 echoes session ID and full public crypto profile and the client requires exact matches.
+## Current remote job wire: RMJ4 / RMR4
 
-**Status:** implemented, not yet rebuilt/run on the development host after the V0.4.3 caching change. The next remote runtime gate is to confirm the existing series-derived `13 -> 14` computation and measure one-time RMS3 bytes versus recurring RMJ3 bytes.
+The recurring remote-machine wire has moved from RMJ3/RMR3 to RMJ4/RMR4 because the retired ToyFingerprint fields were removed instead of retained as dead compatibility baggage.
+
+```text
+RMJ4 each job
+    evaluator session id
+    fixed public shape/profile
+    encrypted zero
+    encrypted program bits
+    encrypted state bits
+    encrypted head bits
+    encrypted tape bits
+
+RMR4 result
+    evaluator session id
+    same public shape/profile
+    encrypted final state
+    encrypted final head
+    encrypted final tape
+```
+
+RMS3 remains the reusable evaluator-session format. RMJ4/RMR4 are intentionally wire-incompatible with RMJ3/RMR3.
 
 See `docs/REMOTE_MACHINE.md`.
 
-## V0.4.2 baseline: WAMR MathVM sandbox
+## SHA3-512 private program path
 
-V0.4.2 embedded WebAssembly Micro Runtime (WAMR), pinned to `WAMR-2.4.0`, with a deliberately narrow profile:
+The current research branch contains two SHA3 construction layers:
+
+- an auditable BooleanIR using XOR / AND / NOT with Keccak rho/pi represented as wiring;
+- a compact 64-bit-lane Boolean program image with seven fixed-width operation classes.
+
+The compact one-block SHA3-512 image uses 60 registers. The canonical image has 2073 instructions; the current deterministic polymorphic stress image permutes the register identities and inserts 32 semantics-preserving identity instructions for 2105 total instructions.
+
+The fixed-path encrypted evaluator keeps opcode, source/destination register ids, input index, rotate amount and immediate encrypted, evaluates every candidate operation and homomorphically selects the active result.
+
+### TFHE-rs CUDA
+
+An optional Rust `cdylib` sidecar uses TFHE-rs 1.6.1 with its CUDA backend. It is exposed to C++ through a small C ABI and built with the `gpu-fhe` CMake preset.
+
+Current boundary:
+
+```text
+trusted local C++/Rust sidecar
+    keygen + encrypt program/input
+             |
+             v
+       TFHE-rs CUDA VM
+             |
+             v
+       local decrypt/check
+```
+
+This is a real CUDA FHE execution path but still a **local differential/stress boundary**, not the final remote protocol. The next protocol split is client-side keygen/encryption/serialization versus evaluator-side server-key-only execution.
+
+The repository owner has built the CUDA path successfully on an RTX 5070 and observed the full mutated SHA3 stress test enter GPU execution. The current high-level universal VM implementation takes roughly 32 seconds per encrypted instruction on that machine, so the full 2105-instruction run is a performance stress case rather than a routine regression test.
+
+## Integrity status
+
+`ToyFingerprint32` has been **retired and removed**. Its plaintext/FHE mixer, candidate-mask bank, dedicated FHE harness and RMJ3/RMR3 wire fields are gone. Generic machine-bit serialization/encryption helpers that were useful independently of the toy experiment were moved into `remote_machine.*`.
+
+The current integrity research is split deliberately:
+
+```text
+SHA3-512 quine commitment
+    binds the issuer's intended job/context
+    does NOT prove remote execution
+
+SHA3-512 round receipt
+    binds observed encrypted round states to job/session/profile
+    attacks skip/replay/splice shortcuts
+    is still research, not a universal proof of correct computation
+```
+
+The malicious-evaluator harness now compares final-output-only verification directly against the round-receipt construction. It no longer computes a legacy toy fingerprint.
+
+Longer-term work is to bind integrity state more tightly to execution progress/final state and make the verification mechanism harder to detach from the polymorphed computation itself.
+
+## WAMR MathVM sandbox
+
+V0ID embeds WebAssembly Micro Runtime (WAMR), pinned to `WAMR-2.4.0`, with a deliberately narrow profile:
 
 ```text
 classic interpreter       ON
@@ -131,120 +192,15 @@ multi-module              OFF
 mini-loader               OFF
 ```
 
-V0ID pre-validates raw Wasm imports and linear-memory declarations before WAMR loads a module. The earlier rejection-boundary suite was runtime-verified:
+V0ID pre-validates raw Wasm imports and linear-memory declarations before WAMR loads a module. The remote MathVM exposes bounded scalar and byte-provider ABIs rather than arbitrary peer-supplied native plugins.
 
-```text
-V0ID MathVM sandbox tests: 11 passed, 0 failed
-OK: local MathVM sandbox rejection boundary exercised
-```
-
-The external scalar guest was also runtime-verified:
-
-```text
-module bytes         : 458
-result               : 1596
-provider calls       : 3
-provider cost        : 130
-```
-
-That establishes the scalar/WAMR baseline; it is not a proof that WAMR or the V0ID host ABI is vulnerability-free.
-
-## V0.4.4: MathVM primitive ABI v2
-
-V0.4.4 turns the primitive layer from a scalar demo into a usable bounded crypto-provider interface.
-
-ABI v1 scalar import remains:
-
-```text
-v0id_math.primitive_u64(
-    tag, version,
-    a, b, c, d
-) -> u64
-```
-
-ABI v2 adds:
-
-```text
-v0id_math.primitive_bytes(
-    tag, version,
-    input_ptr, input_len,
-    output_ptr, output_capacity
-) -> i32 written
-```
-
-The host validates complete Wasm input/output ranges, copies the input into host-owned memory, enforces global and per-provider byte limits, invokes the typed provider, checks the returned size and copies the result back into the validated Wasm buffer.
-
-Provider descriptors declare stable tag, canonical id, version, abstract cost, experimental flag, ABI kind and byte limits. A byte provider cannot be invoked through the scalar host call and vice versa.
-
-### Built-in providers
-
-```text
-0x00010001  v0id.math.add-mod-u64/v1
-0x00010002  v0id.math.mul-mod-u64/v1
-0x00020001  v0id.crypto.sha3-256/v1                     [bytes]
-0x00030301  v0id.pq.ml-kem-768.encapsulate/v1           [bytes, optional]
-0x7fff0001  v0id.experimental.toy-lwe-affine-u64/v1     [EXPERIMENTAL]
-```
-
-`v0id.crypto.sha3-256` is an actual SHA3-256 provider backed by OpenSSL. `v0id.pq.ml-kem-768.encapsulate` wraps OpenSSL's standardized ML-KEM-768 KEM implementation when the linked OpenSSL provider exposes it. Only encapsulation is exposed; there is deliberately no remote decapsulation provider that would encourage sending a client's private KEM key to an untrusted evaluator.
-
-The toy affine provider still computes only:
-
-```text
-b = a*s + e mod q
-```
-
-and remains interface plumbing, **not LWE encryption and not a PQ security claim**.
-
-### Runtime-verified V0.4.4 gate
-
-The development host has now run:
-
-```text
-V0ID MathVM sandbox/provider tests: 16 passed, 0 failed
-V0ID MathVM byte-boundary tests:    4 passed, 0 failed
-```
-
-The passing gate includes SHA3-256 known-answer testing, a real ML-KEM-768 encapsulate/decapsulate round trip, undeclared/ABI mismatch rejection, instruction/provider budgets, input/output OOB rejection and sandbox recovery after traps.
-
-The external compiled SHA3 guest also ran successfully:
-
-```text
-V0ID MathVM ABI      : v2
-module bytes         : 671
-result               : 32
-provider calls       : 1
-provider cost        : 256
-```
-
-The UBSan-aware WAMR build also completed the 16-test suite successfully. The separate ASan build remains blocked by WAMR 2.4.0's native-stack-overflow detector before the test body and is not claimed as ASan-clean.
+Built-in/provider experiments include SHA3-256 and optional ML-KEM-768 through OpenSSL where the linked provider exposes it. Experimental toy arithmetic providers are explicitly not cryptographic security claims.
 
 See `docs/MATHVM.md`.
 
-## MathVM resource limits
+## Client-only Wasm polymorphism
 
-Default limits are:
-
-```text
-Wasm module             <= 1 MiB
-linear memory           <= 16 pages / 1 MiB
-stack                   <= 64 KiB
-host-managed app heap   disabled
-WAMR runtime pool       <= 16 MiB
-Wasm instructions       <= 1,000,000
-provider calls          <= 4,096
-provider cost           <= 1,000,000 units
-provider input buffer   <= 256 KiB
-provider output buffer  <= 256 KiB
-```
-
-The host-managed app heap is disabled because WAMR inserts it into the module's linear-memory allocation and can otherwise enlarge the actually addressable range beyond the module-declared page count. V0ID keeps `max_memory_pages` as the meaningful hard linear-memory ceiling for this profile.
-
-Native provider work has separate call/cost limits because time spent inside native crypto is not represented by Wasm instruction metering.
-
-## V0.4.5: client-only Wasm polymorphism
-
-V0.4.5 adds `WasmSeriesGenerator` as a second `PolymorphicSeriesGenerator` implementation.
+`WasmSeriesGenerator` is a second `PolymorphicSeriesGenerator` implementation:
 
 ```text
 private SeriesSeed + semantic input + epoch
@@ -254,11 +210,7 @@ private SeriesSeed + semantic input + epoch
           local WAMR only
                   |
                   v
-       V0P1 bounded envelope
-      series + MorphSeed + manifest
-                  |
-                  v
-          trusted validation
+       bounded private envelope
                   |
                   v
             ProgramMorpher
@@ -267,56 +219,13 @@ private SeriesSeed + semantic input + epoch
              morphed TM
 ```
 
-The local Wasm profile is intentionally stricter than remote MathVM:
-
-```text
-host imports             0 / forbidden
-WASI/filesystem/network  unavailable
-clock/RNG imports        unavailable
-start function           forbidden
-host-managed app heap    disabled
-instruction metering     enabled
-bounded Wasm32 memory    required
-```
-
-The guest never receives the `Program` transition table. It returns only a canonical `V0P1` envelope containing a private series, 32-byte `MorphSeed` and private manifest. Trusted C++ validates the envelope and keeps state permutation, dummy-state insertion, transition rewriting and integrity placement inside `ProgramMorpher`.
-
-**Status:** implementation and self-contained tests are in-tree; runtime verification of the V0.4.5 gate is pending.
+The local Wasm profile forbids host imports, WASI/filesystem/network, clock/RNG imports and start functions, and uses bounded Wasm32 memory plus instruction metering. The guest never receives the plaintext `Program` transition table.
 
 See `docs/POLYMORPH_WASM.md`.
 
-### V0.4.5 test gate
+## Remote encrypted-machine demo
 
-```sh
-git pull
-cmake -S . -B build
-cmake --build build -j --target v0id-wasm-polymorph-tests
-./build/v0id-wasm-polymorph-tests
-```
-
-The suite constructs tiny Wasm modules in memory and checks deterministic derivation, epoch/input sensitivity, V0P1 parsing, import/memory/output rejection, instruction metering and semantic preservation through trusted `ProgramMorpher`.
-
-External guest:
-
-```sh
-clang --target=wasm32 -O2 -nostdlib \
-  -Wl,--no-entry \
-  -Wl,--export=v0id_buffer_base \
-  -Wl,--export=v0id_polymorph \
-  -Wl,--initial-memory=1048576 \
-  -Wl,--max-memory=1048576 \
-  examples/polymorph/series_mixer.c \
-  -o build/series_mixer.wasm
-
-cmake --build build -j --target v0id-wasm-polymorph-demo
-./build/v0id-wasm-polymorph-demo build/series_mixer.wasm
-```
-
-`series_mixer.c` is demonstration plumbing, not a cryptographic PRF/KDF claim.
-
-## V0.4.3 remote encrypted-machine demo
-
-Build both sides from the same checkout because RMJ3 is wire-incompatible with RMJ2:
+Build both sides from the same checkout because RMJ4/RMR4 are intentionally wire-incompatible with the previous job/result format:
 
 ```sh
 git pull
@@ -336,24 +245,31 @@ Client:
 ./build/v0id-remote-machine client CLIENT tcp://127.0.0.1:7003
 ```
 
-The client prints one-time session setup bytes and recurring RMJ3 per-job bytes so the caching win can be measured directly.
+The client prints one-time RMS3 session setup bytes and recurring RMJ4 per-job bytes so the caching win can be measured directly.
 
-## Integrity status
+## CUDA stress build
 
-`ToyFingerprint32` remains test-only plumbing. It binds the encrypted morphed job image plus initial input/nonce and demonstrates private integrity-candidate placement, but it does not prove that every requested remote round was honestly performed.
+```sh
+cmake --preset gpu-fhe
+cmake --build --preset gpu-fhe
 
-The longer-term integrity experiment is to bind verification state to **execution progress/final state** and interleave it with the polymorphed encrypted machine so an evaluator cannot trivially identify and preserve only the checking logic. Polymorphism can help hide structural roles; it does not by itself constitute a proof of correct execution.
+CUDA_MODULE_LOADING=EAGER \
+./build-gpu/v0id-encrypted-boolean-program-tests
+```
+
+The full SHA3 stress target is deliberately heavy. Fast correctness regression remains covered by the plaintext/OpenSSL and compact-image tests.
 
 ## Dependencies
 
 - C++20 compiler
 - C compiler for embedded WAMR sources
-- CMake >= 3.20
+- CMake >= 3.20 (GPU preset/hook requires newer CMake features)
 - Git during first configure
 - OpenFHE with `OpenFHEConfig.cmake`
-- OpenSSL >= 3 with `KMAC-256` and SHA3-256
+- OpenSSL >= 3 with KMAC-256 and SHA3 support
 - OpenSSL 3.5+ provider support only if ML-KEM-768 capability is desired
 - threads support
+- optional Rust/Cargo + NVIDIA CUDA toolkit for the TFHE-rs CUDA sidecar
 
 Fetched dependencies currently include:
 
@@ -368,43 +284,45 @@ src/core/program.hpp                         machine Rule / Program representati
 src/polymorph/program_morpher.*              semantic morph compiler + private manifest
 src/polymorph/series_generator.*             built-in/functional series-first layer
 src/polymorph/wasm_series_generator.*        client-only WAMR series generator
-src/polymorph/wasm_series_tests.cpp          local Wasm polymorphism regression gate
-src/polymorph/wasm_series_demo.cpp           external local Wasm guest runner
-src/integrity/toy_fingerprint.*              test-only plaintext/FHE fingerprint
-src/fhe/fhe_codec.hpp                        OpenFHE serialization helpers
-src/fhe/remote_machine_codec.hpp             RMS3/RMJ3/RMR3 session/job wire format
-src/fhe/remote_machine.*                     fixed-path encrypted evaluator
+src/integrity/boolean_ir.*                   auditable Boolean construction layer
+src/integrity/keccak_program_image.*         compact SHA3/Keccak program image
+src/integrity/quine_hash.*                   client SHA3-512 commitment
+src/integrity/round_receipt.*                execution-bound receipt research
+src/integrity/malicious_evaluator_harness.cpp adversarial execution harness
+src/fhe/encrypted_boolean_program.*          fixed-path OpenFHE Boolean evaluator
+src/fhe/gpu_fhe_backend.*                    TFHE-rs CUDA C++ adapter
+src/fhe/remote_machine_codec.hpp             RMS3/RMJ4/RMR4 wire format
+src/fhe/remote_machine.*                     fixed-path encrypted machine evaluator
 src/net/peer_transport.*                     binary ZeroMQ envelope transport
 src/net/remote_machine_demo.cpp              cached remote encrypted-machine demo
-src/mathvm/mathvm.*                          typed primitive registry / MathVM ABI v2
-src/mathvm/wamr_sandbox.*                    WAMR policy + scalar/byte host boundary
-src/mathvm/mathvm_demo.cpp                    external remote-visible Wasm demo runner
-src/mathvm/mathvm_tests.cpp                   sandbox/provider regression gate
-src/mathvm/byte_boundary_tests.cpp            explicit ABI-v2 pointer/length gate
-examples/mathvm/series_math.c                 no-WASI scalar composition guest
-examples/mathvm/sha3_bytes.c                  no-WASI bounded byte-provider guest
-examples/polymorph/series_mixer.c             client-only Wasm polymorphism guest
+src/mathvm/mathvm.*                          typed primitive registry / MathVM ABI
+src/mathvm/wamr_sandbox.*                    WAMR policy + host boundary
+docs/REMOTE_MACHINE.md                       current remote session/job protocol
 docs/POLYMORPHISM.md                         morph/correlation threat model
 docs/SERIES_GENERATOR.md                     series-first research boundary
-docs/POLYMORPH_WASM.md                       local Wasm polymorphism ABI/boundary
-docs/REMOTE_MACHINE.md                       remote encrypted-machine/session protocol
+docs/POLYMORPH_WASM.md                       local Wasm polymorphism boundary
 docs/MATHVM.md                               WAMR sandbox/provider architecture
 ```
 
 ## Next milestones
 
-Immediate order:
+Immediate direction:
 
 ```text
-1. build/run V0.4.5 local Wasm polymorphism gate
-2. compile/run the external series_mixer.wasm demo
-3. if both pass, optionally wire WasmSeriesGenerator into the remote-machine client path
-4. rebuild/run V0.4.3 RMS3 -> cached evaluator -> RMJ3 -> BinFHE -> remote -> 14
-5. record actual one-time evaluator setup bytes vs recurring RMJ3 bytes
-6. move next to execution-bound integrity / cheap verification research
-7. continue generated-relation / series-first primitive research only under explicit assumptions
+1. keep the working CPU/GPU FHE paths as correctness/performance baselines
+2. split TFHE client keygen/encryption/serialization from remote server-key evaluation
+3. define fixed public execution-envelope classes to reduce shape fingerprinting
+4. bind session/job/profile/program/input/result context canonically
+5. continue execution-bound integrity / cheap-verification research
+6. attack skip/replay/splice/adaptive-evaluator strategies explicitly
 ```
 
 Parallel later work includes distributed encrypted tape, trace classification, stronger polymorphism, authenticated session/profile binding, encrypted halt/no-op semantics and checkpoint/resume.
 
-V0ID currently favors explicit research boundaries over features that cannot explain why they exist.
+V0ID favors explicit research boundaries over features that cannot explain why they exist.
+
+## License
+
+V0ID is dual-licensed under the Apache License, Version 2.0 or the MIT License, at your option. See `LICENSE-APACHE`, `LICENSE-MIT`, and the top-level `LICENSE` notice.
+
+Third-party dependencies and bundled third-party components remain subject to their respective licenses.

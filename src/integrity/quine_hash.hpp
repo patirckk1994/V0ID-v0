@@ -15,9 +15,11 @@ namespace v0id::integrity {
 using AuditChallenge256 = std::array<std::uint8_t, 32>;
 using QuineDigest512 = std::array<std::uint8_t, 64>;
 
-// Plaintext client-side context committed by QuineHash512. This is deliberately
-// separate from the toy FHE fingerprint. The quine commitment uses standardized
-// SHA3-512/KMAC-256 through OpenSSL; it does not claim to prove remote execution.
+// Plaintext client-side context committed by QuineHash512. This uses
+// standardized SHA3-512/KMAC-256 through OpenSSL and binds the issuer's intended
+// job image/context. It is a commitment, not evidence that a remote evaluator
+// honestly performed every requested transition; execution-bound verification
+// is handled by separate round-receipt/integrity experiments.
 struct QuineHashContext {
     v0id::fhe::PublicMachineShape shape;
     v0id::fhe::CryptoProfileId profile;

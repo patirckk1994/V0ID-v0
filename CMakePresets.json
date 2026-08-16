@@ -1,0 +1,29 @@
+{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "gpu-fhe",
+      "displayName": "V0ID TFHE-rs CUDA",
+      "description": "Build the encrypted Boolean program stress path with the TFHE-rs CUDA sidecar",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-gpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "V0ID_ENABLE_MATHVM": "OFF",
+        "V0ID_ENABLE_Z3_BITVECTOR_AUDIT": "OFF",
+        "V0ID_ENABLE_GPU_FHE": "ON",
+        "CMAKE_PROJECT_INCLUDE": "",
+        "CMAKE_PROJECT_TOP_LEVEL_INCLUDES": "",
+        "CMAKE_PROJECT_v0id_INCLUDE": "${sourceDir}/cmake/V0idTfheRemoteControl.cmake"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "gpu-fhe",
+      "configurePreset": "gpu-fhe",
+      "targets": ["v0id-encrypted-boolean-program-tests"],
+      "jobs": 24
+    }
+  ]
+}

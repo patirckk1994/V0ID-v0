@@ -1,6 +1,6 @@
 # V0ID series-first polymorphism
 
-V0.4.1 introduced a client-side `PolymorphicSeriesGenerator` layer in front of `ProgramMorpher`. V0.4.5 adds a sandboxed local Wasm implementation of that interface.
+The client-side `PolymorphicSeriesGenerator` layer sits in front of `ProgramMorpher`. The generator is deliberately replaceable: KMACXOF256 is the built-in private-series implementation, not a hard-coded dependency of the polymorphism engine.
 
 The purpose remains experimental: make the "series first, algorithm/representation later" idea a concrete object that can be generated, replaced, measured and attacked without pretending the conjecture is already a cryptographic theorem.
 
@@ -13,9 +13,10 @@ semantic input
           |
           v
 PolymorphicSeriesGenerator
-   |                  |
+   |                  |                     |
+   |                  |                     +--> FunctionalSeriesGenerator
    |                  +--> WasmSeriesGenerator (client-only WAMR)
-   +--> KmacSeriesGenerator
+   +--> KmacSeriesGenerator (KMACXOF256 v2 built-in)
           |
           +--> private derived series
           +--> private series manifest/provenance
@@ -28,19 +29,70 @@ PolymorphicSeriesGenerator
              morphed program image
                     |
                     v
-                  BinFHE
+                  FHE
                     |
                     v
             remote fixed evaluator
 ```
 
-The private series, `SeriesSeed`, derived `MorphSeed`, private series manifest and `MorphManifest` are not sent to the remote evaluator.
+The private `SeriesSeed`, generated series, derived `MorphSeed`, private manifest and morph manifest are client-local material and are not evaluator inputs.
 
-## Built-in KMAC generator
+## Built-in KMACXOF256 generator
 
-`v0id-series-kmac-v1` uses OpenSSL 3 KMAC-256 under separate domain strings to derive a byte series, morph seed and small client-only provenance token. The current remote demo uses a 64-byte private series.
+The built-in profile is:
 
-This inherits ordinary assumptions from the cryptographic primitive it uses. It does **not** establish that arbitrary generated series are intrinsically quantum-hard, information-theoretically hidden or a new post-quantum primitive.
+```text
+v0id-series-kmacxof256-v2
+```
+
+It uses OpenSSL 3 `KMAC-256` with XOF mode enabled to expand an issuer-only 256-bit root into an arbitrary-length private series. The output length is a local generator parameter rather than a protocol assumption.
+
+Separate customization strings/domain labels derive:
+
+```text
+V0ID private polymorphic series v2
+V0ID trusted ProgramMorpher seed v2
+V0ID private series provenance v2
+```
+
+The separation prevents series bytes, morpher material and private provenance from being treated as interchangeable output from one undifferentiated stream.
+
+This gives the built-in schedule a standardized keyed PRF/XOF base. It does **not** establish that arbitrary generated series are intrinsically quantum-hard, information-theoretically hidden, or a new post-quantum primitive.
+
+## Generator interface is the architecture
+
+Consumers depend on the abstract interface:
+
+```cpp
+class PolymorphicSeriesGenerator {
+public:
+    virtual ~PolymorphicSeriesGenerator() = default;
+
+    virtual SeriesProfile profile() const = 0;
+    virtual DerivedSeries derive(
+        const std::vector<std::uint8_t>& input,
+        const SeriesSeed& seed,
+        std::uint64_t epoch) const = 0;
+};
+```
+
+`ProgramMorpher` must not call KMACXOF256 directly. The intended dependency direction is:
+
+```text
+PolymorphicSeriesGenerator
+          |
+   +------+------+----------------+
+   |             |                |
+KMACXOF256      Wasm          custom C++
+   |             |                |
+   +-------------+----------------+
+                 |
+           DerivedSeries
+                 |
+           ProgramMorpher
+```
+
+This keeps the cryptographic/default generator replaceable without rewriting the morphing engine.
 
 ## Trusted C++ callback generator
 
@@ -66,9 +118,9 @@ v0id::polymorph::FunctionalSeriesGenerator generator(
 
 This is trusted process-local code, not a network plugin loader.
 
-## V0.4.5 Wasm generator
+## Wasm generator
 
-`WasmSeriesGenerator` lets the client use a portable local Wasm strategy without recompiling V0ID.
+`WasmSeriesGenerator` lets the client use a portable local Wasm strategy without recompiling the core polymorphism engine.
 
 The Wasm receives only private `SeriesSeed`, semantic input and epoch through bounded guest linear memory. It returns a canonical `V0P1` envelope containing:
 
@@ -78,28 +130,26 @@ private series
 private manifest
 ```
 
-It does **not** receive `Program`, does not rewrite transition rules and has zero host imports. Trusted C++ validates the envelope and passes only the resulting morph material into `ProgramMorpher`.
+It does not receive `Program`, does not rewrite transition rules and has zero host imports. Trusted C++ validates the envelope and passes only the resulting morph material into `ProgramMorpher`.
 
 This is deliberately narrower than a general plugin system. See `docs/POLYMORPH_WASM.md` for the ABI and sandbox policy.
 
-## Public profile identifier
+## Public profile metadata
 
-The current remote-machine wire format uses RMS3/RMJ3/RMR3 and carries a bounded public `CryptoProfileId`, including:
+A remote protocol may carry a bounded `series_generator_id` and `series_generator_version` as provenance/interoperability metadata. That public profile does **not** contain the private series or private root and must not be treated as enough information to reproduce client polymorphism.
 
-```text
-primitive_id              openfhe-binfhe
-parameter_set             STD128
-machine_protocol          v0id-remote-machine-v3
-integrity_profile         toy-fingerprint32-v1
-series_generator_id       <client-selected public provenance id>
-series_generator_version  <version>
-```
+A private Wasm/custom strategy may intentionally expose only a coarse profile identifier if revealing exact implementation identity would defeat the intended privacy policy. Any future authenticated suite negotiation should bind that policy explicitly and prevent downgrade.
 
-The evaluator does not execute the series generator. Its public id/version is provenance metadata and is echoed back so the client can require an exact profile match.
+## Tests
 
-A future client using a private Wasm strategy may intentionally expose only a coarse public profile id rather than a module hash if revealing exact strategy identity would defeat the point of client-private polymorphism. That policy has not yet been standardized.
+`v0id-round-morph-schedule-tests` now checks that:
 
-There is not yet an authenticated suite handshake or downgrade protection.
+- the built-in profile is `v0id-series-kmacxof256-v2`;
+- requested KMACXOF256 series lengths are honored;
+- longer XOF output preserves the shorter-output prefix for the same root/input/epoch;
+- identical root/input/epoch reproduces the same private series, morph seed and manifest;
+- changing the private root, semantic input or epoch changes the private series;
+- a `FunctionalSeriesGenerator` can replace KMACXOF256 through the same abstract interface without changing `ProgramMorpher`.
 
 ## Research questions
 
@@ -108,21 +158,21 @@ This layer provides a concrete place to measure:
 - how much diversity a generator actually induces in morphed machine images;
 - which input/program properties survive into evaluator-visible traces;
 - whether a classifier can correlate jobs produced from the same semantic program under different private series;
-- whether the KMAC and Wasm strategies measurably change structural-role inference;
+- whether KMACXOF256, Wasm and custom strategies measurably change structural-role inference;
 - which generator metadata must be public for interoperability;
 - whether any candidate generated-relation family admits a meaningful hardness statement beyond the assumptions of the standard primitives used inside its generator.
 
 The most important criterion is empirical/formal usefulness: if a classifier performs the same with and without a polymorphism layer, that layer has not earned a security claim.
 
-## Why the Wasm layer stays local
+## Why programmable generators stay local
 
-The local Wasm layer exists to make client-side strategies replaceable while keeping the remote attack surface unchanged.
+The local callback/Wasm seams exist to make client-side strategies replaceable while keeping the remote attack surface unchanged.
 
 ```text
-local Wasm strategy     -> programmable private derivation
-trusted ProgramMorpher  -> semantic machine rewrite
-BinFHE                   -> hidden values/program representation
+local private generator  -> programmable private derivation
+trusted ProgramMorpher   -> semantic machine rewrite
+FHE                      -> hidden values/program representation
 remote evaluator         -> fixed encrypted execution
 ```
 
-No `.so`, `.dll`, native machine-code plugin or polymorphism Wasm is accepted from an evaluator.
+No native plugin, generator Wasm, private root or private derived series is accepted from an evaluator.

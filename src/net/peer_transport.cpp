@@ -11,6 +11,7 @@ namespace {
 constexpr std::array<std::uint8_t, 8> MAGIC{'V','0','I','D','N','E','T','1'};
 constexpr std::uint8_t VERSION = 1;
 constexpr std::size_t HEADER_SIZE = 8 + 1 + 1 + 2 + 8 + 4 + 4 + 4;
+constexpr std::size_t MAX_MULTIPART_FRAMES = 16;
 
 void put_u32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     out.push_back(static_cast<std::uint8_t>((v >> 24) & 0xffu));
@@ -53,6 +54,14 @@ void configure_socket(zmq::socket_t& socket, int timeout_ms) {
     socket.set(zmq::sockopt::sndtimeo, timeout_ms);
 }
 
+void drain_remaining_frames(zmq::socket_t& socket) {
+    while (socket.get(zmq::sockopt::rcvmore)) {
+        zmq::message_t ignored;
+        const auto result = socket.recv(ignored, zmq::recv_flags::none);
+        if (!result) throw std::runtime_error("ZeroMQ receive timed out while draining multipart message");
+    }
+}
+
 void send_envelope(zmq::socket_t& socket, const Envelope& envelope) {
     const auto wire = envelope.encode();
     zmq::message_t message(wire.data(), wire.size());
@@ -64,7 +73,60 @@ Envelope recv_envelope(zmq::socket_t& socket) {
     zmq::message_t message;
     const auto result = socket.recv(message, zmq::recv_flags::none);
     if (!result) throw std::runtime_error("ZeroMQ receive timed out");
+    if (socket.get(zmq::sockopt::rcvmore)) {
+        drain_remaining_frames(socket);
+        throw std::runtime_error("unexpected multipart V0ID message on single-frame API");
+    }
     return Envelope::decode(message.data(), message.size());
+}
+
+void send_multipart(zmq::socket_t& socket, const MultipartEnvelope& message) {
+    if (message.frames.size() > MAX_MULTIPART_FRAMES)
+        throw std::runtime_error("too many V0ID multipart frames");
+
+    const auto wire = message.envelope.encode();
+    zmq::message_t header(wire.data(), wire.size());
+    const auto header_flags = message.frames.empty()
+        ? zmq::send_flags::none
+        : zmq::send_flags::sndmore;
+    if (!socket.send(header, header_flags))
+        throw std::runtime_error("ZeroMQ multipart header send timed out");
+
+    for (std::size_t i = 0; i < message.frames.size(); ++i) {
+        const auto& frame = message.frames[i];
+        zmq::message_t payload(frame.data(), frame.size());
+        const auto flags = (i + 1 == message.frames.size())
+            ? zmq::send_flags::none
+            : zmq::send_flags::sndmore;
+        if (!socket.send(payload, flags))
+            throw std::runtime_error("ZeroMQ multipart payload send timed out");
+    }
+}
+
+MultipartEnvelope recv_multipart(zmq::socket_t& socket) {
+    zmq::message_t header;
+    const auto result = socket.recv(header, zmq::recv_flags::none);
+    if (!result) throw std::runtime_error("ZeroMQ multipart header receive timed out");
+
+    MultipartEnvelope out;
+    out.envelope = Envelope::decode(header.data(), header.size());
+
+    bool too_many = false;
+    while (socket.get(zmq::sockopt::rcvmore)) {
+        zmq::message_t frame;
+        const auto frame_result = socket.recv(frame, zmq::recv_flags::none);
+        if (!frame_result)
+            throw std::runtime_error("ZeroMQ multipart payload receive timed out");
+        if (out.frames.size() >= MAX_MULTIPART_FRAMES) {
+            too_many = true;
+            continue;
+        }
+        const auto* begin = static_cast<const std::uint8_t*>(frame.data());
+        out.frames.emplace_back(begin, begin + frame.size());
+    }
+    if (too_many)
+        throw std::runtime_error("too many V0ID multipart frames");
+    return out;
 }
 
 } // namespace
@@ -142,6 +204,12 @@ std::string to_string(MessageType type) {
         case MessageType::module_request: return "MODULE_REQUEST";
         case MessageType::module_blob: return "MODULE_BLOB";
         case MessageType::module_ready: return "MODULE_READY";
+        case MessageType::install_tfhe_session: return "INSTALL_TFHE_SESSION";
+        case MessageType::tfhe_session_ready: return "TFHE_SESSION_READY";
+        case MessageType::tfhe_instruction_chunk: return "TFHE_INSTRUCTION_CHUNK";
+        case MessageType::tfhe_chunk_ready: return "TFHE_CHUNK_READY";
+        case MessageType::tfhe_job_finish: return "TFHE_JOB_FINISH";
+        case MessageType::tfhe_job_result: return "TFHE_JOB_RESULT";
         case MessageType::error: return "ERROR";
     }
     return "UNKNOWN";
@@ -160,6 +228,14 @@ void PeerServer::reply(const Envelope& envelope) {
     send_envelope(socket_, envelope);
 }
 
+MultipartEnvelope PeerServer::receive_multipart() {
+    return recv_multipart(socket_);
+}
+
+void PeerServer::reply_multipart(const MultipartEnvelope& message) {
+    send_multipart(socket_, message);
+}
+
 PeerClient::PeerClient(const std::string& connect_endpoint, int timeout_ms) {
     configure_socket(socket_, timeout_ms);
     socket_.connect(connect_endpoint);
@@ -168,6 +244,11 @@ PeerClient::PeerClient(const std::string& connect_endpoint, int timeout_ms) {
 Envelope PeerClient::round_trip(const Envelope& envelope) {
     send_envelope(socket_, envelope);
     return recv_envelope(socket_);
+}
+
+MultipartEnvelope PeerClient::round_trip_multipart(const MultipartEnvelope& message) {
+    send_multipart(socket_, message);
+    return recv_multipart(socket_);
 }
 
 std::vector<std::uint8_t> bytes(std::string_view value) {

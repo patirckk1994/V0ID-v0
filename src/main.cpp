@@ -1,6 +1,5 @@
 #include "program.hpp"
 #include "program_morpher.hpp"
-#include "toy_fingerprint.hpp"
 
 #include "binfhecontext.h"
 #include <openssl/evp.h>
@@ -17,14 +16,11 @@
 
 using namespace lbcrypto;
 using v0id::core::Program;
-using v0id::integrity::EncryptedDigest32;
 using v0id::polymorph::MorphedProgram;
 using v0id::polymorph::ProgramMorpher;
 
-// Public shape, encrypted semantics. The evaluator learns the number of states,
-// binary alphabet and fixed work budget, but not next-state/write/move choices.
 struct EncryptedTransition {
-    std::vector<LWECiphertext> next_state; // encrypted one-hot selector
+    std::vector<LWECiphertext> next_state;
     LWECiphertext write_one;
     LWECiphertext move_left;
     LWECiphertext move_stay;
@@ -37,10 +33,8 @@ public:
                                     const LWEPrivateKey& sk,
                                     const Program& plain) {
         plain.validate();
-
         std::vector<EncryptedTransition> table;
         table.reserve(plain.states * 2);
-
         for (std::size_t q = 0; q < plain.states; ++q) {
             for (int read = 0; read <= 1; ++read) {
                 const auto& r = plain.rule(q, read);
@@ -48,7 +42,6 @@ public:
                 t.next_state.reserve(plain.states);
                 for (std::size_t q2 = 0; q2 < plain.states; ++q2)
                     t.next_state.push_back(cc.Encrypt(sk, q2 == r.next_state ? 1 : 0));
-
                 t.write_one = cc.Encrypt(sk, r.write == 1 ? 1 : 0);
                 t.move_left = cc.Encrypt(sk, r.move < 0 ? 1 : 0);
                 t.move_stay = cc.Encrypt(sk, r.move == 0 ? 1 : 0);
@@ -56,7 +49,6 @@ public:
                 table.push_back(std::move(t));
             }
         }
-
         return EncryptedProgram(plain.states, std::move(table));
     }
 
@@ -66,25 +58,6 @@ public:
         if (state >= states_ || (read != 0 && read != 1))
             throw std::runtime_error("encrypted transition index out of range");
         return table_.at(state * 2 + static_cast<std::size_t>(read));
-    }
-
-    // Same canonical semantic layout as integrity::canonical_program_bits().
-    // This lets the toy self-fingerprint consume the encrypted program itself.
-    std::vector<LWECiphertext> canonical_bits() const {
-        std::vector<LWECiphertext> bits;
-        bits.reserve(states_ * 2 * (states_ + 4));
-
-        for (std::size_t q = 0; q < states_; ++q) {
-            for (int read = 0; read <= 1; ++read) {
-                const auto& t = transition(q, read);
-                bits.insert(bits.end(), t.next_state.begin(), t.next_state.end());
-                bits.push_back(t.write_one);
-                bits.push_back(t.move_left);
-                bits.push_back(t.move_stay);
-                bits.push_back(t.move_right);
-            }
-        }
-        return bits;
     }
 
 private:
@@ -127,12 +100,11 @@ private:
         if (!ctx) throw std::runtime_error("EVP_MAC_CTX_new failed");
 
         std::array<unsigned char, 24> msg{};
-        put_u64(msg, 0, 0x563049442d524d50ULL); // "V0ID-RMP"
+        put_u64(msg, 0, 0x563049442d524d50ULL);
         put_u64(msg, 8, epoch_);
         put_u64(msg, 16, counter_++);
         std::array<unsigned char, 64> out{};
         std::size_t out_len = 0;
-
         const bool ok = EVP_MAC_init(ctx, key_.data(), key_.size(), nullptr) == 1 &&
                         EVP_MAC_update(ctx, msg.data(), msg.size()) == 1 &&
                         EVP_MAC_final(ctx, out.data(), &out_len, out.size()) == 1;
@@ -175,7 +147,6 @@ public:
         state_.resize(program_.states());
         head_.resize(tape.size());
         physical_tape_.resize(tape.size());
-
         for (std::size_t q = 0; q < state_.size(); ++q)
             state_[q] = cc_.Encrypt(sk, q == initial_state ? 1 : 0);
         for (std::size_t i = 0; i < head_.size(); ++i)
@@ -186,19 +157,14 @@ public:
         }
     }
 
-    // Fixed public evaluator path: there are no C++ branches on encrypted
-    // next-state, write or movement semantics. Every public padded state is
-    // evaluated every round, including dummy states.
     void step() {
         const std::size_t n = head_.size();
         const std::size_t states = program_.states();
-
         std::vector<LWECiphertext> next_state(states, zero_);
         std::vector<LWECiphertext> next_head(n, zero_);
         std::vector<LWECiphertext> write_any(n, zero_);
         std::vector<LWECiphertext> write_one(n, zero_);
         std::vector<LWECiphertext> not_tape(n);
-
         for (std::size_t i = 0; i < n; ++i)
             not_tape[i] = cc_.EvalNOT(tape(i));
 
@@ -207,20 +173,13 @@ public:
                 for (int read = 0; read <= 1; ++read) {
                     auto active = And(state_[q], head_[i]);
                     active = And(active, read ? tape(i) : not_tape[i]);
-
                     const auto& t = program_.transition(q, read);
-
-                    for (std::size_t q2 = 0; q2 < states; ++q2) {
-                        auto selected = And(active, t.next_state[q2]);
-                        next_state[q2] = Or(next_state[q2], selected);
-                    }
-
+                    for (std::size_t q2 = 0; q2 < states; ++q2)
+                        next_state[q2] = Or(next_state[q2], And(active, t.next_state[q2]));
                     write_any[i] = Or(write_any[i], active);
                     write_one[i] = Or(write_one[i], And(active, t.write_one));
-
                     const std::size_t left = i > 0 ? i - 1 : i;
                     const std::size_t right = i + 1 < n ? i + 1 : i;
-
                     next_head[left] = Or(next_head[left], And(active, t.move_left));
                     next_head[i] = Or(next_head[i], And(active, t.move_stay));
                     next_head[right] = Or(next_head[right], And(active, t.move_right));
@@ -233,7 +192,6 @@ public:
             auto keep_old = And(cc_.EvalNOT(write_any[i]), tape(i));
             next_tape[i] = Or(write_one[i], keep_old);
         }
-
         state_ = std::move(next_state);
         head_ = std::move(next_head);
         for (std::size_t i = 0; i < n; ++i)
@@ -269,11 +227,9 @@ public:
 
 private:
     LWECiphertext& tape(std::size_t logical) { return physical_tape_[map_.physical(logical)]; }
-
     LWECiphertext And(const LWECiphertext& a, const LWECiphertext& b) {
         return cc_.EvalBinGate(AND, a, b);
     }
-
     LWECiphertext Or(const LWECiphertext& a, const LWECiphertext& b) {
         return cc_.EvalBinGate(OR, a, b);
     }
@@ -302,7 +258,7 @@ static void print_state_map(const std::string& name, const MorphedProgram& morph
         if (i) std::cout << ',';
         std::cout << morph.manifest.dummy_states[i];
     }
-    std::cout << " | client integrity slot=" << morph.manifest.integrity_output_slot << '\n';
+    std::cout << '\n';
 }
 
 static std::vector<int> run_plaintext(const Program& program,
@@ -312,21 +268,16 @@ static std::vector<int> run_plaintext(const Program& program,
     program.validate();
     if (input.empty() || initial_state >= program.states)
         throw std::runtime_error("invalid plaintext machine input");
-
     auto tape = input;
     std::size_t state = initial_state;
     std::size_t head = 0;
-
     for (std::size_t s = 0; s < steps; ++s) {
         const auto& r = program.rule(state, tape.at(head));
         tape[head] = r.write;
         state = r.next_state;
-        if (r.move < 0 && head > 0)
-            --head;
-        else if (r.move > 0 && head + 1 < tape.size())
-            ++head;
+        if (r.move < 0 && head > 0) --head;
+        else if (r.move > 0 && head + 1 < tape.size()) ++head;
     }
-
     return tape;
 }
 
@@ -335,8 +286,7 @@ static void require_plain_equivalent(const std::string& name,
                                      const std::vector<int>& input,
                                      const std::vector<int>& expected,
                                      std::size_t steps) {
-    const auto output = run_plaintext(morph.program, morph.initial_state, input, steps);
-    if (output != expected)
+    if (run_plaintext(morph.program, morph.initial_state, input, steps) != expected)
         throw std::runtime_error(name + " plaintext morph mismatch");
 }
 
@@ -348,69 +298,27 @@ static void run_fhe_case(BinFHEContext& cc,
                          const std::vector<int>& input,
                          const std::vector<int>& expected,
                          std::size_t fixed_steps) {
-    const auto expected_digest = v0id::integrity::toy_fingerprint32_plain(
-        morph.program, input, morph.manifest.integrity_nonce);
-
     auto encrypted_program = EncryptedProgram::encrypt(cc, sk, morph.program);
-    const auto encrypted_program_bits = encrypted_program.canonical_bits();
-    const auto encrypted_input = v0id::integrity::encrypt_plain_bits(cc, sk, input);
-    const auto encrypted_nonce = v0id::integrity::encrypt_u32_bits(
-        cc, sk, morph.manifest.integrity_nonce);
-    const auto encrypted_mixer_state = v0id::integrity::encrypt_u32_bits(
-        cc, sk, v0id::integrity::TOY_FINGERPRINT_INITIAL_STATE);
-
-    const auto digest = v0id::integrity::toy_fingerprint32_fhe(
-        cc, encrypted_program_bits, encrypted_input, encrypted_nonce,
-        encrypted_mixer_state);
-
-    std::vector<EncryptedDigest32> candidate_bank;
-    candidate_bank.reserve(morph.manifest.integrity_output_masks.size());
-    for (const auto mask : morph.manifest.integrity_output_masks) {
-        const auto encrypted_mask = v0id::integrity::encrypt_u32_bits(cc, sk, mask);
-        candidate_bank.push_back(v0id::integrity::mask_digest_fhe(
-            cc, digest, encrypted_mask));
-    }
-
-    if (morph.manifest.integrity_output_slot >= candidate_bank.size())
-        throw std::runtime_error("client integrity slot outside candidate bank");
-
     EncryptedMachine machine(cc, sk, std::move(encrypted_program), input,
                              morph.initial_state, 0, remap_key, 1);
     machine.run_fixed(fixed_steps, 2);
-
     auto output = machine.decrypt_tape(sk);
     std::cout << name << " output      : ";
     print_msb_first(output);
-
     if (output != expected)
         throw std::runtime_error(name + " encrypted morph result mismatch");
-
-    const auto slot = morph.manifest.integrity_output_slot;
-    const auto masked_digest = v0id::integrity::decrypt_u32_bits(
-        cc, sk, candidate_bank[slot]);
-    const auto recovered_digest =
-        masked_digest ^ morph.manifest.integrity_output_masks[slot];
-
-    std::cout << name << " self-check  : 0x" << std::hex << recovered_digest
-              << std::dec << " (client slot " << slot << ")\n";
-
-    if (recovered_digest != expected_digest)
-        throw std::runtime_error(name + " encrypted self-fingerprint mismatch");
 }
 
 int main() try {
     constexpr std::size_t FIXED_STEPS = 4;
     constexpr std::size_t PUBLIC_STATES = 4;
-    constexpr std::size_t INTEGRITY_SLOTS = 4;
 
-    // State 0 = carry/borrow; state 1 = halted self-loop.
     Program increment{2, {
         {0, 0, 1, 1,  0},
         {0, 1, 0, 0, +1},
         {1, 0, 1, 0,  0},
         {1, 1, 1, 1,  0},
     }};
-
     Program decrement{2, {
         {0, 0, 0, 1, +1},
         {0, 1, 1, 0,  0},
@@ -418,42 +326,32 @@ int main() try {
         {1, 1, 1, 1,  0},
     }};
 
-    const std::vector<int> input{1,0,1,1,0,0,0,0}; // 00001101 = 13, LSB first
-    const std::vector<int> expected_inc{0,1,1,1,0,0,0,0}; // 14
-    const std::vector<int> expected_dec{0,0,1,1,0,0,0,0}; // 12
+    const std::vector<int> input{1,0,1,1,0,0,0,0};
+    const std::vector<int> expected_inc{0,1,1,1,0,0,0,0};
+    const std::vector<int> expected_dec{0,0,1,1,0,0,0,0};
 
     if (run_plaintext(increment, 0, input, FIXED_STEPS) != expected_inc ||
         run_plaintext(decrement, 0, input, FIXED_STEPS) != expected_dec)
         throw std::runtime_error("base plaintext reference program mismatch");
 
-    auto inc_a = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
-                                       ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
-    auto inc_b = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
-                                       ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
-
-    // For the demo, insist that both the semantic state placement and private
-    // integrity return slot differ. Production only needs fresh strong seeds.
+    auto inc_a = ProgramMorpher::morph(
+        increment, 0, PUBLIC_STATES, ProgramMorpher::random_seed());
+    auto inc_b = ProgramMorpher::morph(
+        increment, 0, PUBLIC_STATES, ProgramMorpher::random_seed());
     for (int retry = 0;
-         retry < 32 &&
-         (inc_b.manifest.base_to_morphed == inc_a.manifest.base_to_morphed ||
-          inc_b.manifest.integrity_output_slot == inc_a.manifest.integrity_output_slot);
+         retry < 32 && inc_b.manifest.base_to_morphed == inc_a.manifest.base_to_morphed;
          ++retry) {
-        inc_b = ProgramMorpher::morph(increment, 0, PUBLIC_STATES,
-                                      ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
+        inc_b = ProgramMorpher::morph(
+            increment, 0, PUBLIC_STATES, ProgramMorpher::random_seed());
     }
-    if (inc_b.manifest.base_to_morphed == inc_a.manifest.base_to_morphed ||
-        inc_b.manifest.integrity_output_slot == inc_a.manifest.integrity_output_slot)
+    if (inc_b.manifest.base_to_morphed == inc_a.manifest.base_to_morphed)
         throw std::runtime_error("failed to generate visibly distinct increment morphs");
 
-    auto dec_a = ProgramMorpher::morph(decrement, 0, PUBLIC_STATES,
-                                       ProgramMorpher::random_seed(), INTEGRITY_SLOTS);
-
+    auto dec_a = ProgramMorpher::morph(
+        decrement, 0, PUBLIC_STATES, ProgramMorpher::random_seed());
     if (inc_a.program.states != PUBLIC_STATES ||
         inc_b.program.states != PUBLIC_STATES ||
-        dec_a.program.states != PUBLIC_STATES ||
-        inc_a.manifest.integrity_output_masks.size() != INTEGRITY_SLOTS ||
-        inc_b.manifest.integrity_output_masks.size() != INTEGRITY_SLOTS ||
-        dec_a.manifest.integrity_output_masks.size() != INTEGRITY_SLOTS)
+        dec_a.program.states != PUBLIC_STATES)
         throw std::runtime_error("morph leaked variable public shape");
 
     require_plain_equivalent("increment morph A", inc_a, input, expected_inc, FIXED_STEPS);
@@ -463,8 +361,7 @@ int main() try {
     std::cout << "input               : ";
     print_msb_first(input);
     std::cout << "public state count  : " << PUBLIC_STATES << '\n'
-              << "fixed round budget  : " << FIXED_STEPS << '\n'
-              << "integrity bank slots: " << INTEGRITY_SLOTS << '\n';
+              << "fixed round budget  : " << FIXED_STEPS << '\n';
     print_state_map("increment morph A", inc_a);
     print_state_map("increment morph B", inc_b);
     print_state_map("decrement morph A", dec_a);
@@ -491,11 +388,10 @@ int main() try {
                  "    + KMAC-derived secret state-label permutation\n"
                  "    + fixed-size dummy-state padding\n"
                  "    + client-only morph manifest\n"
-                 "    + encrypted toy self-fingerprint over morphed program + input\n"
-                 "    + private masked integrity candidate bank\n"
                  "    + identical public evaluator dimensions across morphs\n"
                  "    + exact encrypted state/tape semantics\n"
-                 "    + ciphertext-only epoch remap\n";
+                 "    + ciphertext-only epoch remap\n"
+                 "    + ToyFingerprint removed; SHA3/round-receipt work owns integrity\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "V0ID error: " << e.what() << '\n';
